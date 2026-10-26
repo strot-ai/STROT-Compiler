@@ -2,6 +2,10 @@
 
 Reproducible scripts behind the numbers reported in the main README.
 
+The routing, semantic-text, and risk benchmarks used Claude Opus 4.8 for
+synthesis. Their scripts keep that model to match the reported setup.
+New Anthropic compiles default to Haiku 5.5.
+
 ## Routing accuracy: `routing_mpg.py`
 
 The 398-record grounded-routing benchmark (the 74.8% → 92.5% result).
@@ -159,7 +163,10 @@ Findings:
 > Note: the LLM-escalation cascade (`escalate_to=`) shown below was **removed in v0.11.1** based on finding (1): it bought ~0 accuracy at real cost because haiku did not beat the local model on this task. `target_accuracy` remains as a local-only abstain policy. The findings are kept as the record of why.
 
 Full stack on the same 400 test tweets: distilled head + `target_accuracy=0.8`
-+ `escalate_to="anthropic/claude-haiku-4-5"`.
++ hosted Haiku inference.
+
+These measurements used an earlier Haiku release. For new synthesis calls,
+use `llm="anthropic/claude-haiku-5-5"`.
 
 | Tier | Accuracy | Coverage | Cost |
 |---|---|---|---|

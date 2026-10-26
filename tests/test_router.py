@@ -19,13 +19,15 @@ class TestFactory:
         assert isinstance(strategy, LocalEncoderStrategy)
         assert strategy.nlu_model == "SupersonicLabs/Julia-1"
 
-    @pytest.mark.parametrize("name", ["openai/gpt-4o-mini", "anthropic/claude-haiku-4-5"])
+    @pytest.mark.parametrize("name", ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5"])
     def test_provider_prefixes_resolve_to_hosted(self, name):
         assert isinstance(create_strategy(name), HostedApiStrategy)
 
-    def test_hosted_requires_provider_slash_model(self):
+    def test_invalid_hosted_configuration(self):
         with pytest.raises(RouterConfigurationError):
             HostedApiStrategy("openai")
+        with pytest.raises(RouterConfigurationError, match="reasoning_effort"):
+            HostedApiStrategy("anthropic/claude-haiku-5-5", reasoning_effort="low")
 
 
 class TestOptionTreeSplitter:
@@ -96,17 +98,32 @@ class _FakeClient:
 class TestHostedStrategy:
     def make(self, payload):
         client = _FakeClient(payload)
-        strategy = HostedApiStrategy("openai/gpt-4o-mini", client_factory=lambda: client)
+        strategy = HostedApiStrategy("openai/gpt-6-luna", client_factory=lambda: client)
         return strategy, client
 
-    def test_selects_index_from_structured_output(self):
+    def test_selects_index_from_structured_output(self, monkeypatch):
+        monkeypatch.delenv("STROT_NLU_REASONING_EFFORT", raising=False)
         strategy, client = self.make({"selected_index": 1, "confidence": 0.92})
         decision = strategy.select("ctx", "which?", ["a", "b", "c"])
         assert decision.option == "b"
         assert decision.confidence == pytest.approx(0.92)
         sent = client.chat.completions.last_kwargs
-        assert sent["model"] == "gpt-4o-mini"
+        assert sent["model"] == "gpt-6-luna"
+        assert sent["extra_body"] == {"reasoning_effort": "low"}
+        assert "temperature" not in sent
         assert sent["response_format"]["json_schema"]["strict"] is True
+
+    @pytest.mark.parametrize("effort", ["none", "medium"])
+    def test_effort_environment_and_explicit_override(self, monkeypatch, effort):
+        monkeypatch.setenv("STROT_NLU_REASONING_EFFORT", effort)
+        strategy, client = self.make({"selected_index": 0, "confidence": 0.9})
+        strategy.select("ctx", "which?", ["a", "b"])
+        sent = client.chat.completions.last_kwargs
+        assert sent["extra_body"] == {"reasoning_effort": effort}
+        assert ("temperature" in sent) == (effort == "none")
+        HostedApiStrategy("openai/gpt-6-luna", client_factory=lambda: client,
+                          reasoning_effort="high").select("ctx", "which?", ["a", "b"])
+        assert client.chat.completions.last_kwargs["extra_body"] == {"reasoning_effort": "high"}
 
     def test_out_of_range_index_triggers_fallback(self):
         strategy, _ = self.make({"selected_index": 9, "confidence": 0.99})
@@ -115,7 +132,7 @@ class TestHostedStrategy:
 
     def test_missing_env_key_is_a_configuration_error(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        strategy = HostedApiStrategy("openai/gpt-4o-mini")
+        strategy = HostedApiStrategy("openai/gpt-6-luna")
         with pytest.raises(RouterConfigurationError):
             strategy.select("ctx", "which?", ["a"])
 

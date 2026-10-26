@@ -14,8 +14,11 @@ After installation, choose a compile-time LLM:
     codex login status
     python3 examples/end_to_end.py --llm codex-cli/gpt-6-luna --compile-only
 
+    # Codex SDK: install the codex-sdk extra and reuse the same login:
+    python3 examples/end_to_end.py --llm codex-sdk/gpt-6-luna --compile-only
+
     # Claude Code: run claude and /login with your subscription first:
-    python3 examples/end_to_end.py --llm claude-cli/claude-opus-4-8 --compile-only
+    python3 examples/end_to_end.py --llm claude-cli/claude-haiku-5-5 --compile-only
 
 To run the offline example in an isolated environment with uvx:
 
@@ -29,6 +32,9 @@ Codex shell commands and web search are disabled during synthesis.
 
 Without --llm, the example uses the offline stub. Use a separate --state
 directory to compare LLMs. Changing --llm alone does not clear the saved code.
+This simple example uses reasoning effort "none" for an explicit Luna model.
+Use --reasoning-effort medium for harder tasks. Other models keep their
+configured effort unless you set this flag.
 
 The --compile-only flag saves code without loading Julia. Review that code
 before use. To run the tickets, install strot-ai[local], run
@@ -67,7 +73,7 @@ ACTION_REGISTRY = {
 
 
 def stub_synthesizer(prompt: str) -> str:
-    """Offline stand-in for GPT-4o/Claude: returns contract-compliant paths."""
+    """Offline synthesizer: returns paths that follow the compiler contract."""
     return '''```python
 ROUTING_LABELS = {
     "billing_dispute": "billing invoice double charge refund",
@@ -105,10 +111,13 @@ def execute_account_lifecycle(record: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--llm", default="stub", help="Synthesizer spec: stub, codex-cli, claude-cli, or provider/model")
+    parser.add_argument("--reasoning-effort", choices=("none", "low", "medium", "high", "xhigh", "max"),
+                        help="Override effort for an OpenAI or Codex synthesizer")
     parser.add_argument("--compile-only", action="store_true", help="Save without loading Julia")
     parser.add_argument("--state", type=Path, default=Path(".strot/end_to_end"))
     args = parser.parse_args()
-    synthesizer = stub_synthesizer if args.llm == "stub" else args.llm
+    synthesizer = stub_synthesizer if args.llm == "stub" else strot.llm_client(
+        args.llm, reasoning_effort=args.reasoning_effort)
     result = strot.run(
         data=SUPPORT_TICKETS,
         query=GOAL,

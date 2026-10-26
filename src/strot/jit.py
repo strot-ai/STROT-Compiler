@@ -30,10 +30,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 from .compiler import (
     CompiledAsset,
     LLMClient,
+    LLMHook,
     StrotCompiler,
     anthropic_llm_client,
     claude_cli_llm_client,
     codex_cli_llm_client,
+    codex_sdk_llm_client,
     openai_llm_client,
 )
 from .exceptions import RouterConfigurationError, SchemaIntrospectionError
@@ -41,7 +43,7 @@ from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .schema import DatasetSchema, introspect_schema
 
 #: ``llm`` parameter: a client callable, or a lazy spec string resolved only
-#: on a cache miss ("openai/gpt-4o", "gpt-4o", "codex-cli", "claude-cli/sonnet").
+#: on a cache miss ("openai/gpt-6-luna", "gpt-6-luna", "codex-cli", "claude-cli/sonnet").
 LLMSpec = Union[str, LLMClient]
 
 _KEY_PREFIX_LEN = 16
@@ -160,27 +162,51 @@ def cache_key(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _resolve_llm(llm: LLMSpec) -> LLMClient:
-    """Resolve the synthesizer client. Called ONLY on a cache miss, so a warm
-    production box never needs the LLM dependency or its API key."""
+def llm_client(
+    spec: LLMSpec, *, reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None,
+    on_event: Optional[LLMHook] = None, on_turn: Optional[LLMHook] = None,
+) -> LLMClient:
+    """Create a lazy synthesizer with shared hooks. Custom callables keep their own hooks."""
+    client, lock = None, RLock()
+
+    def _call(prompt: str) -> str:
+        nonlocal client
+        with lock:
+            if client is None:
+                client = _resolve_llm(spec, reasoning_effort=reasoning_effort,
+                                      on_result=on_result, on_event=on_event, on_turn=on_turn)
+        return client(prompt)
+
+    return _call
+
+
+def _resolve_llm(llm: LLMSpec, reasoning_effort: Optional[str] = None, **hooks: Any) -> LLMClient:
+    """Resolve a synthesizer spec or return a custom callable."""
     if callable(llm):
         return llm
     if isinstance(llm, str) and llm:
+        if reasoning_effort is not None:
+            hooks["reasoning_effort"] = reasoning_effort
         provider, slash, model = llm.partition("/")
-        if provider in ("claude-cli", "claude-code"):
-            return claude_cli_llm_client(model=model or None)
-        if provider == "codex-cli":
-            return codex_cli_llm_client(model=model or None)
         if provider == "anthropic":
-            return anthropic_llm_client(model) if model else anthropic_llm_client()
+            return anthropic_llm_client(model, **hooks) if model else anthropic_llm_client(**hooks)
+        if provider in ("claude-cli", "claude-code"):
+            return claude_cli_llm_client(model=model or None, **hooks)
+
         if provider == "openai":
-            return openai_llm_client(model)
-        if not slash:  # bare model name, e.g. "gpt-4o"
-            return openai_llm_client(llm)
+            return openai_llm_client(model, **hooks) if model else openai_llm_client(**hooks)
+        if provider == "codex-cli":
+            return codex_cli_llm_client(model=model or None, **hooks)
+        if provider == "codex-sdk":
+            return codex_sdk_llm_client(model=model or None, **hooks)
+
+        if not slash:  # bare model name, e.g. "gpt-6-luna"
+            return openai_llm_client(llm, **hooks)
     raise RouterConfigurationError(
         f"Cannot resolve llm spec {llm!r}; pass a callable, 'anthropic/<model>', "
         "'openai/<model>', a bare OpenAI model name, 'codex-cli[/<model>]', "
-        "or 'claude-cli[/<model>]'."
+        "'codex-sdk[/<model>]', or 'claude-cli[/<model>]'."
     )
 
 
@@ -243,7 +269,7 @@ def run(
     data: Any,
     query: str,
     action_registry: Mapping[str, str],
-    llm: LLMSpec = "openai/gpt-4o",
+    llm: LLMSpec = "openai/gpt-6-luna",
     nlu: str = DEFAULT_NLU_MODEL,
     state: Union[str, Path] = ".strot",
     sample_size: int = 25,
@@ -274,6 +300,7 @@ def run(
         llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
             ``codex-cli[/<model>]`` and ``claude-cli[/<model>]`` use CLI
             authentication. API clients need provider credentials.
+            ``codex-sdk[/<model>]`` uses the optional Codex Python SDK.
         nlu: Runtime decision model baked into the asset (local or hosted).
         state: Artifact-store directory — the persisted "compiled flag + code".
         sample_size: Records used for schema profiling and synthesis grounding.
@@ -430,7 +457,7 @@ def run(
 def decide(
     data: Any,
     questions: Union[str, Mapping[str, Any]],
-    llm: LLMSpec = "openai/gpt-4o",
+    llm: LLMSpec = "openai/gpt-6-luna",
     nlu: str = DEFAULT_NLU_MODEL,
     state: Union[str, Path] = ".strot",
     sample_size: int = 25,

@@ -126,7 +126,7 @@ Semantics worth knowing:
 | `data` | — | DataFrame-like, list of dicts, or dict of lists |
 | `query` | — | the goal, natural language |
 | `action_registry` | — | ordered `{key: description}`; the bounded decision space |
-| `llm` | `"openai/gpt-4o"` | synthesizer spec or callable; resolved **only on cache miss** |
+| `llm` | `"openai/gpt-6-luna"` | synthesizer spec or callable; resolved **only on cache miss** |
 | `nlu` | `SupersonicLabs/Julia-1` | decision model baked into the artifact |
 | `state` | `".strot"` | artifact store directory |
 | `sample_size` | 25 | records used for schema, synthesis grounding, teacher labeling |
@@ -188,12 +188,42 @@ To add a new local engine, implement the strategy contract — `select(state, qu
 
 | Spec | Client |
 |---|---|
-| `"anthropic/claude-opus-4-8"` | Anthropic API (`[anthropic]` extra, `ANTHROPIC_API_KEY`) |
-| `"openai/gpt-4o"` or bare model | OpenAI API (`[hosted]` extra, `OPENAI_API_KEY`) |
+| `"anthropic/claude-haiku-5-5"` | Anthropic API (`[anthropic]` extra, `ANTHROPIC_API_KEY`) |
+| `"openai/gpt-6-luna"` or bare model | OpenAI API (`[hosted]` extra, `OPENAI_API_KEY`) |
 | `"codex-cli"` / `"codex-cli/<model>"` | Codex CLI with saved login. Run `codex login` for subscription access. No SDK required. |
+| `"codex-sdk"` / `"codex-sdk/<model>"` | Codex Python SDK (`[codex-sdk]` extra), with saved Codex login. |
 | `"claude-cli"` / `"claude-cli/<model>"` | local Claude Code CLI as proxy (no key, no SDK) |
 
 Specs resolve **only on a cache miss** — a warm production box never needs the LLM dependency or key.
+
+For SDK calls, STROT selects the newest verified CLI from `PATH`, standard locations, or desktop apps. If none meets the SDK's pinned minimum version, STROT uses the bundle. Verification uses OpenAI signatures on macOS/Windows and online release hashes on Linux. Explicit `cli=` skips verification. Without the bundle, a compatible CLI is required. Dependency checks still report the bundle as missing.
+
+Each Codex SDK synthesis call starts and closes its runtime. `openai_codex.CodexError` exceptions pass through unchanged. Empty or incomplete replies raise `CompilationError`.
+
+OpenAI synthesis defaults to Luna with `none` effort. Set `reasoning_effort` on `strot.llm_client` or an OpenAI/Codex factory to change it. Other models keep provider defaults. Anthropic synthesis defaults to Haiku 5.5. The Anthropic and Claude CLI clients reject explicit effort. With reasoning enabled, OpenAI calls omit `temperature`.
+
+Hosted Luna routing defaults to `low`. For OpenAI routing, pass `reasoning_effort` to `HostedApiStrategy` or set `STROT_NLU_REASONING_EFFORT` before startup. The argument overrides the environment.
+
+`strot.llm_client(spec, **hooks)` accepts the same specs as `llm=`. It creates and reuses a client on first use. Custom callables keep their own callbacks.
+
+All factories accept the callbacks below. Client calls return text. Unsupported callbacks are ignored. Callbacks run on the caller's thread and must return promptly. Errors pass through unchanged. Result fields vary by provider.
+
+Call `handle.interrupt()` from `on_turn` to request cancellation. Cancelled turns and expired response waits raise `CompilationError` without a compiler retry.
+
+SDK response waits default to 600 seconds. Set `timeout=60` on `strot.codex_sdk_llm_client` to change the limit. Expiry closes the runtime. Startup, callbacks, and cleanup can outlast the limit.
+
+| Client | `on_result` | `on_event` | `on_turn` |
+|---|---|---|---|
+| Codex SDK | Native result, usage, duration | Typed notification | Active turn handle |
+| OpenAI / Anthropic API | Native API response | Unused | Unused |
+| Raw CLIs | Unused | Unused | Unused |
+
+```python
+llm = strot.llm_client("codex-sdk/gpt-6-luna", on_result=lambda result: print(result.usage))
+result = strot.run(records, query=goal, action_registry=actions, llm=llm)
+```
+
+Changing `llm` or reasoning effort does not clear cached artifacts. Use a fresh `state` directory to compare compiles or recalibrate.
 
 Both CLIs run in an isolated temporary directory and keep CLI authentication.
 Codex skips user configuration and disables project instructions, shell commands,

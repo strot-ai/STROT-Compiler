@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -51,11 +52,13 @@ def test_relative_cli_path(backend, monkeypatch, tmp_path):
         "    print('ready', end='')\n"
     )
     cli.chmod(0o755)
-    client = getattr(strot, backend + "_cli_llm_client")(cli="./" + backend)
+    unsupported = lambda _: pytest.fail("Unsupported hook called")
+    client = getattr(strot, backend + "_cli_llm_client")(
+        cli="./" + backend, on_result=unsupported, on_event=unsupported, on_turn=unsupported)
     assert client("prompt") == "ready"
 
 
-@pytest.mark.parametrize("spec", ["codex-cli", "codex-cli/gpt-6-luna", "claude-cli", "claude-cli/claude-opus-4-8"])
+@pytest.mark.parametrize("spec", ["codex-cli", "codex-cli/gpt-6-luna", "claude-cli", "claude-cli/claude-haiku-5-5"])
 def test_cli_synthesis_and_cache(spec, monkeypatch, tmp_path):
     from test_jit import SAMPLE, QUERY, REGISTRY, VALID_PATHS
 
@@ -70,9 +73,12 @@ def test_cli_synthesis_and_cache(spec, monkeypatch, tmp_path):
         assert Path(kwargs["cwd"]).is_dir()
         if "--output-last-message" in command:
             assert "--sandbox" in command and "read-only" in command
-            assert [command[i + 1] for i, value in enumerate(command) if value == "-c"] == [
+            expected = [
                 "project_doc_max_bytes=0", "features.shell_tool=false", 'web_search="disabled"',
             ]
+            if spec.endswith("/gpt-6-luna"):
+                expected.append('model_reasoning_effort="none"')
+            assert [command[i + 1] for i, value in enumerate(command) if value == "-c"] == expected
             Path(command[command.index("--output-last-message") + 1]).write_text(VALID_PATHS)
         else:
             assert "--safe-mode" in command
@@ -99,6 +105,18 @@ def test_missing_cli(backend, monkeypatch):
     monkeypatch.setattr("shutil.which", lambda cli: None)
     with pytest.raises(RouterConfigurationError, match="CLI on PATH"):
         _resolve_llm(backend + "-cli")
+
+
+def test_codex_cli_effort_override(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda cli: "/bin/" + cli)
+
+    def invoke(command, **kwargs):
+        assert 'model_reasoning_effort="low"' in command
+        Path(command[command.index("--output-last-message") + 1]).write_text("code")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", invoke)
+    assert strot.codex_cli_llm_client("gpt-6-luna", reasoning_effort="low")("prompt") == "code"
 
 
 @pytest.mark.parametrize("backend", ["codex", "claude"])
@@ -137,3 +155,19 @@ def test_example_defaults_to_offline_stub(monkeypatch, tmp_path, capsys):
     summary = json.loads(capsys.readouterr().out.splitlines()[0])
     assert Path(summary["artifact"]).is_file()
     assert not summary["cache_hit"] and summary["processed"] == 0
+
+
+@pytest.mark.parametrize("spec,override,expected", [
+    ("gpt-6-luna", [], None), ("openai/gpt-6-luna", [], None),
+    ("codex-sdk/gpt-6-luna", [], None), ("codex-cli/gpt-6-luna", [], None),
+    ("codex-sdk", [], None), ("claude-cli", [], None),
+    ("codex-sdk/gpt-6-luna", ["--reasoning-effort", "medium"], "medium"),
+])
+def test_example_forwards_effort_override(monkeypatch, tmp_path, spec, override, expected):
+    example = runpy.run_path(str(Path(__file__).parents[1] / "examples/end_to_end.py"))
+    factory = Mock(return_value=example["stub_synthesizer"])
+    monkeypatch.setattr(strot, "llm_client", factory)
+    monkeypatch.setattr(sys, "argv", ["end_to_end.py", "--compile-only", "--llm", spec,
+                                     "--state", str(tmp_path), *override])
+    example["main"]()
+    factory.assert_called_once_with(spec, reasoning_effort=expected)

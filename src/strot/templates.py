@@ -248,12 +248,16 @@ class _RuntimeRouter:
         if not api_key:
             raise RuntimeError("Missing {{0}} in environment.".format(env_key))
         self._client = OpenAI(api_key=api_key)
+        effort = os.environ.get("STROT_NLU_REASONING_EFFORT",
+                                "low" if _MODEL_ID == "gpt-6-luna" else None) if _PROVIDER == "openai" else None
+        self._request_options: Dict[str, Any] = {{"temperature": 0.0}} if effort in (None, "none") else {{}}
+        if effort is not None:
+            self._request_options["extra_body"] = {{"reasoning_effort": effort}}
 
     def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
         numbered = "\\n".join("{{0}}: {{1}}".format(i, opt) for i, opt in enumerate(options))
         response = self._client.chat.completions.create(
             model=_MODEL_ID,
-            temperature=0.0,
             messages=[
                 {{
                     "role": "system",
@@ -271,6 +275,7 @@ class _RuntimeRouter:
                 }},
             ],
             response_format={{"type": "json_schema", "json_schema": _RESPONSE_SCHEMA}},
+            **self._request_options,
         )
         payload = json.loads(response.choices[0].message.content)
         index = int(payload["selected_index"])

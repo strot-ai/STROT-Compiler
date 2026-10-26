@@ -1,11 +1,11 @@
-[tool.poetry]
+[project]
 name = "strot-ai"
 version = "0.11.1"
 description = "STROT: compile-time LLM code synthesis with deterministic, self-routing NLU runtimes (local transformer or hosted API)"
-authors = ["strot-ai <lee@strot-ai.xyz>"]
+authors = [{ name = "strot-ai", email = "lee@strot-ai.xyz" }]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/strot-ai/STROT-Compiler"
+requires-python = ">=3.10"
 keywords = ["strot", "nlu", "code-generation", "llm", "routing", "compiler"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -15,10 +15,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Typing :: Typed",
 ]
-packages = [{ include = "strot", from = "src" }]
 
-[tool.poetry.dependencies]
-python = ">=3.9,<4.0"
+[project.urls]
+Repository = "https://github.com/strot-ai/Project-STROT"
+
+[project.optional-dependencies]
 # The core library is pure-stdlib. Runtime strategies pull in heavy
 # dependencies only through extras, so a hosted-API production container
 # never ships torch/transformers.
@@ -27,25 +28,21 @@ python = ">=3.9,<4.0"
 # match supersonic-julia's requirements; needs Python >=3.11). The model's
 # own inference package is NOT on PyPI — bake it in at image-build time via
 # strot.prefetch_nlu(install=True). Never `pip install julia` (unrelated).
-transformers = { version = ">=5.0,<5.1", optional = true }
-torch = { version = ">=2.6", optional = true }
-safetensors = { version = ">=0.5", optional = true }
-huggingface-hub = { version = ">=0.26", optional = true }
-openai = { version = ">=1.30", optional = true }
-anthropic = { version = ">=0.80", optional = true }
+local = ["transformers>=5.0,<5.1", "torch>=2.6", "safetensors>=0.5", "huggingface-hub>=0.26"]
+hosted = ["openai>=1.55.3"]
+anthropic = ["anthropic>=0.80"]
+codex-sdk = ["openai-codex>=0.163.0"]
+all = ["strot-ai[local,hosted,anthropic,codex-sdk]"]
 
-[tool.poetry.extras]
-local = ["transformers", "torch", "safetensors", "huggingface-hub"]
-hosted = ["openai"]
-anthropic = ["anthropic"]
-all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic"]
+[tool.poetry]
+packages = [{ include = "strot", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
 pytest-cov = "*"
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.2"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]

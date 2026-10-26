@@ -37,11 +37,17 @@ from .schema import DatasetSchema, introspect_schema
 
 #: A generative LLM client is any callable mapping a prompt to raw model text.
 LLMClient = Callable[[str], str]
+LLMHook = Callable[[Any], None]
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
-def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMClient:
+def openai_llm_client(
+    model: str = "gpt-6-luna", temperature: float = 0.0, *,
+    reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None, on_event: Optional[LLMHook] = None,
+    on_turn: Optional[LLMHook] = None,
+) -> LLMClient:
     """Convenience factory: a synthesizer client backed by the OpenAI API."""
     try:
         from openai import OpenAI
@@ -51,27 +57,39 @@ def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMCli
             "pip install strot-ai[hosted]"
         ) from exc
     client = OpenAI()
+    effort = reasoning_effort if reasoning_effort is not None else (
+        "none" if model == "gpt-6-luna" else None)
+    options: Dict[str, Any] = {"temperature": temperature} if effort in (None, "none") else {}
+    if effort is not None:
+        options["extra_body"] = {"reasoning_effort": effort}
 
     def _call(prompt: str) -> str:
         response = client.chat.completions.create(
             model=model,
-            temperature=temperature,
             messages=[{"role": "user", "content": prompt}],
+            **options,
         )
+        if on_result is not None:
+            on_result(response)
         return response.choices[0].message.content or ""
 
     return _call
 
 
 def anthropic_llm_client(
-    model: str = "claude-opus-4-8",
+    model: str = "claude-haiku-5-5",
     max_tokens: int = 16000,
+    *, reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None, on_event: Optional[LLMHook] = None,
+    on_turn: Optional[LLMHook] = None,
 ) -> LLMClient:
     """Convenience factory: a synthesizer client backed by the Anthropic API.
 
     Requires the ``anthropic`` package (``pip install strot-ai[anthropic]``)
     and ``ANTHROPIC_API_KEY`` in the environment.
     """
+    if reasoning_effort is not None:
+        raise RouterConfigurationError("This Anthropic client does not support reasoning_effort.")
     try:
         from anthropic import Anthropic
     except ImportError as exc:
@@ -87,6 +105,8 @@ def anthropic_llm_client(
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        if on_result is not None:
+            on_result(response)
         if response.stop_reason == "refusal":
             raise CompilationError(
                 "Anthropic synthesizer refused the request.", attempts=0
@@ -102,6 +122,9 @@ def claude_cli_llm_client(
     model: Optional[str] = None,
     cli: str = "claude",
     timeout: float = 600.0,
+    *, reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None, on_event: Optional[LLMHook] = None,
+    on_turn: Optional[LLMHook] = None,
 ) -> LLMClient:
     """Use Claude Code for synthesis.
 
@@ -109,6 +132,8 @@ def claude_cli_llm_client(
     keeps CLI authentication. Built-in tools and session persistence are
     disabled. No SDK is required.
     """
+    if reasoning_effort is not None:
+        raise RouterConfigurationError("This Claude CLI client does not support reasoning_effort.")
     return _cli_llm_client("claude", cli, model, timeout)
 
 
@@ -116,6 +141,9 @@ def codex_cli_llm_client(
     model: Optional[str] = None,
     cli: str = "codex",
     timeout: float = 600.0,
+    *, reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None, on_event: Optional[LLMHook] = None,
+    on_turn: Optional[LLMHook] = None,
 ) -> LLMClient:
     """Use ``codex exec`` for synthesis.
 
@@ -123,10 +151,116 @@ def codex_cli_llm_client(
     ``--ignore-user-config`` and ``--ephemeral``. No SDK is required.
     Shell commands, web search, and project instructions are disabled.
     """
-    return _cli_llm_client("codex", cli, model, timeout)
+    return _cli_llm_client("codex", cli, model, timeout, reasoning_effort)
 
 
-def _cli_llm_client(backend: str, cli: str, model: Optional[str], timeout: float) -> LLMClient:
+def codex_sdk_llm_client(
+    model: Optional[str] = None, cli: Optional[str] = None, timeout: float = 600.0, *,
+    reasoning_effort: Optional[str] = None,
+    on_result: Optional[LLMHook] = None, on_event: Optional[LLMHook] = None,
+    on_turn: Optional[LLMHook] = None,
+) -> LLMClient:
+    """Use the Codex SDK with an installed CLI, or its bundled runtime.
+
+    Automatic selection checks publisher identity and version. Set ``cli`` to
+    trust a specific executable name or path instead.
+    ``timeout`` bounds response waiting after turn startup. Expiry closes the
+    runtime. Startup and user callbacks must return on their own.
+    """
+    import tempfile
+    from threading import TIMEOUT_MAX, Event, Timer
+    from ._codex import collect_turn, find_cli
+
+    if not 0 < timeout <= TIMEOUT_MAX:
+        raise ValueError("timeout must be a positive finite number of seconds within the platform's timer limit")
+
+    try:
+        from openai_codex import ApprovalMode, Codex, CodexConfig, CodexError, Sandbox
+    except ImportError as exc:
+        raise RouterConfigurationError(
+            "codex_sdk_llm_client requires the 'codex-sdk' extra: "
+            "pip install strot-ai[codex-sdk]"
+        ) from exc
+
+    cli_path = find_cli(cli) if cli is not None else None
+    effort = reasoning_effort if reasoning_effort is not None else (
+        "none" if model == "gpt-6-luna" else None)
+
+    def _call(prompt: str) -> str:
+        hook_error = None
+        expired = Event()
+
+        def notify(hook: LLMHook, value: Any) -> None:
+            nonlocal hook_error
+            try:
+                hook(value)
+            except Exception as exc:
+                hook_error = exc
+                raise
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="strot-synthesis-") as cwd:
+                config = CodexConfig(
+                    codex_bin=cli_path or find_cli(), cwd=cwd, experimental_api=False,
+                    config_overrides=("project_doc_max_bytes=0", "features.shell_tool=false",
+                                      'web_search="disabled"'),
+                )
+                with Codex(config) as client:
+                    turn = client.thread_start(
+                        model=model, model_provider="openai", cwd=cwd, ephemeral=True,
+                        developer_instructions="",
+                        sandbox=Sandbox.read_only, approval_mode=ApprovalMode.deny_all,
+                    ).turn(prompt, **({"effort": effort} if effort is not None else {}))
+                    if on_turn is not None:
+                        notify(on_turn, turn)
+
+                    def expire() -> None:
+                        expired.set()
+                        client.close()
+
+                    timer = Timer(timeout, expire)
+                    timer.daemon = True
+                    timer.start()
+                    try:
+                        if on_event is None:
+                            result = turn.run()
+                        else:
+                            result = collect_turn(turn, lambda event: notify(on_event, event))
+                    finally:
+                        timer.cancel()
+                        timer.join()
+                    if expired.is_set():
+                        raise TimeoutError(f"response wait exceeded {timeout:g} seconds")
+        except Exception as exc:
+            if exc is hook_error:
+                raise
+            if expired.is_set():
+                raise CompilationError(
+                    f"Codex SDK synthesizer timed out after {timeout:g} seconds of response waiting.",
+                    attempts=0,
+                ) from exc
+            if isinstance(exc, CodexError):
+                raise
+            if isinstance(exc, (OSError, RuntimeError, UnicodeError)):
+                raise CompilationError(f"Codex SDK synthesizer failed: {exc}", attempts=0) from exc
+            raise
+        if on_result is not None:
+            on_result(result)
+        if result.status.value != "completed":
+            raise CompilationError(
+                f"Codex SDK synthesizer stopped with {result.status.value}.", attempts=0,
+            )
+        if not result.final_response or not result.final_response.strip():
+            raise CompilationError("Codex SDK synthesizer returned no text.", attempts=0)
+        return result.final_response
+
+    return _call
+
+
+def _cli_llm_client(
+    backend: str, cli: str, model: Optional[str], timeout: float,
+    reasoning_effort: Optional[str] = None,
+) -> LLMClient:
     import shutil
     import subprocess
     import tempfile
@@ -137,6 +271,8 @@ def _cli_llm_client(backend: str, cli: str, model: Optional[str], timeout: float
             f"Cannot find the {cli!r} CLI on PATH. Install {backend} and sign in."
         )
     cli_path = str(Path(cli_path).absolute())
+    effort = reasoning_effort if reasoning_effort is not None else (
+        "none" if model == "gpt-6-luna" else None)
 
     def _call(prompt: str) -> str:
         # Use stdin for context and skip project instructions.
@@ -155,6 +291,8 @@ def _cli_llm_client(backend: str, cli: str, model: Optional[str], timeout: float
                     cli_path, "--safe-mode", "-p", "--output-format", "text", "--tools", "",
                     "--no-session-persistence",
                 ]
+            if backend == "codex" and effort is not None:
+                command += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
             if model:
                 command += ["--model", model]
             try:
