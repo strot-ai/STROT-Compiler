@@ -201,6 +201,8 @@ the latest `main`, and run the test suite first. See [CONTRIBUTING.md](CONTRIBUT
 
 Questions, ideas, or problems: open an issue or email **lee@strot-ai.xyz**.
 
+Built by Amit Rath. Follow me on [LinkedIn](https://www.linkedin.com/in/amirath/).
+
 ## License
 
 MIT. The default decision model is Apache-2.0
