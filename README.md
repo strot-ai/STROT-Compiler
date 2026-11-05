@@ -8,7 +8,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/strot-ai?color=7c3aed&label=pip%20install%20strot-ai)](https://pypi.org/project/strot-ai/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 [![Live demo](https://img.shields.io/badge/%F0%9F%A4%97-live%20demo-ffce00)](https://huggingface.co/spaces/STROT-ai/STROT-AI-Compiler)
 
 **▶ [Try the live demo](https://huggingface.co/spaces/STROT-ai/STROT-AI-Compiler)** — decisions in your browser, no install, key-free.
@@ -42,7 +42,7 @@ result = strot.run(
         "billing_dispute":  "Refunds, invoice corrections, double charges",
         "technical_defect": "Crashes, bugs, broken behavior",
     },
-    llm="anthropic/claude-opus-4-8",   # used once, on first compile only
+    llm="anthropic/claude-haiku-5-5",   # used once, on first compile only
 )
 
 for o in result.outcomes:
@@ -57,7 +57,7 @@ nothing is generated at runtime, every output is bounded, and records the model
 isn't sure about abstain instead of guessing.
 
 To compile with a subscription CLI, use
-`llm="claude-cli/claude-opus-4-8"` or `llm="codex-cli/gpt-6-luna"`.
+`llm="claude-cli/claude-haiku-5-5"` or `llm="codex-cli/gpt-6-luna"`.
 Sign in through `claude` or `codex login` first. Omit `/<model>` to use the
 CLI default. Model access and usage limits depend on your account.
 The CLI only runs at compile time. See [the example](examples/end_to_end.py).
@@ -121,6 +121,9 @@ Real model (SupersonicLabs/Julia-1, 144M, CPU), real datasets, run in clean
 Docker containers. The benchmark scripts are in [`benchmarks/`](benchmarks/),
 losses included.
 
+The routing, semantic-text, and risk benchmarks used Claude Opus 4.8 for
+synthesis. Those results do not measure the new Haiku 5.5 default.
+
 | Benchmark | Result |
 |---|---|
 | Grounded routing (398 records) | 92.5% compiled vs 74.8% naive — the compiler is worth +18pp on the same model |
@@ -167,15 +170,31 @@ pip install strot-ai             # core: pure stdlib
 pip install "strot-ai[local]"     # + local model dependencies (torch/transformers)
 pip install "strot-ai[hosted]"    # + openai, for API synthesis or runtime routing
 pip install "strot-ai[anthropic]" # + anthropic, for Anthropic API synthesis
+pip install "strot-ai[codex-sdk]" # + Codex Python SDK and its bundled runtime
 ```
 
 Extras install optional Python packages. They do not select a provider or sign you in.
 For OpenAI API synthesis, install `[hosted]`, set `OPENAI_API_KEY`, and pass
-`llm="openai/gpt-4o"`. For Anthropic API synthesis, install `[anthropic]`, set
-`ANTHROPIC_API_KEY`, and pass `llm="anthropic/claude-opus-4-8"`.
+`llm="openai/gpt-6-luna"`. For Anthropic API synthesis, install `[anthropic]`, set
+`ANTHROPIC_API_KEY`, and pass `llm="anthropic/claude-haiku-5-5"`.
 Subscription CLI synthesis needs the CLI and its subscription login. It needs
 neither the `[hosted]` nor the `[anthropic]` extra. Check which login the CLI uses.
 Other credentials can override a saved subscription login.
+
+For Codex SDK synthesis, install `[codex-sdk]` and pass
+`llm="codex-sdk/gpt-6-luna"`. It reuses your Codex login and prefers a verified installed CLI.
+With uv, run in a virtual environment:
+
+```bash
+uv pip install "strot-ai[codex-sdk]"  # With the bundled CLI
+
+# Or reuse codex CLI from PATH or bundled in the ChatGPT desktop app:
+printf 'openai-codex-cli-bin\n' |
+  uv pip install --excludes - "strot-ai[codex-sdk]"
+```
+
+Repeat the exclusion for upgrades. See [client configuration](DEVELOPERS.md#llm-clients)
+for CLI selection, callbacks, and reasoning effort.
 
 Bake the local model into your image for offline production:
 

@@ -13,6 +13,7 @@ from .compiler import (
     anthropic_llm_client,
     claude_cli_llm_client,
     codex_cli_llm_client,
+    codex_sdk_llm_client,
     openai_llm_client,
 )
 from .exceptions import (
@@ -38,13 +39,14 @@ from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_sche
 
 __version__ = "0.11.1"
 
-from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
+from .jit import RunResult, decide, llm_client, run  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
     "run",
     "decide",
     "RunResult",
+    "llm_client",
     "prefetch_nlu",
     "CompiledAsset",
     "StrotCompiler",
@@ -52,6 +54,7 @@ __all__ = [
     "anthropic_llm_client",
     "claude_cli_llm_client",
     "codex_cli_llm_client",
+    "codex_sdk_llm_client",
     "StrotError",
     "CompilationError",
     "FallbackException",

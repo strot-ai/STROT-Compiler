@@ -2,16 +2,62 @@ import ast
 import json
 import sys
 import types
+from unittest.mock import Mock
 
 import pytest
 
-from strot.compiler import StrotCompiler, handler_name
+from strot.compiler import StrotCompiler, handler_name, openai_llm_client, anthropic_llm_client, claude_cli_llm_client
 from strot.exceptions import CompilationError, FallbackException
 
 SAMPLE = [
     {"ticket_id": 1, "body": "double charged", "tier": "pro"},
     {"ticket_id": 2, "body": "app crashes", "tier": "free"},
 ]
+
+
+@pytest.mark.parametrize("provider,factory,name,options,expected", [
+    ("openai", openai_llm_client, "OpenAI", {},
+     {"model": "gpt-6-luna", "temperature": 0.0, "extra_body": {"reasoning_effort": "none"}}),
+    ("openai", openai_llm_client, "OpenAI", {"reasoning_effort": "low"},
+     {"model": "gpt-6-luna", "extra_body": {"reasoning_effort": "low"}}),
+    ("openai", openai_llm_client, "OpenAI", {"reasoning_effort": "medium"},
+     {"model": "gpt-6-luna", "extra_body": {"reasoning_effort": "medium"}}),
+    ("openai", openai_llm_client, "OpenAI", {"reasoning_effort": "none", "temperature": 0.2},
+     {"model": "gpt-6-luna", "temperature": 0.2, "extra_body": {"reasoning_effort": "none"}}),
+    ("openai", openai_llm_client, "OpenAI", {"model": "custom-model", "temperature": 0.2},
+     {"model": "custom-model", "temperature": 0.2}),
+    ("anthropic", anthropic_llm_client, "Anthropic", {},
+     {"model": "claude-haiku-5-5", "max_tokens": 16000}),
+    ("anthropic", anthropic_llm_client, "Anthropic", {"model": "custom-model"},
+     {"model": "custom-model", "max_tokens": 16000}),
+])
+def test_native_api_result_hooks(monkeypatch, provider, factory, name, options, expected):
+    response = types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="code"))],
+        content=[types.SimpleNamespace(type="thinking", thinking="plan"),
+                 types.SimpleNamespace(type="text", text="code")], stop_reason="end_turn")
+    module, client = Mock(), Mock()
+    getattr(module, name).return_value = client
+    client.chat.completions.create.return_value = client.messages.create.return_value = response
+    monkeypatch.setitem(sys.modules, provider, module)
+    seen = []
+    unsupported = lambda _: pytest.fail("Unsupported hook called")
+    assert factory(**options, on_result=seen.append, on_event=unsupported, on_turn=unsupported)("prompt") == "code"
+    assert seen == [response]
+    create = client.chat.completions.create if provider == "openai" else client.messages.create
+    create.assert_called_once_with(**expected, messages=[{"role": "user", "content": "prompt"}])
+    error = OSError("observer failed")
+    with pytest.raises(OSError) as caught:
+        factory(**options, on_result=Mock(side_effect=error))("prompt")
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("factory", [anthropic_llm_client, claude_cli_llm_client])
+def test_unsupported_effort_is_explicit(factory):
+    from strot.exceptions import RouterConfigurationError
+
+    with pytest.raises(RouterConfigurationError, match="reasoning_effort"):
+        factory(reasoning_effort="low")
 
 REGISTRY = {
     "billing": "Billing disputes and refunds",
@@ -158,7 +204,7 @@ class TestAssetAssembly:
 
     def test_hosted_asset_is_valid_python_and_torch_free(self):
         compiler = StrotCompiler(
-            nlu_model="openai/gpt-4o-mini", llm_client=ScriptedLLM([VALID_PATHS])
+            nlu_model="openai/gpt-6-luna", llm_client=ScriptedLLM([VALID_PATHS])
         )
         asset = compiler.compile(SAMPLE, "triage", REGISTRY)
         tree = ast.parse(asset.source)
@@ -193,12 +239,15 @@ class TestAssetAssembly:
 class TestCompiledAssetExecution:
     """Execute a hosted-runtime asset end-to-end with a faked openai module."""
 
-    def _fake_openai(self, payload):
+    def _fake_openai(self, payload, effort="low"):
         module = types.ModuleType("openai")
 
         class _Completions:
             @staticmethod
             def create(**kwargs):
+                assert kwargs["model"] == "gpt-6-luna"
+                assert kwargs["extra_body"] == {"reasoning_effort": effort}
+                assert ("temperature" in kwargs) == (effort == "none")
                 msg = types.SimpleNamespace(content=json.dumps(payload))
                 choice = types.SimpleNamespace(message=msg)
                 return types.SimpleNamespace(choices=[choice])
@@ -210,11 +259,15 @@ class TestCompiledAssetExecution:
         module.OpenAI = OpenAI
         return module
 
-    def _run_asset(self, monkeypatch, payload):
+    def _run_asset(self, monkeypatch, payload, effort=None):
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        monkeypatch.setitem(sys.modules, "openai", self._fake_openai(payload))
+        if effort is None:
+            monkeypatch.delenv("STROT_NLU_REASONING_EFFORT", raising=False)
+        else:
+            monkeypatch.setenv("STROT_NLU_REASONING_EFFORT", effort)
+        monkeypatch.setitem(sys.modules, "openai", self._fake_openai(payload, effort or "low"))
         compiler = StrotCompiler(
-            nlu_model="openai/gpt-4o-mini", llm_client=ScriptedLLM([VALID_PATHS])
+            nlu_model="openai/gpt-6-luna", llm_client=ScriptedLLM([VALID_PATHS])
         )
         asset = compiler.compile(SAMPLE, "triage", REGISTRY)
         module = types.ModuleType("compiled_pipeline")
@@ -222,8 +275,9 @@ class TestCompiledAssetExecution:
         exec(compile(asset.source, "compiled_pipeline.py", "exec"), module.__dict__)
         return module.__dict__
 
-    def test_confident_route_dispatches_generated_path(self, monkeypatch):
-        ns = self._run_asset(monkeypatch, {"selected_index": 1, "confidence": 0.95})
+    @pytest.mark.parametrize("effort", [None, "none", "medium"])
+    def test_confident_route_dispatches_generated_path(self, monkeypatch, effort):
+        ns = self._run_asset(monkeypatch, {"selected_index": 1, "confidence": 0.95}, effort)
         outcome = ns["CompiledPipeline"]().process({"ticket_id": 7, "body": "crash"})
         assert outcome["action"] == "defect"
         assert outcome["result"] == {"queue": "engineering", "ticket_id": 7}

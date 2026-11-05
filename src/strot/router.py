@@ -194,7 +194,10 @@ class HostedApiStrategy(RuntimeStrategy):
         },
     }
 
-    def __init__(self, nlu_model: str, client_factory: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(
+        self, nlu_model: str, client_factory: Optional[Callable[[], Any]] = None,
+        *, reasoning_effort: Optional[str] = None,
+    ) -> None:
         self.nlu_model = nlu_model
         self.provider, _, self.model_id = nlu_model.partition("/")
         if not self.model_id:
@@ -203,6 +206,15 @@ class HostedApiStrategy(RuntimeStrategy):
             )
         self._client_factory = client_factory
         self._client: Any = None
+        if reasoning_effort is not None and self.provider != "openai":
+            raise RouterConfigurationError("Only OpenAI routing supports reasoning_effort.")
+        effort = reasoning_effort
+        if effort is None and self.provider == "openai":
+            effort = os.environ.get("STROT_NLU_REASONING_EFFORT",
+                                    "low" if self.model_id == "gpt-6-luna" else None)
+        self._request_options: Dict[str, Any] = {"temperature": 0.0} if effort in (None, "none") else {}
+        if effort is not None:
+            self._request_options["extra_body"] = {"reasoning_effort": effort}
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -251,9 +263,9 @@ class HostedApiStrategy(RuntimeStrategy):
         client = self._ensure_client()
         response = client.chat.completions.create(
             model=self.model_id,
-            temperature=0.0,
             messages=self.build_messages(context, question, options),
             response_format={"type": "json_schema", "json_schema": self.RESPONSE_SCHEMA},
+            **self._request_options,
         )
         payload = json.loads(response.choices[0].message.content)
         index = int(payload["selected_index"])

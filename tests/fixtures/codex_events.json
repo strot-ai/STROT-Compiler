@@ -1,0 +1,11 @@
+[
+  {"method": "item/agentMessage/delta", "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": "comment", "delta": "Checking the task"}},
+  {"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 1000, "item": {"id": "comment", "type": "agentMessage", "phase": "commentary", "text": "Checking the task"}}},
+  {"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 1100, "item": {"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "COMPILED_CODE"}}},
+  {"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 1101, "item": {"id": "legacy", "type": "agentMessage", "text": "Later unphased text"}}},
+  {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-1", "turnId": "turn-1", "tokenUsage": {
+    "last": {"inputTokens": 100, "cachedInputTokens": 20, "outputTokens": 30, "reasoningOutputTokens": 15, "totalTokens": 130},
+    "total": {"inputTokens": 100, "cachedInputTokens": 20, "outputTokens": 30, "reasoningOutputTokens": 15, "totalTokens": 130}
+  }}},
+  {"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": [], "startedAt": 1000, "completedAt": 1001, "durationMs": 125}}}
+]
