@@ -18,7 +18,7 @@ import pytest
 import strot
 from strot.exceptions import RouterConfigurationError, SchemaIntrospectionError
 
-from strot.jit import _load_artifact, as_records, cache_key, schema_fingerprint
+from strot.jit import _battery_slug, _load_artifact, as_records, cache_key, schema_fingerprint
 from strot.schema import introspect_schema
 
 SAMPLE = [
@@ -194,6 +194,25 @@ class TestAsRecords:
             as_records([])
 
 
+class TestBatterySlug:
+    def test_name_takes_precedence_and_is_slugified(self):
+        assert _battery_slug("Ticket Router v2", QUERY) == "ticket-router-v2"
+
+    def test_auto_slug_derived_from_query_when_no_name(self):
+        assert _battery_slug(None, "Triage incoming tickets") == "triage-incoming-tickets"
+
+    def test_slug_charset_and_collapse(self):
+        assert _battery_slug("A/B  Test!! (beta)", "") == "a-b-test-beta"
+
+    def test_slug_capped_and_trimmed(self):
+        slug = _battery_slug("x" * 40, "")
+        assert slug == "x" * 24 and not slug.endswith("-")
+
+    def test_empty_falls_back_to_task(self):
+        assert _battery_slug(None, "!!! @@@") == "task"
+        assert _battery_slug("", "") == "task"
+
+
 class TestCacheKey:
     def make_key(self, sample=SAMPLE, query=QUERY, registry=REGISTRY, nlu="SupersonicLabs/Julia-1"):
         schema = introspect_schema(sample)
@@ -322,6 +341,34 @@ class TestRun:
         assert len(result.outcomes) == 2
         routed = {o["record"]["ticket_id"]: o["action"] for o in result.outcomes}
         assert routed == {1: "billing", 2: "defect"}
+
+    def test_battery_filename_leads_with_auto_slug_from_query(self, tmp_path, fake_runtime):
+        result = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
+        stem = result.artifact_path.stem
+        # battery_<slug>_<hash>: slug auto-derived from the query words.
+        assert stem.startswith("battery_triage-incoming-tickets")
+        assert stem.endswith(result.cache_key[:16])
+        assert result.artifact_path.with_suffix(".json").exists()
+
+    def test_name_seeds_the_battery_filename_slug(self, tmp_path, fake_runtime):
+        result = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]),
+            state=tmp_path, name="Ticket Router v2",
+        )
+        assert result.artifact_path.stem.startswith("battery_ticket-router-v2_")
+
+    def test_name_is_cosmetic_only_cache_key_unchanged(self, tmp_path, fake_runtime):
+        # The slug rides in the filename but is NOT part of the content key:
+        # the same (query, schema, ...) under two names recompiles under a new
+        # filename yet produces the identical cache key.
+        a = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]),
+                      state=tmp_path, name="alpha")
+        b = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]),
+                      state=tmp_path, name="beta")
+        assert a.cache_key == b.cache_key
+        assert a.artifact_path != b.artifact_path
+        assert a.artifact_path.stem.startswith("battery_alpha_")
+        assert b.artifact_path.stem.startswith("battery_beta_")
 
     def test_cache_hit_never_touches_the_llm(self, tmp_path, fake_runtime):
         strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)

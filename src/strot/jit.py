@@ -3,13 +3,18 @@
 STROT as a *production* compiler, not a dev tool. Developers set only the
 intent (a natural-language query plus an action registry); the compile event
 happens wherever :func:`run` is first called — typically in production — and
-the resulting asset is persisted to a content-addressed artifact store. Every
-subsequent call (and every restart sharing the ``state`` directory) is a pure
-cache hit: no LLM, no API key, just deterministic execution.
+the resulting battery (the frozen, self-contained decision unit the compiler
+emits) is persisted to a content-addressed store. Every subsequent call (and
+every restart sharing the ``state`` directory) is a pure cache hit: no LLM,
+no API key, just deterministic execution.
 
     key = hash(query + schema fingerprint + registry + nlu + version)
-    ├─ artifact exists  ──▶ load compiled code, execute          (every call)
+    ├─ battery exists   ──▶ load compiled code, execute          (every call)
     └─ cache miss       ──▶ LLM synthesizes, validate, persist   (once)
+
+On disk a battery is a pair ``battery_<slug>_<hash>.py`` / ``.json``: the slug
+is a human-readable task label (from ``name`` or auto-derived from the query)
+and is purely cosmetic — the content hash, not the slug, is the cache key.
 
 The schema fingerprint is part of the key, so schema drift in the live data
 automatically misses the cache and triggers exactly one recompile against
@@ -21,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 from threading import RLock
 from dataclasses import dataclass, field
@@ -46,6 +52,7 @@ LLMSpec = Union[str, LLMClient]
 
 _KEY_PREFIX_LEN = 16
 _ARTIFACT_LOCK = RLock()
+_SLUG_MAX_LEN = 24
 
 
 @dataclass
@@ -208,20 +215,35 @@ def _resolve_llm(llm: LLMSpec) -> LLMClient:
     )
 
 
-def _artifact_paths(state: Union[str, Path], key: str) -> "tuple[Path, Path]":
+def _battery_slug(name: Optional[str], query: str) -> str:
+    """A short, filesystem-safe task label for the battery filename.
+
+    Cosmetic only: it rides in the ``.py`` / ``.json`` stem so a human can tell
+    one battery from another on disk, but it is NOT part of the cache key (that
+    stays a pure content address). Prefer an explicit ``name``; otherwise derive
+    from the first meaningful words of the query. Lowercased, ``[a-z0-9-]`` only,
+    hyphens collapsed/trimmed, capped at ~24 chars, ``"task"`` if nothing survives.
+    """
+    source = name if name else query
+    slug = re.sub(r"[^a-z0-9]+", "-", (source or "").lower()).strip("-")
+    slug = slug[:_SLUG_MAX_LEN].strip("-")
+    return slug or "task"
+
+
+def _artifact_paths(state: Union[str, Path], slug: str, key: str) -> "tuple[Path, Path]":
     state_dir = Path(state)
-    stem = f"strot_{key[:_KEY_PREFIX_LEN]}"
+    stem = f"battery_{slug}_{key[:_KEY_PREFIX_LEN]}"
     return state_dir / f"{stem}.py", state_dir / f"{stem}.json"
 
 
-def _artifact_module_name(path: Path, key: str) -> str:
+def _battery_module_name(path: Path, key: str) -> str:
     location = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
     return f"strot_compiled_{key}_{location}"
 
 
 def _load_artifact(path: Path, key: str) -> Any:
     with _ARTIFACT_LOCK:
-        module_name = _artifact_module_name(path, key)
+        module_name = _battery_module_name(path, key)
         try:
             stat = path.stat()
             stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
@@ -236,7 +258,7 @@ def _load_artifact(path: Path, key: str) -> Any:
         except Exception as exc:
             sys.modules.pop(module_name, None)
             raise RouterConfigurationError(
-                f"Compiled artifact {path} failed to load: {exc}. The local runtime "
+                f"Compiled battery {path} failed to load: {exc}. The local runtime "
                 "needs strot-ai[local] (torch/transformers); the hosted runtime "
                 "needs strot-ai[hosted] (openai)."
             ) from exc
@@ -282,6 +304,7 @@ def run(
     target_accuracy: Optional[float] = None,
     optimize: bool = False,
     reuse_adapter: Optional[Mapping[str, Any]] = None,
+    name: Optional[str] = None,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -300,26 +323,26 @@ def run(
         llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
             ``codex-cli[/<model>]`` and ``claude-cli[/<model>]`` use CLI
             authentication. API clients need provider credentials.
-        nlu: Runtime decision model baked into the asset (local or hosted).
-        state: Artifact-store directory — the persisted "compiled flag + code".
+        nlu: Runtime decision model baked into the battery (local or hosted).
+        state: Battery-store directory — the persisted "compiled flag + code".
         sample_size: Records used for schema profiling and synthesis grounding.
         max_retries: Feedback-driven synthesis budget on a cache miss.
         confidence_threshold: Routing confidence below this raises the
-            compiled asset's FallbackException instead of executing a path.
-        question: Optional override of the routing question baked into the asset.
-        execute: If False, only ensure the artifact exists (warm the cache)
+            compiled battery's FallbackException instead of executing a path.
+        question: Optional override of the routing question baked into the battery.
+        execute: If False, only ensure the battery exists (warm the cache)
             without loading the runtime — useful on boxes without the runtime
             extras installed.
         golden: Optional known-answer records
             (``[{"record": {...}, "expect": "<action key>"}, ...]``) — the
-            promotion gate. Candidate artifacts are executed against them
-            inside the compile repair loop; only an artifact for which every
+            promotion gate. Candidate batteries are executed against them
+            inside the compile repair loop; only a battery for which every
             expectation holds is persisted and served. Requires the decision
             runtime on the compile box.
         target_risk: Optional miscoverage level ``alpha`` (e.g. 0.05). Fits
             temperature scaling + a split-conformal threshold from an
             LLM-teacher-labeled sample at compile time (disjoint folds
-            preserve conformal validity); the artifact then dispatches only
+            preserve conformal validity); the battery then dispatches only
             on singleton prediction sets. The guarantee is MARGINAL: wrong
             dispatches are <= alpha of ALL records under exchangeability;
             conditional-on-dispatch error is bounded by alpha/dispatch_rate
@@ -360,6 +383,11 @@ def run(
             training. Calibration is always re-fit on this task's own data. Part
             of the cache key (a reused compile keys differently from a trained
             one). Ignored when optimize is off.
+        name: Optional label for the compiled battery. It seeds the on-disk
+            filename slug (``battery_<slug>_<hash>.py``); when omitted the slug
+            is auto-derived from the query. Cosmetic only — not part of the
+            cache key, so renaming a task reuses no prior battery and triggers
+            one recompile under the new filename.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -379,7 +407,7 @@ def run(
         distill=distill, target_accuracy=target_accuracy, optimize=optimize,
         reuse_adapter=reuse_adapter,
     )
-    artifact_path, meta_path = _artifact_paths(state, key)
+    artifact_path, meta_path = _artifact_paths(state, _battery_slug(name, query), key)
 
     cache_hit = artifact_path.exists()
     attempts = 0
@@ -424,7 +452,7 @@ def run(
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         with _ARTIFACT_LOCK:
             asset.save(artifact_path)
-            sys.modules.pop(_artifact_module_name(artifact_path, key), None)
+            sys.modules.pop(_battery_module_name(artifact_path, key), None)
         meta_path.write_text(
             json.dumps(
                 {
@@ -486,6 +514,7 @@ def decide(
     golden: Optional[List[Mapping[str, Any]]] = None,
     optimize: bool = False,
     reuse_adapter: Optional[Mapping[str, Any]] = None,
+    name: Optional[str] = None,
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
@@ -515,6 +544,11 @@ def decide(
     ``optimize`` and ``reuse_adapter`` are accepted for API parity with
     :func:`run` and participate in the cache key; decide mode has no
     routing-tier escalation, so they are otherwise inert here.
+
+    ``name`` is an optional label for the compiled battery. It seeds the on-disk
+    filename slug (``battery_<slug>_<hash>.py``); when omitted the slug is
+    auto-derived from the question names. Cosmetic only — not part of the cache
+    key.
     """
     if isinstance(questions, str):
         questions = json.loads(questions)
@@ -532,7 +566,9 @@ def decide(
         canonical_config, None, nlu, schema, None, 0.0, mode="decide",
         golden=golden, optimize=optimize, reuse_adapter=reuse_adapter,
     )
-    artifact_path, meta_path = _artifact_paths(state, key)
+    # The canonical config is JSON, so auto-slug off the question names instead.
+    slug = _battery_slug(name, " ".join(questions))
+    artifact_path, meta_path = _artifact_paths(state, slug, key)
 
     cache_hit = artifact_path.exists()
     attempts = 0
@@ -562,7 +598,7 @@ def decide(
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         with _ARTIFACT_LOCK:
             asset.save(artifact_path)
-            sys.modules.pop(_artifact_module_name(artifact_path, key), None)
+            sys.modules.pop(_battery_module_name(artifact_path, key), None)
         meta_path.write_text(
             json.dumps(
                 {

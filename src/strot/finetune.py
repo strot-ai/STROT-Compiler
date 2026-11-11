@@ -13,10 +13,12 @@ backprops through the top block only, so it finishes on CPU in minutes and
 sidesteps the memory blow-up of full-encoder fine-tuning. ``N`` is small by
 design (top-4 is the measured knee); depth beyond that buys noise. Unlike the
 pure-Python frozen head this needs torch + transformers (the ``[finetune]``
-extra) and emits an adapter (MB of weights, saved alongside the artifact), not
-inlinable float literals. The optimizer only reaches this rung when
-``optimize=True`` and the frozen tier misses the target on the real
-measurement fold.
+extra) and trains an adapter (MB of weights). Those weights are then baked
+into the battery ``.py`` as ``ADAPTER`` / ``ADAPTER_CONFIG`` literals (next to
+the distilled head, labels, calibration, and OOD centroids), so the battery
+stays self-contained except for the shared base-encoder checkpoint it loads at
+runtime. The optimizer only reaches this rung when ``optimize=True`` and the
+frozen tier misses the target on the real measurement fold.
 
 Fold hygiene is identical to distillation: teacher/synthetic data may TEACH
 (train fold); only held-out real records JUDGE (measure fold decides whether

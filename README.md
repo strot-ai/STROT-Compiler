@@ -142,7 +142,12 @@ milliseconds, at $0 and zero LLM calls.
 - The optimizer compiles once; the battery decides forever. The compiled
   artifact is content-addressed; a schema change triggers exactly one recompile,
   nothing else does. There is no runtime loop: compile is a single pass, and the
-  battery never retrains itself.
+  battery never retrains itself. Each battery lands on disk as
+  `battery_<task>_<hash>.py` and carries all its task-specific parameters inline
+  — routing labels, calibration, the distilled head, and (the fine-tune tier)
+  the LoRA weights — so the only external dependency is the shared base-model
+  checkpoint it loads at runtime. Pass `name=` to label the file; otherwise the
+  slug is derived from your query.
 - Cheapest tier that clears your bar. The optimizer keeps the cheapest rung that
   meets your target on held-out real records: a zero-shot route, then a logistic
   head distilled onto the frozen encoder. Both are frozen tiers and cover most
