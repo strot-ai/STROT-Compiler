@@ -749,6 +749,8 @@ class StrotCompiler:
         measure_labels: bool = False,
         distill: bool = False,
         target_accuracy: Optional[float] = None,
+        optimize: bool = False,
+        reuse_adapter: Optional[Dict[str, Any]] = None,
     ) -> CompiledAsset:
         """Run the full compile-time pipeline and return the production asset.
 
@@ -780,6 +782,28 @@ class StrotCompiler:
                 bake the winner - measurement instead of guessing. Needs the
                 teacher labels, so it shares the one teacher call with
                 target_risk (free when calibrating; otherwise triggers it).
+            optimize: Permit the fine-tune tier (:mod:`strot.finetune`) above
+                frozen distillation. Only escalates when the frozen tier
+                (zero-shot / distilled head) misses the target on the real
+                measurement fold; the fine-tune tier is then trained on the same
+                three-way folds and the measured winner is kept (recorded in
+                ``CompiledAsset.model_search``). A no-op when the frozen tier
+                already clears the bar. Opt-in and heavy: needs the [finetune]
+                extra on the compile box - a missing extra degrades gracefully
+                to the frozen tier (recorded, never fatal).
+            reuse_adapter: Optional pre-built adapter battery to adopt before
+                training, shaped ``{"adapters": [ ... ], "config": { ... }}`` (a
+                prior :class:`strot.finetune.EnsembleResult`'s adapters + config,
+                or the equivalent from a stored battery). When ``optimize`` is on
+                and the frozen tier misses the bar, the battery is validated on
+                this task's real measure fold (no training); if it clears the bar
+                and beats the frozen baseline (and passes the golden gate), it is
+                adopted and training is skipped (recorded as
+                ``model_search["optimize"] == "reused"``). Otherwise the compiler
+                falls through to training. Calibration is always re-fit on this
+                task's calibrate fold, never reused from the old battery. Ignored
+                when ``optimize`` is off. A missing [finetune] extra degrades
+                gracefully.
         """
         if target_risk is not None and not 0 < target_risk < 1:
             raise RouterConfigurationError("target_risk must be in (0, 1).")
@@ -794,6 +818,11 @@ class StrotCompiler:
             raise RouterConfigurationError(
                 "distill requires a local decision model (the encoder supplies "
                 f"the embeddings); got {self.nlu_model!r}."
+            )
+        if optimize and self.runtime_kind != "local":
+            raise RouterConfigurationError(
+                "optimize requires a local decision model (the fine-tune tier "
+                f"serves a local adapter); got {self.nlu_model!r}."
             )
         if not action_registry:
             raise CompilationError("action_registry must contain at least one action.", attempts=0)
@@ -834,24 +863,41 @@ class StrotCompiler:
         label_search: Optional[Dict[str, Any]] = None
         model_search: Optional[Dict[str, Any]] = None
         runtime_override: Optional[str] = None
-        if target_risk is not None or measure_labels or distill or target_accuracy is not None:
+        # Drift/OOD artifact (per-class centroids + threshold on the frozen
+        # encoder embeddings), fitted only when an encoder runtime wins.
+        ood_artifact: Optional[Dict[str, Any]] = None
+        if (
+            target_risk is not None or measure_labels or distill
+            or target_accuracy is not None or optimize
+        ):
             records = _sample_records(sample)
-            if distill:
+            if distill or optimize:
                 from . import distill as distill_mod
 
                 if len(records) < distill_mod.MIN_DISTILL_RECORDS:
                     raise RouterConfigurationError(
-                        f"distill needs at least {distill_mod.MIN_DISTILL_RECORDS} "
-                        f"sample records (got {len(records)}); raise sample_size."
+                        f"{'optimize' if optimize else 'distill'} needs at least "
+                        f"{distill_mod.MIN_DISTILL_RECORDS} sample records "
+                        f"(got {len(records)}); raise sample_size."
                     )
             # Chunked teacher labeling: one call per batch keeps the exact-
             # count contract reliable at any sample size.
+            from . import pii
+
             labels: List[str] = []
             _CHUNK = 50
             for _start in range(0, len(records), _CHUNK):
                 _chunk = records[_start:_start + _CHUNK]
+                # PII masking at the teacher boundary: real sample records are
+                # scrubbed before they reach the cloud teacher. Uses GLiNER
+                # (names/addresses) + regex (structured ids/secrets) when the
+                # [pii] extra is installed, else the regex baseline alone
+                # (pii.default_maskers caches the NER model). Masking affects
+                # only the teacher's view - the label indices it returns apply
+                # to the original records.
+                _masked_chunk = pii.mask_records(_chunk, maskers=pii.default_maskers())
                 teacher_prompt = self.build_teacher_prompt(
-                    goal, action_registry, _chunk
+                    goal, action_registry, _masked_chunk
                 )
                 labels_code, _ = self._synthesize_with(
                     teacher_prompt,
@@ -869,11 +915,11 @@ class StrotCompiler:
             action_keys = list(action_registry)
             true_indices = [action_keys.index(label) for label in labels]
 
-            # Fold hygiene: with distill, teacher-labeled records are split so
-            # training, judging (model/label search), and calibration never
-            # share data. Without distill, judging and calibration use all
+            # Fold hygiene: with distill/optimize, teacher-labeled records are
+            # split so training, judging (model/label search), and calibration
+            # never share data. Without them, judging and calibration use all
             # records (back-compatible).
-            if distill:
+            if distill or optimize:
                 from . import distill as distill_mod
 
                 train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
@@ -887,6 +933,10 @@ class StrotCompiler:
             true_measure = [true_indices[i] for i in measure_ix]
             records_calib = [records[i] for i in calib_ix]
             labels_calib = [labels[i] for i in calib_ix]
+            # Set when the fine-tune tier wins: its calibrate-fold softmax rows
+            # (aligned to calib_ix) feed the conformal/policy fit directly, so
+            # calibration never has to re-run a torch-only adapter at compile.
+            _ft_calibrate_dist: Optional[List[List[float]]] = None
 
             if measure_labels:
                 winner, winner_labels, scores = self._measure_labelings(
@@ -917,11 +967,9 @@ class StrotCompiler:
                         final_code = candidate_code
                         source = candidate_source
 
-            if distill:
+            if distill or optimize:
                 from . import distill as distill_mod
 
-                checkpoint = self._resolve_compile_checkpoint()
-                embed = distill_mod.make_encoder_embedder(checkpoint)
                 module = self._load_candidate_module(source)
                 try:
                     contexts = [
@@ -944,53 +992,230 @@ class StrotCompiler:
                     _sys.modules.pop("strot_golden_gate", None)
                 zero_shot_acc = round(zero_shot_correct / len(measure_ix), 4)
 
-                vectors = embed([contexts[i] for i in train_ix + measure_ix])
-                train_vectors = vectors[: len(train_ix)]
-                measure_vectors = vectors[len(train_ix):]
-                head_w, head_b = distill_mod.train_head(
-                    train_vectors,
-                    [true_indices[i] for i in train_ix],
-                    n_classes=len(action_keys),
-                )
-                distilled_acc = distill_mod.head_accuracy(
-                    measure_vectors, true_measure, head_w, head_b
-                )
                 model_search = {
                     "zero_shot": zero_shot_acc,
-                    "distilled": distilled_acc,
                     "n_train": len(train_ix),
                     "n_measure": len(measure_ix),
-                    "winner": "distilled" if distilled_acc > zero_shot_acc else "zero_shot",
+                    "winner": "zero_shot",
                 }
-                if model_search["winner"] == "distilled":
-                    head_code = (
-                        "\n\n# Compile-time-distilled head (train fold only)\n"
-                        f"HEAD_WEIGHTS = {head_w!r}\n"
-                        f"HEAD_BIAS = {head_b!r}"
+                # The frozen tier's best measure accuracy and the code/runtime
+                # that realizes it. The distilled head (if trained) competes
+                # against zero-shot; whichever wins is the frozen baseline the
+                # fine-tune tier must then beat to escalate.
+                frozen_acc = zero_shot_acc
+
+                if distill:
+                    checkpoint = self._resolve_compile_checkpoint()
+                    embed = distill_mod.make_encoder_embedder(checkpoint)
+                    vectors = embed([contexts[i] for i in train_ix + measure_ix])
+                    train_vectors = vectors[: len(train_ix)]
+                    measure_vectors = vectors[len(train_ix):]
+                    head_w, head_b = distill_mod.train_head(
+                        train_vectors,
+                        [true_indices[i] for i in train_ix],
+                        n_classes=len(action_keys),
                     )
-                    candidate_code = final_code + head_code
-                    candidate_source = self._assemble(
-                        schema, goal, dict(action_registry), candidate_code,
-                        question, runtime="distilled",
+                    distilled_acc = distill_mod.head_accuracy(
+                        measure_vectors, true_measure, head_w, head_b
                     )
-                    golden_error = (
-                        self._test_golden_pipeline(candidate_source, golden)
-                        if golden
-                        else None
-                    )
-                    if golden_error:
-                        model_search["winner_rejected_by_golden"] = True
-                        model_search["winner"] = "zero_shot"
+                    model_search["distilled"] = distilled_acc
+                    if distilled_acc > zero_shot_acc:
+                        model_search["winner"] = "distilled"
+                        # Drift/OOD guard: per-class centroids + a high
+                        # percentile of in-distribution nearest-centroid
+                        # distances, fit on the train-fold frozen embeddings
+                        # (same encoder the distilled runtime serves with). Only
+                        # fitted/baked when optimize=True, so a plain
+                        # optimize=False distilled compile keeps its old runtime
+                        # abstention behaviour (no OOD gate; the baked OOD literal
+                        # is empty, which the template treats as a no-op).
+                        candidate_ood: Optional[Dict[str, Any]] = None
+                        if optimize:
+                            from . import router as router_mod
+
+                            centroids = router_mod.class_centroids(
+                                train_vectors,
+                                [true_indices[i] for i in train_ix],
+                                n_classes=len(action_keys),
+                            )
+                            threshold = router_mod.ood_threshold(
+                                train_vectors, centroids, percentile=0.95
+                            )
+                            candidate_ood = {
+                                "centroids": centroids, "threshold": threshold,
+                                "percentile": 0.95, "basis": "distilled_frozen_encoder",
+                            }
+                        head_code = (
+                            "\n\n# Compile-time-distilled head (train fold only)\n"
+                            f"HEAD_WEIGHTS = {head_w!r}\n"
+                            f"HEAD_BIAS = {head_b!r}"
+                        )
+                        candidate_code = final_code + head_code
+                        candidate_source = self._assemble(
+                            schema, goal, dict(action_registry), candidate_code,
+                            question, runtime="distilled", ood=candidate_ood,
+                        )
+                        golden_error = (
+                            self._test_golden_pipeline(candidate_source, golden)
+                            if golden
+                            else None
+                        )
+                        if golden_error:
+                            model_search["winner_rejected_by_golden"] = True
+                            model_search["winner"] = "zero_shot"
+                        else:
+                            final_code = candidate_code
+                            source = candidate_source
+                            runtime_override = "distilled"
+                            frozen_acc = distilled_acc
+                            ood_artifact = candidate_ood
+                            if candidate_ood is not None:
+                                model_search["ood_threshold"] = candidate_ood["threshold"]
+
+                # --- Fine-tune escalation: only on a measured gap to a target ---
+                # Adaptive, not maximal: escalate only when a target_accuracy is
+                # set and the frozen tier misses it on the real measure fold. No
+                # target -> the frozen tier stays (no fine-tune); a target the
+                # frozen tier already clears -> no fine-tune either.
+                if optimize:
+                    frozen_bar = target_accuracy
+                    if frozen_bar is None:
+                        model_search["optimize"] = "skipped_no_target"
+                    elif frozen_acc >= frozen_bar:
+                        model_search["optimize"] = "skipped_frozen_cleared_bar"
                     else:
-                        final_code = candidate_code
-                        source = candidate_source
-                        runtime_override = "distilled"
+                        from . import finetune as finetune_mod
+
+                        # Shared adoption: bake a battery's adapters, golden-gate
+                        # it, and (on promotion) mutate the enclosing state. Both
+                        # the reuse and train paths use the same promotion so an
+                        # adopted battery is served like a trained one.
+                        def _adopt_battery(battery_result: Any) -> bool:
+                            nonlocal final_code, source, runtime_override
+                            nonlocal frozen_acc, _ft_calibrate_dist
+                            adapter_code = (
+                                "\n\n# Compile-time fine-tuned adapter battery "
+                                "(cached-lower + top-N LoRA; train fold only; "
+                                "softmax-averaged ensemble)\n"
+                                f"ADAPTER = {battery_result.adapters!r}\n"
+                                f"ADAPTER_CONFIG = {battery_result.config!r}"
+                            )
+                            candidate_code = final_code + adapter_code
+                            candidate_source = self._assemble(
+                                schema, goal, dict(action_registry),
+                                candidate_code, question, runtime="fine_tuned",
+                            )
+                            golden_error = (
+                                self._test_golden_pipeline(candidate_source, golden)
+                                if golden
+                                else None
+                            )
+                            if golden_error:
+                                model_search["winner_rejected_by_golden"] = True
+                                return False
+                            final_code = candidate_code
+                            source = candidate_source
+                            runtime_override = "fine_tuned"
+                            frozen_acc = battery_result.measure_accuracy
+                            model_search["winner"] = "fine_tuned"
+                            # The winner's calibrate-fold distributions feed the
+                            # conformal/policy fit downstream. They are scored on
+                            # this task's calibrate fold (never reused from an old
+                            # battery), so calibration is always re-fit on this
+                            # data.
+                            _ft_calibrate_dist = battery_result.calibrate_distributions
+                            return True
+
+                        # --- Adopt-or-train: find/reuse a pre-built battery
+                        # before training. A provided battery is validated on this
+                        # task's real measure fold only (no training); if it clears
+                        # the bar and beats the frozen baseline it is adopted and
+                        # training is skipped. A validation miss (or a missing
+                        # [finetune] extra) falls through to training, never fatal.
+                        reused = False
+                        if reuse_adapter is not None:
+                            try:
+                                reuse_result = finetune_mod.validate_adapter(
+                                    contexts,
+                                    true_indices,
+                                    n_classes=len(action_keys),
+                                    measure=measure_ix,
+                                    calibrate=calib_ix,
+                                    adapters=reuse_adapter["adapters"],
+                                    config=reuse_adapter["config"],
+                                )
+                            except RouterConfigurationError as exc:
+                                # Missing [finetune] extra: can't validate the
+                                # provided battery; record and fall through.
+                                model_search["optimize_reuse"] = "unavailable"
+                                model_search["optimize_reuse_error"] = str(exc)[:300]
+                                reuse_result = None
+                            if reuse_result is not None:
+                                reused_acc = reuse_result.measure_accuracy
+                                model_search["reused_measure_accuracy"] = reused_acc
+                                if (
+                                    reused_acc >= frozen_bar
+                                    and reused_acc > frozen_acc
+                                    and _adopt_battery(reuse_result)
+                                ):
+                                    model_search["optimize"] = "reused"
+                                    model_search["ensemble_size"] = len(
+                                        reuse_result.adapters
+                                    )
+                                    reused = True
+                                else:
+                                    # Validated but did not clear the bar / lost
+                                    # the golden gate: train normally.
+                                    model_search["optimize_reuse"] = "rejected"
+
+                        if not reused:
+                            try:
+                                # Ensemble escalation: train K diverse adapters
+                                # and judge on their member-averaged
+                                # distributions (the same average serving
+                                # computes). K is an internal knob
+                                # (FineTuneConfig.ensemble_size); the public API
+                                # exposes only `optimize`.
+                                ft_result = finetune_mod.finetune_ensemble(
+                                    contexts,
+                                    true_indices,
+                                    n_classes=len(action_keys),
+                                    measure=measure_ix,
+                                    calibrate=calib_ix,
+                                    train=train_ix,
+                                )
+                            except RouterConfigurationError as exc:
+                                # Missing [finetune] extra: degrade to the frozen
+                                # tier, record why, never crash the compile.
+                                model_search["fine_tuned"] = None
+                                model_search["optimize"] = "unavailable"
+                                model_search["optimize_error"] = str(exc)[:300]
+                                ft_result = None
+                            if ft_result is not None:
+                                finetuned_acc = ft_result.measure_accuracy
+                                model_search["fine_tuned"] = finetuned_acc
+                                model_search["ensemble_size"] = len(ft_result.adapters)
+                                model_search["member_accuracies"] = (
+                                    ft_result.member_accuracies
+                                )
+                                if finetuned_acc > frozen_acc:
+                                    _adopt_battery(ft_result)
 
             if target_risk is not None:
-                calibration = self._fit_calibration(
-                    source, records_calib, labels_calib, action_registry,
-                    question, goal, target_risk,
-                )
+                if _ft_calibrate_dist is not None:
+                    # Fine-tune tier won: calibrate on its own calibrate-fold
+                    # distributions (no torch re-run of the adapter needed).
+                    from . import calibrate as calibrate_mod
+
+                    true_calib = [true_indices[i] for i in calib_ix]
+                    calibration = calibrate_mod.fit_split_calibration(
+                        _ft_calibrate_dist, true_calib, alpha=target_risk
+                    )
+                else:
+                    calibration = self._fit_calibration(
+                        source, records_calib, labels_calib, action_registry,
+                        question, goal, target_risk,
+                    )
                 source = self._assemble(
                     schema,
                     goal,
@@ -1001,6 +1226,7 @@ class StrotCompiler:
                     conformal_q=float(calibration["conformal_quantile"]),
                     calibration=calibration,
                     runtime=runtime_override,
+                    ood=ood_artifact,
                 )
                 if golden:
                     error = self._test_golden_pipeline(source, golden)
@@ -1020,9 +1246,12 @@ class StrotCompiler:
                 true_calib = [
                     action_keys.index(label) for label in labels_calib
                 ]
-                dists = self._collect_distributions(
-                    source, records_calib, action_registry, question, goal
-                )
+                if _ft_calibrate_dist is not None:
+                    dists = _ft_calibrate_dist  # fine-tune tier's own rows
+                else:
+                    dists = self._collect_distributions(
+                        source, records_calib, action_registry, question, goal
+                    )
                 # Fold hygiene inside the policy fit: corrections on half A,
                 # the dispatch cutoff on disjoint half B.
                 a_d, a_t = dists[0::2], true_calib[0::2]
@@ -1082,6 +1311,7 @@ class StrotCompiler:
                     dispatch_cutoff=cutoff if cutoff is not None else 1.1,
                     policy=policy,
                     runtime=runtime_override,
+                    ood=ood_artifact,
                 )
                 if golden:
                     error = self._test_golden_pipeline(source, golden)
@@ -1425,6 +1655,7 @@ class StrotCompiler:
         class_bias: Optional[List[float]] = None,
         dispatch_cutoff: Optional[float] = None,
         policy: Optional[Dict[str, Any]] = None,
+        ood: Optional[Dict[str, Any]] = None,
     ) -> str:
         header = templates.ASSET_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
@@ -1437,10 +1668,13 @@ class StrotCompiler:
             class_bias=repr(class_bias),
             dispatch_cutoff=repr(dispatch_cutoff),
             policy_literal=repr(policy or {}),
+            ood_literal=repr(ood or {}),
             schema_literal=repr(schema.to_dict()),
         )
         if runtime == "distilled":
             runtime_template = templates.DISTILLED_RUNTIME_TEMPLATE
+        elif runtime == "fine_tuned":
+            runtime_template = templates.FINETUNED_RUNTIME_TEMPLATE
         elif self.runtime_kind == "hosted":
             runtime_template = templates.HOSTED_RUNTIME_TEMPLATE
         else:

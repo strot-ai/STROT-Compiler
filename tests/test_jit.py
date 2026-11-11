@@ -229,6 +229,13 @@ class TestCacheKey:
         fp_b = schema_fingerprint(introspect_schema(reordered))
         assert fp_a == fp_b
 
+    def test_optimize_flag_changes_key(self):
+        schema = introspect_schema(SAMPLE)
+        plain = cache_key(QUERY, REGISTRY, "SupersonicLabs/Julia-1", schema, None, 0.40)
+        optimized = cache_key(QUERY, REGISTRY, "SupersonicLabs/Julia-1", schema,
+                              None, 0.40, optimize=True)
+        assert plain != optimized
+
 
 # --------------------------------------------------------------------- #
 # The JIT loop: miss -> compile -> persist; hit -> execute only          #
@@ -361,20 +368,21 @@ class TestRun:
         assert second.cache_key != first.cache_key
         assert first.artifact_path.exists() and second.artifact_path.exists()
 
-    def test_low_confidence_records_collect_as_fallbacks(self, tmp_path, fake_runtime):
-        # Three actions so a zero-overlap record ties at ~0.33 < 0.40; with
-        # only two, a tie sits at exactly 0.5 and would still dispatch.
+    def test_low_confidence_dispatched_with_confidence_without_target(self, tmp_path, fake_runtime):
+        # Default (no target): STROT never hard-abstains. A low-confidence,
+        # zero-overlap record (ties at ~0.33) is DISPATCHED with its low
+        # confidence shown, not collected as a fallback. Hard abstention is
+        # opt-in via target_risk / target_accuracy.
         registry3 = dict(REGISTRY, lifecycle="Account deletion and data export requests")
         paths3 = make_paths(["billing", "defect", "lifecycle"])
         with_unroutable = SAMPLE + [{"ticket_id": 3, "body": "zzz qqq", "tier": None}]
         result = strot.run(
             with_unroutable, QUERY, registry3, llm=ScriptedLLM([paths3]), state=tmp_path
         )
-        assert len(result.outcomes) == 2
-        assert len(result.fallbacks) == 1
-        fallback = result.fallbacks[0]
-        assert fallback["record"]["ticket_id"] == 3
-        assert fallback["confidence"] < 0.40
+        assert len(result.outcomes) == 3  # everything dispatched, nothing refused
+        assert len(result.fallbacks) == 0  # no abstain without a target
+        unroutable = [o for o in result.outcomes if o["record"]["ticket_id"] == 3][0]
+        assert unroutable["confidence"] < 0.40  # the low confidence is shown, not hidden
 
     def test_execute_false_warms_cache_without_runtime(self, tmp_path):
         # No fake torch here: loading the artifact would fail, proving the
@@ -609,6 +617,347 @@ class TestDistill:
         assert plain.cache_key != distilled.cache_key
 
 
+class TestOptimize:
+    """The optimize flag + fine-tune escalation (no torch: finetune_adapter is
+    faked). Mirrors TestDistill's sample/teacher so folds behave identically."""
+
+    BIG_SAMPLE = TestDistill.BIG_SAMPLE
+    TEACHER = TestDistill.TEACHER
+
+    # Labels the keyword router cannot match -> zero-shot misses on the measure
+    # fold, so the frozen tier does not clear the bar and optimize escalates.
+    BAD_LABELS = VALID_PATHS.replace(
+        'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}',
+        'ROUTING_LABELS = {"billing": "zzz", "defect": "qqq"}',
+    )
+
+    @staticmethod
+    def _fake_trainer(measure_acc, n_classes=2):
+        """A fake finetune_adapter: emits per-measure-row distributions whose
+        argmax hits ``measure_acc`` of the real measure-fold labels, so the
+        ensemble's own recomputed accuracy (from the averaged rows) matches.
+        Every member returns identical rows, so the K-way average is stable."""
+        from strot.finetune import FineTuneResult
+
+        def _trainer(texts, labels, n_cls, measure, calibrate, train, config=None):
+            measure = list(measure)
+            n_hit = round(measure_acc * len(measure))
+            rows = []
+            for pos, idx in enumerate(measure):
+                true = int(labels[idx])
+                # First n_hit rows peak on the true class; the rest peak wrong.
+                peak = true if pos < n_hit else (true + 1) % n_cls
+                rows.append([0.9 if c == peak else 0.1 / (n_cls - 1) for c in range(n_cls)])
+            calib = [[0.8, 0.2], [0.3, 0.7]] * 3
+            return FineTuneResult(
+                measure_accuracy=measure_acc,
+                measure_distributions=rows,
+                calibrate_distributions=calib,
+                adapter={
+                    "__head_weight__": [[0.0]] * n_cls,
+                    "__head_bias__": [0.0] * n_cls,
+                },
+                config={"base_model": "x", "cut": 0, "n_layers": 1, "lora_rank": 2,
+                        "lora_alpha": 4, "max_length": 8, "n_classes": n_cls,
+                        "device": "cpu"},
+            )
+
+        return _trainer
+
+    def test_optimize_is_part_of_cache_key(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        monkeypatch.setattr(ft_mod, "finetune_adapter", self._fake_trainer(1.0))
+        plain = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                          llm=ScriptedLLM([VALID_PATHS]), state=tmp_path, sample_size=28)
+        optimized = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                              llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                              state=tmp_path, sample_size=28, optimize=True, execute=False)
+        assert plain.cache_key != optimized.cache_key
+
+    def test_optimize_without_target_is_a_noop(self, tmp_path, fake_runtime, monkeypatch):
+        # Adaptive, not maximal: optimize=True WITHOUT a target_accuracy must
+        # never fine-tune (there is no measured gap to close), even when the
+        # frozen tier is imperfect (BAD_LABELS -> zero-shot misses).
+        import strot.finetune as ft_mod
+
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("finetune_adapter called though no target was set")
+
+        monkeypatch.setattr(ft_mod, "finetune_adapter", _boom)
+        monkeypatch.setattr(ft_mod, "finetune_ensemble", _boom)
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["optimize"] == "skipped_no_target"
+        assert search["winner"] == "zero_shot"
+        assert "ADAPTER" not in result.artifact_path.read_text()
+
+    def test_frozen_clears_bar_is_a_noop(self, tmp_path, fake_runtime, monkeypatch):
+        # VALID_PATHS -> keyword router scores 1.0 on the measure fold, so with
+        # a target_accuracy of 0.9 the frozen tier CLEARS the bar and the
+        # fine-tune tier must not be invoked.
+        import strot.finetune as ft_mod
+
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("finetune_adapter called though frozen cleared the bar")
+
+        monkeypatch.setattr(ft_mod, "finetune_adapter", _boom)
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([VALID_PATHS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["optimize"] == "skipped_frozen_cleared_bar"
+        assert search["winner"] == "zero_shot"
+        assert "ADAPTER" not in result.artifact_path.read_text()
+
+    def test_finetune_wins_when_it_beats_frozen(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        monkeypatch.setattr(ft_mod, "finetune_adapter", self._fake_trainer(0.95))
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["winner"] == "fine_tuned"
+        # Ensemble judges on the member-averaged distributions: accuracy is
+        # recomputed from those rows (>= the frozen baseline it must beat).
+        assert search["fine_tuned"] > search["zero_shot"]  # frozen missed
+        assert search["ensemble_size"] == 3  # default internal battery width
+        assert len(search["member_accuracies"]) == 3
+        source = result.artifact_path.read_text()
+        # The list of adapters is baked (serving averages them).
+        assert "ADAPTER = [" in source and "fine_tuned" in meta["runtime_kind"]
+
+    def test_frozen_kept_when_finetune_cannot_beat_it(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        # Fine-tune accuracy no better than the (missed) zero-shot baseline.
+        monkeypatch.setattr(ft_mod, "finetune_adapter", self._fake_trainer(0.0))
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["model_search"]["winner"] == "zero_shot"
+        assert "ADAPTER" not in result.artifact_path.read_text()
+
+    def test_missing_extra_degrades_gracefully(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        from strot.exceptions import RouterConfigurationError as RCE
+
+        def _no_extra(*a, **k):
+            raise RCE("The fine-tune tier needs the finetune extra")
+
+        monkeypatch.setattr(ft_mod, "finetune_adapter", _no_extra)
+        # Must not crash: falls back to the frozen tier and records why.
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["optimize"] == "unavailable"
+        assert "finetune extra" in search["optimize_error"]
+        assert search["winner"] == "zero_shot"
+        assert "ADAPTER" not in result.artifact_path.read_text()
+
+    def test_optimize_requires_local_runtime(self, tmp_path):
+        with pytest.raises(RouterConfigurationError, match="optimize requires"):
+            strot.run(self.BIG_SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(),
+                      nlu="openai/gpt-4o", state=tmp_path, sample_size=28, optimize=True)
+
+    def test_optimize_requires_enough_records(self, tmp_path, fake_runtime):
+        with pytest.raises(RouterConfigurationError, match="sample_size"):
+            strot.run(SAMPLE, QUERY, REGISTRY,
+                      llm=ScriptedLLM([VALID_PATHS, "x"]),
+                      state=tmp_path, optimize=True)
+
+
+class TestReuseAdapter:
+    """Adopt a pre-built adapter battery before training (find/reuse first).
+
+    No torch: strot.finetune.validate_adapter and finetune_ensemble are faked,
+    so the compiler's adopt-or-train branch is exercised purely in Python.
+    """
+
+    BIG_SAMPLE = TestDistill.BIG_SAMPLE
+    TEACHER = TestDistill.TEACHER
+    BAD_LABELS = TestOptimize.BAD_LABELS
+
+    #: A pre-built battery shaped like a prior EnsembleResult's adapters+config.
+    REUSE = {
+        "adapters": [{"__head_bias__": [0.0, 0.0]}, {"__head_bias__": [0.0, 0.0]}],
+        "config": {"base_model": "x", "cut": 0, "n_layers": 1, "lora_rank": 2,
+                   "lora_alpha": 4, "max_length": 8, "n_classes": 2, "device": "cpu"},
+    }
+
+    @staticmethod
+    def _fake_validator(measure_acc, calib_row=None):
+        """A fake validate_adapter returning an EnsembleResult whose averaged
+        measure rows hit ``measure_acc`` of the real measure-fold labels. The
+        calibrate rows are sized to the real calibrate fold; ``calib_row`` sets
+        a distinctive per-row signature (default is a plain [0.8, 0.2])."""
+        from strot.finetune import EnsembleResult
+
+        def _validate(texts, labels, n_classes, measure, calibrate, adapters, config,
+                      _loader=None):
+            measure = list(measure)
+            n_hit = round(measure_acc * len(measure))
+            rows = []
+            for pos, idx in enumerate(measure):
+                true = int(labels[idx])
+                peak = true if pos < n_hit else (true + 1) % n_classes
+                rows.append([0.9 if c == peak else 0.1 / (n_classes - 1)
+                             for c in range(n_classes)])
+            row = calib_row or [0.8, 0.2]
+            return EnsembleResult(
+                measure_accuracy=measure_acc,
+                measure_distributions=rows,
+                calibrate_distributions=[list(row) for _ in calibrate],
+                adapters=list(adapters),
+                config=dict(config),
+            )
+
+        return _validate
+
+    def test_adopts_when_validates_and_skips_training(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+
+        def _never_trains(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("finetune_ensemble called though reuse validated")
+
+        monkeypatch.setattr(ft_mod, "validate_adapter", self._fake_validator(0.95))
+        monkeypatch.setattr(ft_mod, "finetune_ensemble", _never_trains)
+        # target_accuracy=0.9 is the bar: frozen (BAD labels) misses it, the
+        # reused battery (0.95) clears it -> adopt, skip training.
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9, reuse_adapter=self.REUSE, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["optimize"] == "reused"
+        assert search["winner"] == "fine_tuned"
+        assert search["reused_measure_accuracy"] == 0.95
+        assert search["ensemble_size"] == 2  # the provided battery width
+        assert "fine_tuned" in meta["runtime_kind"]
+        # The battery's adapters are baked, exactly like a trained winner.
+        assert "ADAPTER = [" in result.artifact_path.read_text()
+
+    def test_trains_when_reuse_fails_to_clear_bar(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        trained = {"called": False}
+
+        monkeypatch.setattr(ft_mod, "validate_adapter", self._fake_validator(0.0))
+
+        # Use the real ensemble over the faked member trainer so training runs.
+        monkeypatch.setattr(ft_mod, "finetune_adapter", TestOptimize._fake_trainer(0.95))
+        orig_ensemble = ft_mod.finetune_ensemble
+
+        def _spy_ensemble(*a, **k):
+            trained["called"] = True
+            return orig_ensemble(*a, **k)
+
+        monkeypatch.setattr(ft_mod, "finetune_ensemble", _spy_ensemble)
+        # Bar 0.9: frozen misses it, the reused battery (0.0) also misses it ->
+        # reuse rejected, fall through to training.
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9, reuse_adapter=self.REUSE, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert trained["called"] is True  # fell through to training
+        assert search["optimize_reuse"] == "rejected"
+        assert search["reused_measure_accuracy"] == 0.0
+        assert search["winner"] == "fine_tuned"  # the trained battery won
+
+    def test_reuse_missing_extra_degrades_to_training(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        from strot.exceptions import RouterConfigurationError as RCE
+
+        def _no_extra(*a, **k):
+            raise RCE("The fine-tune tier needs the finetune extra")
+
+        monkeypatch.setattr(ft_mod, "validate_adapter", _no_extra)
+        monkeypatch.setattr(ft_mod, "finetune_adapter", TestOptimize._fake_trainer(0.95))
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           target_accuracy=0.9, reuse_adapter=self.REUSE, execute=False)
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["optimize_reuse"] == "unavailable"
+        assert "finetune extra" in search["optimize_reuse_error"]
+        assert search["winner"] == "fine_tuned"  # trained path still ran
+
+    def test_calibration_refit_on_this_task_not_reused(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        from strot import calibrate as calibrate_mod
+
+        # A distinctive calibrate signature so we can prove it drove the fit.
+        sentinel_row = [0.73, 0.27]
+        monkeypatch.setattr(
+            ft_mod, "validate_adapter", self._fake_validator(0.95, calib_row=sentinel_row)
+        )
+        monkeypatch.setattr(ft_mod, "finetune_ensemble",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("should not train")))
+
+        seen = {}
+        orig_fit = calibrate_mod.fit_temperature
+
+        def _spy_fit(dists, true_indices):
+            seen["dists"] = dists
+            return orig_fit(dists, true_indices)
+
+        monkeypatch.setattr(calibrate_mod, "fit_temperature", _spy_fit)
+        # target_accuracy=0.9: frozen (BAD labels) misses the bar, the reused
+        # battery (0.95) clears it and is adopted; the policy fit then runs on
+        # the battery's own calibrate-fold rows. measure_labels=False so the
+        # label search can't rescue the BAD labels and clear the bar frozen.
+        strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                  llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                  state=tmp_path, sample_size=28, optimize=True,
+                  reuse_adapter=self.REUSE, target_accuracy=0.9,
+                  measure_labels=False, execute=False)
+        # Calibration ran on the adopted battery's own calibrate-fold rows
+        # (scored on this task's calibrate fold), never skipped. Every row is
+        # the sentinel signature -> the reused battery's rows drove the fit.
+        assert seen["dists"] and all(r == sentinel_row for r in seen["dists"])
+
+    def test_reuse_adapter_is_part_of_cache_key(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+        monkeypatch.setattr(ft_mod, "finetune_adapter", TestOptimize._fake_trainer(0.95))
+        monkeypatch.setattr(ft_mod, "validate_adapter", self._fake_validator(0.95))
+        plain = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                          llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                          state=tmp_path, sample_size=28, optimize=True, execute=False)
+        reused = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([self.BAD_LABELS, self.TEACHER]),
+                           state=tmp_path, sample_size=28, optimize=True,
+                           reuse_adapter=self.REUSE, execute=False)
+        assert plain.cache_key != reused.cache_key
+
+    def test_reuse_ignored_when_optimize_off(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.finetune as ft_mod
+
+        def _boom(*a, **k):  # pragma: no cover - must never run without optimize
+            raise AssertionError("validate_adapter called though optimize is off")
+
+        monkeypatch.setattr(ft_mod, "validate_adapter", _boom)
+        # optimize off: reuse_adapter is inert, no fine-tune tier touched.
+        result = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                           llm=ScriptedLLM([VALID_PATHS]),
+                           state=tmp_path, sample_size=28,
+                           reuse_adapter=self.REUSE, execute=False)
+        assert result.artifact_path.exists()
+
+
 class TestTargetAccuracy:
     # 24 labeled records: 16 clear (separable by keyword), 8 ambiguous.
     SAMPLE24 = (
@@ -763,4 +1112,3 @@ class TestDecide:
         llm = ScriptedLLM([missing_rubric, VALID_DECIDE])
         result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
         assert result.attempts == 2
-

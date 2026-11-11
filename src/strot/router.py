@@ -67,6 +67,78 @@ class RuntimeStrategy(ABC):
         """Return the winning option with a calibrated confidence score."""
 
 
+def class_centroids(
+    vectors: Sequence[Sequence[float]],
+    labels: Sequence[int],
+    n_classes: int,
+) -> List[List[float]]:
+    """Mean embedding per class (pure Python).
+
+    Returns ``centroids[n_classes][dim]``. A class with no training vectors
+    gets a zero centroid - it can never be the nearest, so it never anchors an
+    in-distribution decision. Rounded to plain floats so the artifact stores
+    literals, not tensors.
+    """
+    if not vectors:
+        raise ValueError("need at least one vector to form centroids")
+    dim = len(vectors[0])
+    sums = [[0.0] * dim for _ in range(n_classes)]
+    counts = [0] * n_classes
+    for vector, label in zip(vectors, labels):
+        row = sums[label]
+        for d, x in enumerate(vector):
+            row[d] += x
+        counts[label] += 1
+    return [
+        [round(s / counts[c], 6) for s in sums[c]] if counts[c] else [0.0] * dim
+        for c in range(n_classes)
+    ]
+
+
+def _euclidean(a: Sequence[float], b: Sequence[float]) -> float:
+    return math.sqrt(sum((x - y) * (x - y) for x, y in zip(a, b)))
+
+
+def nearest_centroid_distance(
+    vector: Sequence[float],
+    centroids: Sequence[Sequence[float]],
+) -> float:
+    """Distance from ``vector`` to the closest class centroid (pure Python)."""
+    if not centroids:
+        raise ValueError("need at least one centroid")
+    return min(_euclidean(vector, c) for c in centroids)
+
+
+def ood_threshold(
+    vectors: Sequence[Sequence[float]],
+    centroids: Sequence[Sequence[float]],
+    percentile: float = 0.95,
+) -> float:
+    """A high percentile of in-distribution nearest-centroid distances.
+
+    Fit on the training embeddings themselves: the ``percentile`` quantile of
+    each record's distance to its nearest centroid. At runtime a record farther
+    than this is flagged out-of-distribution. Pure Python, stored as a float.
+    """
+    if not vectors:
+        raise ValueError("need vectors to fit an OOD threshold")
+    if not 0.0 < percentile <= 1.0:
+        raise ValueError("percentile must be in (0, 1]")
+    distances = sorted(nearest_centroid_distance(v, centroids) for v in vectors)
+    # Nearest-rank percentile (inclusive), clamped to the last index.
+    rank = min(len(distances) - 1, max(0, math.ceil(percentile * len(distances)) - 1))
+    return round(distances[rank], 6)
+
+
+def is_ood(
+    vector: Sequence[float],
+    centroids: Sequence[Sequence[float]],
+    threshold: float,
+) -> bool:
+    """True iff ``vector`` is farther than ``threshold`` from every centroid."""
+    return nearest_centroid_distance(vector, centroids) > threshold
+
+
 def chunk_options(options: Sequence[str], max_flat: int = MAX_FLAT_OPTIONS) -> List[List[str]]:
     """Split an oversized option list into balanced groups of <= ``max_flat``.
 
@@ -164,6 +236,161 @@ class LocalEncoderStrategy(RuntimeStrategy):
         result = self._engine.predict(rows=[self.build_row(context, question, options)])[0]
         index = int(result["index"])
         probs = [float(p) for p in result["probabilities"]]
+        return RouteDecision(
+            index=index,
+            option=options[index],
+            confidence=probs[index],
+            distribution=dict(zip(options, probs)),
+        )
+
+
+def _load_finetuned_forward(adapter: Dict[str, Any], config: Dict[str, Any]) -> Any:
+    """Rebuild the cached-lower + top-N LoRA model from a saved adapter.
+
+    Reconstructs the exact architecture :func:`strot.finetune.finetune_adapter`
+    trained (base encoder frozen, lower layers replaced by pass-throughs, top-N
+    layers carrying LoRA, plus the classifier head), loads the saved trainable
+    tensors, and returns ``(tokenizer, forward)`` where ``forward(texts)`` emits
+    pooled softmax distribution rows. Torch-guarded like the fine-tune tier.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        from huggingface_hub import snapshot_download
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - env guard
+        raise RouterConfigurationError(
+            "Serving a fine-tuned adapter needs the finetune extra: "
+            "pip install strot-ai[finetune]"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    path = snapshot_download(config["base_model"])
+    tok = AutoTokenizer.from_pretrained(path)
+    model = AutoModel.from_pretrained(path).to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    n_layers = int(config["n_layers"])
+    cut = int(config["cut"])
+    dim = model.config.hidden_size
+    max_len = int(config["max_length"])
+
+    class _Passthrough(nn.Module):
+        def __init__(self, attention_type: Any) -> None:
+            super().__init__()
+            self.attention_type = attention_type
+
+        def forward(self, hidden_states: Any, **kwargs: Any) -> Any:
+            return (hidden_states,)
+
+    class _LoRALinear(nn.Module):
+        def __init__(self, inner: Any, r: int, alpha: int) -> None:
+            super().__init__()
+            self.inner = inner
+            self.A = nn.Parameter(torch.zeros(inner.in_features, r))
+            self.B = nn.Parameter(torch.zeros(r, inner.out_features))
+            self.scaling = alpha / r
+
+        def forward(self, x: Any) -> Any:
+            return self.inner(x) + (x @ self.A @ self.B) * self.scaling
+
+    def _wrap(module: Any) -> None:
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear):
+                setattr(module, name, _LoRALinear(child, int(config["lora_rank"]), int(config["lora_alpha"])))
+            else:
+                _wrap(child)
+
+    # Serving runs the real frozen lower layers, not pass-throughs. The cached
+    # activations injected at train time are a deterministic function of the
+    # frozen lower stack, so re-running it reproduces the exact input the LoRA
+    # top layers were trained on. Only the top-N layers carry the adapter.
+    for i in range(cut, n_layers):
+        _wrap(model.layers[i])
+
+    # Load the saved trainable tensors (LoRA A/B) by name.
+    own = dict(model.named_parameters())
+    for name, value in adapter.items():
+        if name.startswith("__"):
+            continue
+        if name in own:
+            own[name].data = torch.tensor(value, device=device)
+    head = nn.Linear(dim, int(config["n_classes"])).to(device)
+    head.weight.data = torch.tensor(adapter["__head_weight__"], device=device)
+    head.bias.data = torch.tensor(adapter["__head_bias__"], device=device)
+    model.eval()
+    head.eval()
+
+    def forward(texts: Sequence[str]) -> List[List[float]]:
+        import torch.nn.functional as F
+
+        enc = tok(
+            list(texts), padding="max_length", truncation=True,
+            max_length=max_len, return_tensors="pt",
+        )
+        ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+        rows: List[List[float]] = []
+        with torch.no_grad():
+            for i in range(0, len(texts), 16):
+                last = model(
+                    input_ids=ids[i:i + 16], attention_mask=mask[i:i + 16]
+                ).last_hidden_state
+                m = mask[i:i + 16].unsqueeze(-1).float()
+                pooled = (last * m).sum(1) / m.sum(1).clamp(min=1.0)
+                rows.extend(F.softmax(head(pooled), dim=1).cpu().tolist())
+        return rows
+
+    return tok, forward
+
+
+class FineTunedAdapterStrategy(RuntimeStrategy):
+    """Serve a compile-time fine-tuned battery: cached-lower + top-N LoRA.
+
+    Loads the base encoder plus one or more saved adapters (the top-N LoRA
+    tensors + classifier head from
+    :class:`strot.finetune.FineTuneResult`) and produces pooled softmax
+    distributions. When ``adapters`` holds more than one adapter they are run
+    over the shared frozen base and their softmax rows are averaged (prediction
+    ensemble). Torch-guarded like the fine-tune tier.
+    """
+
+    def __init__(
+        self,
+        adapters: Sequence[Dict[str, Any]],
+        config: Dict[str, Any],
+        nlu_model: str = DEFAULT_NLU_MODEL,
+    ) -> None:
+        if not adapters:
+            raise RouterConfigurationError("FineTunedAdapterStrategy needs >= 1 adapter.")
+        self.nlu_model = nlu_model
+        self._adapters = list(adapters)
+        self._config = config
+        self._forwards: Optional[List[Any]] = None
+
+    def _ensure_loaded(self) -> None:
+        if self._forwards is not None:
+            return
+        self._forwards = [
+            _load_finetuned_forward(adapter, self._config)[1]
+            for adapter in self._adapters
+        ]
+
+    def distributions(self, texts: Sequence[str]) -> List[List[float]]:
+        """Averaged softmax rows over the K adapters (K=1 is the single case)."""
+        self._ensure_loaded()
+        assert self._forwards is not None
+        per_adapter = [forward(texts) for forward in self._forwards]
+        if len(per_adapter) == 1:
+            return per_adapter[0]
+        n = len(per_adapter)
+        return [
+            [sum(rows[r][c] for rows in per_adapter) / n for c in range(len(per_adapter[0][0]))]
+            for r in range(len(per_adapter[0]))
+        ]
+
+    def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+        probs = self.distributions([context])[0]
+        index = max(range(len(probs)), key=probs.__getitem__)
         return RouteDecision(
             index=index,
             option=options[index],

@@ -26,6 +26,7 @@ from .router import (
     CONFIDENCE_THRESHOLD,
     DEFAULT_NLU_MODEL,
     MAX_FLAT_OPTIONS,
+    FineTunedAdapterStrategy,
     HostedApiStrategy,
     LocalEncoderStrategy,
     RouteDecision,
@@ -36,7 +37,7 @@ from .router import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 
 from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
@@ -63,6 +64,7 @@ __all__ = [
     "RuntimeStrategy",
     "LocalEncoderStrategy",
     "HostedApiStrategy",
+    "FineTunedAdapterStrategy",
     "RouteDecision",
     "Router",
     "create_router",

@@ -125,6 +125,23 @@ def schema_fingerprint(schema: DatasetSchema) -> List[List[str]]:
     )
 
 
+def _reuse_adapter_key(reuse_adapter: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A stable, compact cache-key projection of a reuse-adapter battery.
+
+    The raw adapters are MB of float tensors - unsuitable for a cache key. The
+    battery's identity for keying is its config (base_model, cut, n_layers,
+    lora_rank, lora_alpha, max_length, n_classes) plus how many adapters it
+    carries; two batteries with the same config and width compile the same
+    adopt-or-train decision. ``None`` when no battery is provided.
+    """
+    if reuse_adapter is None:
+        return None
+    return {
+        "config": reuse_adapter.get("config"),
+        "n_adapters": len(reuse_adapter.get("adapters") or []),
+    }
+
+
 def cache_key(
     query: str,
     action_registry: Optional[Mapping[str, str]],
@@ -138,6 +155,8 @@ def cache_key(
     measure_labels: bool = False,
     distill: bool = False,
     target_accuracy: Optional[float] = None,
+    optimize: bool = False,
+    reuse_adapter: Optional[Mapping[str, Any]] = None,
 ) -> str:
     from . import __version__
 
@@ -155,6 +174,11 @@ def cache_key(
         "measure_labels": measure_labels,
         "distill": distill,
         "target_accuracy": target_accuracy,
+        "optimize": optimize,
+        # A reused-adapter compile must key differently from a trained one.
+        # Hash a stable projection (the adapter config + battery size), never
+        # the raw float tensors, so the key is small and deterministic.
+        "reuse_adapter": _reuse_adapter_key(reuse_adapter),
     }
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -256,6 +280,8 @@ def run(
     measure_labels: Optional[bool] = None,
     distill: bool = False,
     target_accuracy: Optional[float] = None,
+    optimize: bool = False,
+    reuse_adapter: Optional[Mapping[str, Any]] = None,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -316,6 +342,24 @@ def run(
             auto-decided records meet the accuracy target; below-cutoff
             records abstain. An empirical fit, NOT a finite-sample
             guarantee; reported in POLICY metadata.
+        optimize: Permit the fine-tune tier (strot.finetune) above frozen
+            distillation. When the frozen tier (zero-shot / distilled head)
+            misses the target on the held-out measurement fold, a
+            cached-lower + top-N LoRA adapter is trained on the same folds
+            and the measured winner is kept; a no-op when the frozen tier
+            already clears the bar. Opt-in and heavy: needs the [finetune]
+            extra on the compile box (degrades gracefully to the frozen
+            tier if it is missing). Implies distill-style fold hygiene, so
+            use a larger sample_size (100+).
+        reuse_adapter: Optional pre-built adapter battery to adopt before
+            training (``{"adapters": [ ... ], "config": { ... }}`` - a prior
+            compile's baked ADAPTER / ADAPTER_CONFIG). When optimize is on and
+            the frozen tier misses the bar, the battery is validated on this
+            task's real measure fold (no training); if it clears the bar it is
+            adopted and training is skipped. A validation miss falls through to
+            training. Calibration is always re-fit on this task's own data. Part
+            of the cache key (a reused compile keys differently from a trained
+            one). Ignored when optimize is off.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -332,7 +376,8 @@ def run(
     key = cache_key(
         query, action_registry, nlu, schema, question, confidence_threshold,
         golden=golden, target_risk=target_risk, measure_labels=effective_measure,
-        distill=distill, target_accuracy=target_accuracy,
+        distill=distill, target_accuracy=target_accuracy, optimize=optimize,
+        reuse_adapter=reuse_adapter,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -356,6 +401,8 @@ def run(
                 measure_labels=effective_measure,
                 distill=distill,
                 target_accuracy=target_accuracy,
+                optimize=optimize,
+                reuse_adapter=reuse_adapter,
             )
         except Exception as exc:
             _log_episode(state, {
@@ -437,6 +484,8 @@ def decide(
     max_retries: int = 3,
     execute: bool = True,
     golden: Optional[List[Mapping[str, Any]]] = None,
+    optimize: bool = False,
+    reuse_adapter: Optional[Mapping[str, Any]] = None,
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
@@ -462,6 +511,10 @@ def decide(
     score rubrics, boolean case descriptions, and the state projection; at
     runtime the local ML decision model answers all questions per record in
     one batched pass. Output is bounded, type-safe JSON - nothing generated.
+
+    ``optimize`` and ``reuse_adapter`` are accepted for API parity with
+    :func:`run` and participate in the cache key; decide mode has no
+    routing-tier escalation, so they are otherwise inert here.
     """
     if isinstance(questions, str):
         questions = json.loads(questions)
@@ -477,7 +530,7 @@ def decide(
     canonical_config = json.dumps(questions, sort_keys=True)
     key = cache_key(
         canonical_config, None, nlu, schema, None, 0.0, mode="decide",
-        golden=golden,
+        golden=golden, optimize=optimize, reuse_adapter=reuse_adapter,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 

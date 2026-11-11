@@ -41,16 +41,39 @@ CLASS_BIAS = {class_bias}
 DISPATCH_CUTOFF = {dispatch_cutoff}
 POLICY: Dict[str, Any] = {policy_literal}
 
+#: Drift / out-of-distribution guard fitted at compile time (None = disabled).
+#: {{"centroids": per-class mean embeddings, "threshold": max in-distribution
+#: nearest-centroid distance}}. At runtime a record whose pooled embedding is
+#: farther than threshold from every centroid is forced to abstain (status
+#: "ood") - only the encoder runtimes (distilled / fine-tuned) can embed.
+OOD: Dict[str, Any] = {ood_literal}
+
 DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
 
 
 class FallbackException(Exception):
     """Low-confidence routing refusal: do not execute any path blindly."""
 
-    def __init__(self, message: str, confidence: float, threshold: float) -> None:
+    def __init__(
+        self, message: str, confidence: float, threshold: float, status: str = "abstain"
+    ) -> None:
         super().__init__(message)
         self.confidence = confidence
         self.threshold = threshold
+        self.status = status  # "abstain" | "ood"
+
+
+def _nearest_centroid_distance(vector: Sequence[float], centroids: Sequence[Sequence[float]]) -> float:
+    return min(
+        math.sqrt(sum((x - y) * (x - y) for x, y in zip(vector, c)))
+        for c in centroids
+    )
+
+
+def _is_ood(vector: Sequence[float]) -> bool:
+    """True iff ``vector`` is farther than the fitted threshold from every
+    class centroid (drift / out-of-distribution guard; OOD must be set)."""
+    return _nearest_centroid_distance(vector, OOD["centroids"]) > OOD["threshold"]
 
 
 @dataclass(frozen=True)
@@ -184,7 +207,8 @@ class _RuntimeRouter:
         )
         self._model.eval()
 
-    def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+    def embed(self, context: str) -> List[float]:
+        """Mean-pooled frozen-encoder embedding (also feeds the OOD guard)."""
         inputs = self._tokenizer(
             [context], return_tensors="pt", padding=True,
             truncation=True, max_length=256,
@@ -193,7 +217,10 @@ class _RuntimeRouter:
             hidden = self._model(**inputs).last_hidden_state
         mask = inputs["attention_mask"].unsqueeze(-1).float()
         pooled = ((hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0))[0]
-        vector = pooled.tolist()
+        return pooled.tolist()
+
+    def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+        vector = self.embed(context)
         logits = [
             sum(w * x for w, x in zip(row, vector)) + b
             for row, b in zip(HEAD_WEIGHTS, HEAD_BIAS)
@@ -202,6 +229,111 @@ class _RuntimeRouter:
         exps = [math.exp(z - peak) for z in logits]
         total = sum(exps)
         probs = [e / total for e in exps]
+        index = max(range(len(probs)), key=probs.__getitem__)
+        return RouteDecision(
+            index=index,
+            option=options[index],
+            confidence=probs[index],
+            distribution=dict(zip(options, probs)),
+        )
+'''
+
+FINETUNED_RUNTIME_TEMPLATE = '''\
+# --- Runtime architecture: compile-time fine-tuned adapter (cached-lower + top-N LoRA) ---
+# The adapter(s) below were trained at compile time on teacher-labeled real
+# records (train fold only) and baked in as ADAPTER / ADAPTER_CONFIG literals.
+# Multiple adapters are averaged at inference (prediction ensemble).
+try:
+    import torch
+    import torch.nn as _nn
+    import torch.nn.functional as _F
+    from huggingface_hub import snapshot_download
+    from transformers import AutoModel, AutoTokenizer
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        "This fine-tuned asset serves a LoRA adapter: pip install strot-ai[finetune]"
+    ) from _exc
+
+
+class _PassthroughLayer(_nn.Module):
+    def __init__(self, attention_type: Any) -> None:
+        super().__init__()
+        self.attention_type = attention_type
+
+    def forward(self, hidden_states: Any, **kwargs: Any) -> Any:
+        return (hidden_states,)
+
+
+class _LoRALinear(_nn.Module):
+    def __init__(self, inner: Any, r: int, alpha: int) -> None:
+        super().__init__()
+        self.inner = inner
+        self.A = _nn.Parameter(torch.zeros(inner.in_features, r))
+        self.B = _nn.Parameter(torch.zeros(r, inner.out_features))
+        self.scaling = alpha / r
+
+    def forward(self, x: Any) -> Any:
+        return self.inner(x) + (x @ self.A @ self.B) * self.scaling
+
+
+def _build_adapter_forward(adapter: Dict[str, Any], config: Dict[str, Any]) -> Any:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    path = snapshot_download(config["base_model"])
+    tok = AutoTokenizer.from_pretrained(path)
+    model = AutoModel.from_pretrained(path).to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    n_layers = int(config["n_layers"])
+    cut = int(config["cut"])
+    dim = model.config.hidden_size
+    max_len = int(config["max_length"])
+
+    def _wrap(module: Any) -> None:
+        for name, child in list(module.named_children()):
+            if isinstance(child, _nn.Linear):
+                setattr(module, name, _LoRALinear(child, int(config["lora_rank"]), int(config["lora_alpha"])))
+            else:
+                _wrap(child)
+
+    # Serving runs the real frozen lower layers (the cached train-time
+    # activations are a deterministic function of them); only the top-N layers
+    # carry the adapter.
+    for i in range(cut, n_layers):
+        _wrap(model.layers[i])
+    own = dict(model.named_parameters())
+    for name, value in adapter.items():
+        if not name.startswith("__") and name in own:
+            own[name].data = torch.tensor(value, device=device)
+    head = _nn.Linear(dim, int(config["n_classes"])).to(device)
+    head.weight.data = torch.tensor(adapter["__head_weight__"], device=device)
+    head.bias.data = torch.tensor(adapter["__head_bias__"], device=device)
+    model.eval()
+    head.eval()
+
+    def forward(text: str) -> List[float]:
+        enc = tok([text], padding="max_length", truncation=True,
+                  max_length=max_len, return_tensors="pt")
+        ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+        with torch.no_grad():
+            last = model(input_ids=ids, attention_mask=mask).last_hidden_state
+            m = mask.unsqueeze(-1).float()
+            pooled = (last * m).sum(1) / m.sum(1).clamp(min=1.0)
+            return _F.softmax(head(pooled), dim=1)[0].cpu().tolist()
+
+    return forward
+
+
+class _RuntimeRouter:
+    """Frozen base + top-N LoRA adapter(s), softmax-averaged over the battery."""
+
+    def __init__(self) -> None:
+        adapters = ADAPTER if isinstance(ADAPTER, list) else [ADAPTER]
+        self._forwards = [_build_adapter_forward(a, ADAPTER_CONFIG) for a in adapters]
+
+    def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+        per = [forward(context) for forward in self._forwards]
+        n = len(per)
+        probs = [sum(row[c] for row in per) / n for c in range(len(per[0]))]
         index = max(range(len(probs)), key=probs.__getitem__)
         return RouteDecision(
             index=index,
@@ -437,6 +569,18 @@ class CompiledPipeline:
         question: str = {default_question!r},
     ) -> Dict[str, Any]:
         context = route_context(dict(record))  # compile-time-synthesized projection
+        # Drift / OOD guard: if fitted and this runtime can embed, a record whose
+        # pooled embedding is farther than the threshold from every class
+        # centroid is refused up front (status "ood") - never dispatched.
+        if OOD and hasattr(self._router, "embed"):
+            if _is_ood(self._router.embed(context)):
+                raise FallbackException(
+                    "Record is out-of-distribution (farther than the fitted "
+                    "threshold from every class centroid); falling back.",
+                    confidence=0.0,
+                    threshold=CONFIDENCE_THRESHOLD,
+                    status="ood",
+                )
         decision = self._router.select(context, question, _ROUTING_OPTIONS)
         # Inference-level correction (fitted at compile): temperature +
         # per-class bias over the arbiter's distribution.
@@ -478,13 +622,10 @@ class CompiledPipeline:
                         confidence, DISPATCH_CUTOFF, POLICY.get("target_accuracy")
                     )
                 )
-        else:
-            if decision.confidence < CONFIDENCE_THRESHOLD:
-                abstain_reason = (
-                    "Routing confidence {{0:.3f}} below threshold {{1:.2f}}".format(
-                        decision.confidence, CONFIDENCE_THRESHOLD
-                    )
-                )
+        # No target set -> never hard-abstain: always dispatch and publish the
+        # confidence so the caller can decide what to do with a low score (route
+        # to a human, apply a default). Hard abstention is opt-in via target_risk
+        # (conformal prediction set) or target_accuracy (dispatch cutoff).
         if abstain_reason is None:
             action_key = _ACTION_KEYS[index]
             result = _HANDLERS[action_key](dict(record))

@@ -229,11 +229,14 @@ class TestCompiledAssetExecution:
         assert outcome["result"] == {"queue": "engineering", "ticket_id": 7}
         assert outcome["confidence"] == pytest.approx(0.95)
 
-    def test_low_confidence_triggers_asset_fallback(self, monkeypatch):
+    def test_low_confidence_dispatched_with_confidence_no_target(self, monkeypatch):
+        # No target -> never hard-abstain: a low-confidence route still
+        # dispatches, with the low confidence surfaced for the caller to act on.
+        # (Hard abstention is opt-in via target_risk / target_accuracy.)
         ns = self._run_asset(monkeypatch, {"selected_index": 0, "confidence": 0.2})
-        with pytest.raises(ns["FallbackException"]) as error:
-            ns["CompiledPipeline"]().process({"ticket_id": 7, "body": "???"})
-        assert error.value.confidence == pytest.approx(0.2)
+        outcome = ns["CompiledPipeline"]().process({"ticket_id": 7, "body": "???"})
+        assert outcome["action"] == "billing"  # selected_index 0
+        assert outcome["confidence"] == pytest.approx(0.2)
 
     def test_default_route_skips_calibration_math(self, monkeypatch):
         ns = self._run_asset(monkeypatch, {"selected_index": 1, "confidence": 0.95})

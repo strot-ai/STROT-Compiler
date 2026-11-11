@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "0.11.1"
+version = "0.12.0"
 description = "STROT: compile-time LLM code synthesis with deterministic, self-routing NLU runtimes (local transformer or hosted API)"
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
@@ -33,12 +33,20 @@ safetensors = { version = ">=0.5", optional = true }
 huggingface-hub = { version = ">=0.26", optional = true }
 openai = { version = ">=1.30", optional = true }
 anthropic = { version = ">=0.80", optional = true }
+gliner = { version = ">=0.2", optional = true }
+sentencepiece = { version = ">=0.2", optional = true }
 
 [tool.poetry.extras]
 local = ["transformers", "torch", "safetensors", "huggingface-hub"]
+finetune = ["transformers", "torch", "safetensors", "huggingface-hub"]
+# [pii] = NER masking for unstructured PII (names, addresses) at the teacher
+# boundary; layered on top of the zero-dep regex baseline for structured ids.
+# sentencepiece is required for GLiNER's DeBERTa-v3 tokenizer (else it routes
+# to tiktoken and fails to load).
+pii = ["gliner", "transformers", "torch", "sentencepiece"]
 hosted = ["openai"]
 anthropic = ["anthropic"]
-all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic"]
+all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic", "gliner", "sentencepiece"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
