@@ -78,14 +78,16 @@ flowchart TB
         direction LR
         A["intent + data sample"] --> B["synthesize<br/>labels · projection · handlers"]
         B --> C["golden gate<br/>(must pass your known answers)"]
-        C --> D["teacher labels a sample<br/>(once)"]
-        D --> E["fit confidence threshold"]
+        C --> D["PII-mask the sample →<br/>teacher labels it (once)"]
+        D --> E["fit calibration"]
+        E -.->|optimize + target,<br/>frozen misses the bar| J["fine-tune once<br/>top-N LoRA + ensemble"]
         E --> F[["frozen .py artifact"]]
+        J --> F
     end
     subgraph runtime["RUNTIME — every record"]
         direction LR
         F --> G["project record"]
-        G --> H["decision model<br/>144M · CPU · ~60ms"]
+        G --> H["decision model<br/>local · CPU · ~60ms"]
         H --> I["typed JSON decision<br/>+ calibrated confidence"]
         I -.->|target set:<br/>below the bar| K["abstain → fallbacks"]
     end
@@ -118,45 +120,22 @@ result = strot.decide(records, questions={
 # {"booleans": {...}, "scores": {...}, "choices": {...}}  with probabilities + confidence
 ```
 
-## Numbers
+## Where it fits
 
-Real model (SupersonicLabs/Julia-1, 144M, CPU), real datasets, run in clean
-Docker containers. The benchmark scripts are in [`benchmarks/`](benchmarks/),
-losses included.
+STROT is built for record-level decisions on messy real text — the kind cyber,
+financial, and insurance triage actually run on. Easy tasks (routing,
+tool-selection) stay on the frozen tier and never need more. Harder,
+representation-bound tasks — where the right call hinges on a distinction a small
+frozen encoder can't see on its own — are what the opt-in fine-tune tier is for.
 
-| Benchmark | Result |
-|---|---|
-| Grounded routing (398 records) | 92.5% compiled vs 74.8% naive — the compiler is worth +18pp on the same model |
-| Semantic text, unseen labels (AG News) | 86.7% compiled vs 72.7% naive (+14pp) |
-| Typed decisions vs a leading hosted decision API's own example | near-identical (sentiment 1.79 vs 1.8) |
-| Latency / marginal cost / LLM calls per record | ~60ms · $0 · 0 |
-
-### On real risk narratives
-
-Record-level unstructured text, the kind cyber / financial / insurance triage
-actually runs on. Public ground-truth datasets, classes balanced so accuracy is
-interpretable, baselines shown. STROT never sees the test labels.
-([`benchmarks/risk_narratives.py`](benchmarks/risk_narratives.py))
-
-| Task — 6-class, balanced | Random | Majority | Naive | Compiled | Abstains |
-|---|---|---|---|---|---|
-| Cyber — [VERIS/VCDB](https://github.com/vz-risk/VCDB) incident note → attack action | 16.7% | 16.7% | 36.8% | 39.5% | 8/114 |
-| Finance — [CFPB](https://www.consumerfinance.gov/data-research/consumer-complaints/) complaint → product | 16.7% | 26.4% | 54.2% | 61.1% | 5/72 |
-
-Both clear their baselines and the compiler lifts accuracy on the same 144M
-model; the abstains come from running these with a target set. These are honest
-proof the architecture works on messy real text, not production underwriting
-accuracy. For that you'd put a task-trained specialist in the `nlu=` slot; the
+The product metric isn't blanket accuracy; it's reliability on the slice the
+model is confident about (coverage at your target). Calibration and the
+fine-tune ensemble are what move that slice. For production-grade accuracy on a
+specific domain, drop a task-trained specialist into the `nlu=` slot — the
 compiler, calibration, and gate don't change.
 
-Single-seed numbers, so read them as ranges, not guarantees. The frozen tier
-lands around the low-60s to low-70s; turning on the fine-tune tier
-(`optimize=True` with a target) pushes the hard representation-bound tasks into
-the low-to-mid-70s. The real win isn't the headline accuracy — it's coverage on
-the confident slice (cov@90), which is what the calibration and the fine-tune
-ensemble move most. (And a measured non-result: synthesizing training data with
-the LLM hurt both numbers, which is why STROT only labels real data — see
-[Data](#data).)
+Runtime cost is the point: every decision runs locally on CPU, in tens of
+milliseconds, at $0 and zero LLM calls.
 
 ## What's actually going on under the hood
 
@@ -205,10 +184,10 @@ guard format-defined tokens (email, SSN, Luhn card, API keys, IBAN, IP/MAC/
 phone). Without the `[pii]` extra it falls back to regex-only with a warning.
 Masking is compile-time only.
 
-Synthetic data is a last resort, not a default. We measured it: LLM-generated
-synthetic records hurt — roughly −2pp accuracy and −17pp cov@90 on the cyber
-task — because they come out too clean and tend to leak the label. So the policy
-is real-first: label real data, and handle class imbalance by pulling and
+Synthetic data is a last resort, not a default. We measured it, and LLM-generated
+synthetic records hurt both accuracy and the confident slice — they come out too
+clean and tend to leak the label. So the policy is real-first: label real data,
+and handle class imbalance by pulling and
 labeling more real minority-class records (or oversampling / weighting the real
 minority). Reach for synthetic only to seed a near-empty class, never to "scale
 up."
