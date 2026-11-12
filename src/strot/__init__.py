@@ -42,11 +42,27 @@ __version__ = "0.12.0"
 from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
 
+# Battery distribution: a compiled catalog classifier as data (bundle on disk)
+# served by a data-parameterized runtime in the package. Imported after
+# __version__ so export can stamp the bundle. Local filesystem only for now.
+from .battery import (  # noqa: E402
+    Battery,
+    battery_info,
+    export_bundle,
+    list_batteries,
+    load,
+)
+
 __all__ = [
     "run",
     "decide",
     "RunResult",
     "prefetch_nlu",
+    "Battery",
+    "load",
+    "list_batteries",
+    "battery_info",
+    "export_bundle",
     "CompiledAsset",
     "StrotCompiler",
     "openai_llm_client",
