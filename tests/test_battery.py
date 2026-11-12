@@ -430,3 +430,242 @@ def test_catalog_helpers_roundtrip(_torch_distilled_env, tmp_path):
     assert info["runtime_kind"] == "distilled"
     # battery_info is torch-free (reads json only).
     assert "labels" in info
+
+
+# --------------------------------------------------------------------------- #
+# Hub resolution: a bare name -> files cached from the HF hub (MOCKED)         #
+# --------------------------------------------------------------------------- #
+#
+# huggingface_hub.hf_hub_download is monkeypatched to serve files out of a tmp
+# bundle written by Stage 1 helpers, so NO real network is touched. The catalog
+# / metadata / resolve *plumbing* is torch-free and always runs; only the final
+# Battery.decide parity gate is gated behind the torch importorskip.
+
+
+def _write_battery_json(directory, metadata):
+    """Write just a bundle's battery.json (torch-free, no weights file).
+
+    Lets the manifest / info / resolve plumbing be asserted without safetensors
+    or numpy installed; the weights-bearing round-trip uses export_bundle under
+    the torch fixture instead.
+    """
+    import json
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "battery.json").write_text(json.dumps(metadata), encoding="utf-8")
+    return directory / "battery.json"
+
+
+def _metadata_for(name):
+    """A torch-free battery.json payload captured from a compiled asset."""
+    source = _distilled_source(
+        temperature=1.0, dispatch_cutoff=0.3, policy={"target_accuracy": 0.7},
+    )
+    asset = types.SimpleNamespace(
+        source=source, runtime_kind="distilled", goal="triage tickets",
+        nlu_model="SupersonicLabs/Julia-1",
+    )
+    metadata, _tensors, _ = bat._collect_bundle(asset, name=name, question="which queue?")
+    return metadata
+
+
+class _HubStub:
+    """Stand-in for huggingface_hub.hf_hub_download backed by an on-disk tree.
+
+    ``root`` mirrors the dataset repo layout (``manifest.json`` at the top,
+    ``<name>/battery.json`` + ``<name>/weights.safetensors`` per battery). Each
+    call records its kwargs and either returns the matching local path or raises
+    a 404-shaped error for an unknown file, exactly as the real downloader does.
+    """
+
+    class EntryNotFoundError(Exception):
+        pass
+
+    def __init__(self, root):
+        self.root = root
+        self.calls = []
+
+    def __call__(self, *, repo_id, repo_type, filename, revision=None):
+        self.calls.append(
+            {"repo_id": repo_id, "repo_type": repo_type,
+             "filename": filename, "revision": revision}
+        )
+        target = self.root / filename
+        if not target.exists():
+            raise self.EntryNotFoundError(f"404: {filename} not in {repo_id}")
+        return str(target)
+
+
+@pytest.fixture
+def _hub(monkeypatch, tmp_path):
+    """Install a mocked huggingface_hub.hf_hub_download over a tmp repo tree."""
+    hub_mod = pytest.importorskip("huggingface_hub")
+    repo_root = tmp_path / "repo"
+    stub = _HubStub(repo_root)
+    monkeypatch.setattr(hub_mod, "hf_hub_download", stub)
+    return types.SimpleNamespace(root=repo_root, stub=stub)
+
+
+def test_list_batteries_returns_hub_manifest(_hub):
+    import json
+
+    manifest = {
+        "format_version": 1,
+        "batteries": [
+            {"name": "triage", "task": "triage tickets", "nlu_model": "x",
+             "runtime_kind": "distilled", "strot_version": "0.1.3"},
+            {"name": "sentiment", "task": "classify sentiment", "nlu_model": "x",
+             "runtime_kind": "fine_tuned", "strot_version": "0.1.3"},
+        ],
+    }
+    _hub.root.mkdir(parents=True, exist_ok=True)
+    (_hub.root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    # No source argument -> resolves the hub manifest's batteries list.
+    out = list_batteries()
+    assert [b["name"] for b in out] == ["triage", "sentiment"]
+    # It downloaded exactly the root manifest from the pinned dataset repo.
+    assert _hub.stub.calls == [
+        {"repo_id": "strot-ai/batteries", "repo_type": "dataset",
+         "filename": "manifest.json", "revision": None}
+    ]
+
+
+def test_battery_info_resolves_from_hub(_hub):
+    meta = _metadata_for("triage")
+    _write_battery_json(_hub.root / "triage", meta)
+
+    info = battery_info("triage")
+    assert info["name"] == "triage"
+    assert info["runtime_kind"] == "distilled"
+    assert "labels" in info  # torch-free, metadata only
+    assert _hub.stub.calls[0]["filename"] == "triage/battery.json"
+    assert _hub.stub.calls[0]["repo_type"] == "dataset"
+
+
+def test_repo_override_arg_and_env(_hub, monkeypatch):
+    meta = _metadata_for("triage")
+    _write_battery_json(_hub.root / "triage", meta)
+
+    # Explicit repo= arg flows through to the download.
+    battery_info("triage", repo="acme/batteries")
+    assert _hub.stub.calls[-1]["repo_id"] == "acme/batteries"
+
+    # STROT_BATTERY_REPO overrides the pinned default when no arg is given.
+    monkeypatch.setenv("STROT_BATTERY_REPO", "env/batteries")
+    battery_info("triage")
+    assert _hub.stub.calls[-1]["repo_id"] == "env/batteries"
+
+    # The explicit arg still wins over the env var.
+    battery_info("triage", repo="acme/batteries")
+    assert _hub.stub.calls[-1]["repo_id"] == "acme/batteries"
+
+
+def test_revision_is_forwarded(_hub):
+    meta = _metadata_for("triage")
+    _write_battery_json(_hub.root / "triage", meta)
+    battery_info("triage", revision="v2")
+    assert _hub.stub.calls[-1]["revision"] == "v2"
+
+
+def test_unknown_battery_name_errors(_hub):
+    # Nothing published under that name -> the actionable "not found" guidance.
+    with pytest.raises(Exception) as exc:
+        battery_info("does-not-exist")
+    msg = str(exc.value)
+    assert "not found" in msg
+    assert "list_batteries" in msg
+
+
+def test_local_dir_never_calls_hub(_hub, tmp_path):
+    # An existing local directory input stays on the Stage 1 local path; the hub
+    # mock must not be touched.
+    source = _distilled_source()
+    asset = types.SimpleNamespace(
+        source=source, runtime_kind="distilled", goal="triage tickets",
+        nlu_model="SupersonicLabs/Julia-1",
+    )
+    meta, _tensors, _ = bat._collect_bundle(asset, name="triage")
+    bundle = tmp_path / "local_triage"
+    _write_battery_json(bundle, meta)
+
+    info = battery_info(bundle)
+    assert info["name"] == "triage"
+    assert _hub.stub.calls == []  # no hub download made for a local dir
+
+
+def test_list_batteries_local_dir_never_calls_hub(_hub, tmp_path):
+    source = _distilled_source()
+    asset = types.SimpleNamespace(
+        source=source, runtime_kind="distilled", goal="triage tickets",
+        nlu_model="SupersonicLabs/Julia-1",
+    )
+    meta, _tensors, _ = bat._collect_bundle(asset, name="triage")
+    catalog = tmp_path / "catalog"
+    _write_battery_json(catalog / "triage", meta)
+
+    infos = list_batteries(catalog)
+    assert {i["name"] for i in infos} == {"triage"}
+    assert all("path" in i for i in infos)
+    assert _hub.stub.calls == []  # local listing makes no hub call
+
+
+def test_missing_huggingface_hub_errors(monkeypatch):
+    # Simulate huggingface_hub being absent: the lazy import inside the hub path
+    # must raise the actionable install guidance, not a bare ImportError.
+    import builtins
+
+    # Drop any already-imported huggingface_hub so the lazy import re-runs and
+    # hits the faked __import__ below instead of the module cache.
+    for mod in list(sys.modules):
+        if mod == "huggingface_hub" or mod.startswith("huggingface_hub."):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    real_import = builtins.__import__
+
+    def _no_hub(name, *args, **kwargs):
+        if name == "huggingface_hub" or name.startswith("huggingface_hub."):
+            raise ImportError("No module named 'huggingface_hub'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_hub)
+
+    with pytest.raises(Exception) as exc:
+        battery_info("triage")
+    msg = str(exc.value)
+    assert "huggingface_hub" in msg
+    # Points at the actionable remedy (the extra or the direct install).
+    assert "strot-ai[local]" in msg or "pip install huggingface_hub" in msg
+
+
+def test_name_resolves_and_matches_local_load(_hub, _torch_distilled_env, tmp_path):
+    # The torch-backed gate: a name resolved from the (mocked) hub builds a
+    # Battery whose decision matches the SAME bundle loaded locally.
+    source = _distilled_source(
+        temperature=1.0, dispatch_cutoff=0.3, policy={"target_accuracy": 0.7},
+    )
+    asset = types.SimpleNamespace(
+        source=source, runtime_kind="distilled", goal="triage tickets",
+        nlu_model="SupersonicLabs/Julia-1",
+    )
+    # Publish the full bundle (battery.json + weights.safetensors) under the
+    # repo tree the hub stub serves from.
+    export_bundle(asset, _hub.root / "triage", name="triage", question="which queue?")
+
+    context = "double charged"
+
+    # Local load of the very same files, for a reference decision.
+    local_battery = load(_hub.root / "triage")
+    local_verdict = local_battery.decide(context)
+
+    # Name -> hub resolve: downloads battery.json + weights, builds a Battery.
+    hub_battery = load("triage")
+    assert isinstance(hub_battery, Battery)
+    hub_verdict = hub_battery.decide(context)
+
+    assert hub_verdict == local_verdict
+
+    # It fetched exactly the two per-battery files from the dataset repo.
+    fetched = {c["filename"] for c in _hub.stub.calls}
+    assert fetched == {"triage/battery.json", "triage/weights.safetensors"}
+    assert all(c["repo_type"] == "dataset" for c in _hub.stub.calls)

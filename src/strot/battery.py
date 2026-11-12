@@ -43,8 +43,17 @@ datum the decision path needs is already a module-level literal in that source
 ``DISPATCH_CUTOFF``, ``CALIBRATION``, ``POLICY``, ``OOD``, ``HEAD_WEIGHTS`` /
 ``HEAD_BIAS`` or ``ADAPTER`` / ``ADAPTER_CONFIG``), so a literal read is both the
 single source of truth and a guarantee the bundle cannot drift from the baked
-artifact. Only local filesystem bundles are supported here; hub download is a
-later stage.
+artifact.
+
+Distribution has two sources. A local filesystem bundle (or catalog directory)
+is read straight off disk. A **bare battery name** resolves from the hub: a
+single pinned Hugging Face *dataset* repo (:data:`DEFAULT_BATTERY_REPO`) holding
+a root ``manifest.json`` catalog plus per-battery ``<name>/battery.json`` +
+``<name>/weights.safetensors``. :func:`load` / :func:`list_batteries` /
+:func:`battery_info` pick disk vs hub by the argument: an existing local
+directory stays local, everything else resolves against the hub via
+``huggingface_hub`` (imported lazily, needed only on that path; the catalog /
+metadata reads stay torch-free).
 """
 
 from __future__ import annotations
@@ -71,6 +80,18 @@ WEIGHTS_FILENAME = "weights.safetensors"
 #: zero-shot local (Julia) and hosted runtimes are excluded: their "weights"
 #: are an external checkpoint / an API, not shippable bundle data.
 SUPPORTED_RUNTIME_KINDS = ("distilled", "fine_tuned")
+
+#: The pinned hub repo a bare battery name resolves against: a single HF
+#: *dataset* repo holding every published bundle plus a root ``manifest.json``.
+#: Fixed by default so a bare name never resolves somewhere untrusted; a caller
+#: can retarget it with ``repo=`` or the ``STROT_BATTERY_REPO`` env var (the arg
+#: wins over the env, the env over this default), but it is never inferred from
+#: the name itself.
+DEFAULT_BATTERY_REPO = "strot-ai/batteries"
+
+#: The catalog file at the hub repo root: ``{"format_version", "batteries":
+#: [{name, task, nlu_model, runtime_kind, strot_version, ...}, ...]}``.
+MANIFEST_FILENAME = "manifest.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -717,47 +738,236 @@ def _resolve_checkpoint(nlu_model: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Public catalog helpers (local filesystem only)                              #
+# Hub resolution (a bare battery name -> files cached from the HF hub)         #
 # --------------------------------------------------------------------------- #
 
 
-def load(path: Union[str, Path]) -> Battery:
-    """Load a battery bundle directory into a :class:`Battery`."""
-    return Battery.from_bundle(path)
+def _resolve_repo(repo: Optional[str]) -> str:
+    """Pick the hub repo to resolve a bare name against.
+
+    Precedence: explicit ``repo=`` arg > ``STROT_BATTERY_REPO`` env var >
+    :data:`DEFAULT_BATTERY_REPO`. The default stays pinned so a bare name never
+    silently resolves somewhere untrusted; overriding it is an explicit act.
+    """
+    import os
+
+    if repo is not None:
+        return repo
+    return os.environ.get("STROT_BATTERY_REPO") or DEFAULT_BATTERY_REPO
 
 
-def battery_info(name_or_path: Union[str, Path]) -> Dict[str, Any]:
-    """Read a bundle's ``battery.json`` without loading any weights.
+def _hf_hub_download(repo: str, filename: str, revision: Optional[str]) -> str:
+    """Download one file from the hub dataset repo, returning its cached path.
 
-    ``name_or_path`` is a bundle directory (or the path to its ``battery.json``).
-    Torch-free: this only reads metadata.
+    ``huggingface_hub`` is only needed on this hub path, so it is imported
+    lazily here (never at module import) and a missing install surfaces the same
+    actionable ``strot-ai[local]`` guidance the runtime uses. Reading a battery
+    catalog / metadata needs only this dependency — no torch — so the import is
+    deliberately kept independent of the runtime's safetensors/torch guards.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RouterConfigurationError(
+            "Resolving a battery by name downloads it from the Hugging Face hub, "
+            "which needs huggingface_hub. Install the extra or the package "
+            "directly:\n"
+            "  pip install strot-ai[local]\n"
+            "  pip install huggingface_hub\n"
+            "(Or pass a local bundle directory path instead of a name.)"
+        ) from exc
+    return hf_hub_download(
+        repo_id=repo,
+        repo_type="dataset",
+        filename=filename,
+        revision=revision,
+    )
+
+
+def _hub_file_missing(exc: Exception) -> bool:
+    """True iff a hub download failed because the requested file is not there.
+
+    A 404 (``EntryNotFoundError`` / ``RepositoryNotFoundError``) means an
+    unknown battery; any other failure (offline, auth, transport) is a different
+    class of problem and should surface its own message rather than be reported
+    as "not found".
+    """
+    name = type(exc).__name__
+    if name in ("EntryNotFoundError", "RepositoryNotFoundError"):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in (401, 404)
+
+
+def _download_battery_json(repo: str, name: str, revision: Optional[str]) -> Dict[str, Any]:
+    """Fetch and parse ``<name>/battery.json`` from the hub, torch-free.
+
+    A missing battery is turned into an actionable "not found" error pointing
+    the caller at :func:`list_batteries`; other download failures propagate.
+    """
+    try:
+        path = _hf_hub_download(repo, f"{name}/{METADATA_FILENAME}", revision)
+    except RouterConfigurationError:
+        raise
+    except Exception as exc:
+        if _hub_file_missing(exc):
+            raise RouterConfigurationError(
+                f"battery {name!r} not found in {repo!r}; run "
+                "strot.list_batteries() to see available batteries."
+            ) from exc
+        raise RouterConfigurationError(
+            f"Could not download battery {name!r} from {repo!r}: {exc}. "
+            "Check your network connection and the battery name "
+            "(strot.list_batteries() lists what is published)."
+        ) from exc
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _resolve_bundle_from_hub(name: str, repo: str, revision: Optional[str]) -> Path:
+    """Download a battery's two files from the hub, returning their directory.
+
+    ``hf_hub_download`` caches each file under the HF cache and lays the repo's
+    ``<name>/battery.json`` + ``<name>/weights.safetensors`` out under a common
+    snapshot directory, so the two cached paths share a parent that is a valid
+    bundle directory :meth:`Battery.from_bundle` can read unchanged.
+    """
+    # Fetch battery.json first so an unknown name fails fast with the "not
+    # found" guidance before we attempt the (larger) weights file.
+    try:
+        meta_path = _hf_hub_download(repo, f"{name}/{METADATA_FILENAME}", revision)
+    except RouterConfigurationError:
+        raise
+    except Exception as exc:
+        if _hub_file_missing(exc):
+            raise RouterConfigurationError(
+                f"battery {name!r} not found in {repo!r}; run "
+                "strot.list_batteries() to see available batteries."
+            ) from exc
+        raise RouterConfigurationError(
+            f"Could not download battery {name!r} from {repo!r}: {exc}. "
+            "Check your network connection and the battery name."
+        ) from exc
+    try:
+        _hf_hub_download(repo, f"{name}/{WEIGHTS_FILENAME}", revision)
+    except RouterConfigurationError:
+        raise
+    except Exception as exc:
+        raise RouterConfigurationError(
+            f"Downloaded {name!r}'s metadata but not its weights from {repo!r}: "
+            f"{exc}. The published bundle may be incomplete."
+        ) from exc
+    return Path(meta_path).parent
+
+
+def _looks_like_path(name_or_path: Union[str, Path]) -> bool:
+    """True iff the argument names an existing local bundle directory.
+
+    Name-vs-path disambiguation is deliberately conservative: only an existing
+    local directory takes the Stage 1 local path; everything else (a bare name,
+    or a path that is not a directory on disk) resolves against the hub. A hub
+    battery name is a plain identifier, never a filesystem path, so there is no
+    ambiguity for a published catalog.
+    """
+    return Path(name_or_path).is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# Public catalog helpers (local filesystem + hub)                             #
+# --------------------------------------------------------------------------- #
+
+
+def load(
+    name_or_path: Union[str, Path],
+    *,
+    repo: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> Battery:
+    """Load a battery into a :class:`Battery`, from disk or the hub.
+
+    ``name_or_path`` is either an existing local bundle directory (loaded
+    unchanged, Stage 1 behavior) or a bare battery name resolved from the hub.
+    A name downloads ``<name>/battery.json`` + ``<name>/weights.safetensors``
+    from the pinned ``repo`` dataset (``huggingface_hub`` caches them), then
+    builds the battery from the cached files. ``repo`` / ``STROT_BATTERY_REPO``
+    retarget the repo; ``revision`` pins a branch/tag/commit.
+    """
+    if _looks_like_path(name_or_path):
+        return Battery.from_bundle(name_or_path)
+    directory = _resolve_bundle_from_hub(
+        str(name_or_path), _resolve_repo(repo), revision
+    )
+    return Battery.from_bundle(directory)
+
+
+def battery_info(
+    name_or_path: Union[str, Path],
+    *,
+    repo: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read a battery's ``battery.json`` without loading any weights.
+
+    ``name_or_path`` is a local bundle directory (or the path to its
+    ``battery.json``) read from disk, or a bare battery name whose
+    ``<name>/battery.json`` is downloaded from the hub. Torch-free either way:
+    this only reads metadata, so it needs ``huggingface_hub`` but never the
+    runtime (torch/safetensors).
     """
     candidate = Path(name_or_path)
-    meta_path = candidate if candidate.name == METADATA_FILENAME else candidate / METADATA_FILENAME
-    if not meta_path.exists():
-        raise RouterConfigurationError(
-            f"No {METADATA_FILENAME} under {name_or_path!r}; not a battery bundle."
-        )
-    return json.loads(meta_path.read_text(encoding="utf-8"))
-
-
-def list_batteries(directory: Union[str, Path]) -> List[Dict[str, Any]]:
-    """List battery metadata for every bundle directly under ``directory``.
-
-    Each entry is the bundle's ``battery.json`` plus a ``path`` key. Torch-free;
-    directories without a ``battery.json`` are skipped silently.
-    """
-    root = Path(directory)
-    if not root.is_dir():
-        raise RouterConfigurationError(f"{directory!r} is not a directory.")
-    out: List[Dict[str, Any]] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
-        meta_path = child / METADATA_FILENAME
+    # A direct path to a bundle's battery.json, or a bundle directory on disk,
+    # reads from local filesystem (Stage 1); anything else is a hub name.
+    if candidate.name == METADATA_FILENAME and candidate.exists():
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    if candidate.is_dir():
+        meta_path = candidate / METADATA_FILENAME
         if not meta_path.exists():
-            continue
-        info = json.loads(meta_path.read_text(encoding="utf-8"))
-        info["path"] = str(child)
-        out.append(info)
-    return out
+            raise RouterConfigurationError(
+                f"No {METADATA_FILENAME} under {name_or_path!r}; not a battery bundle."
+            )
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    return _download_battery_json(_resolve_repo(repo), str(name_or_path), revision)
+
+
+def list_batteries(
+    source: Optional[Union[str, Path]] = None,
+    *,
+    repo: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List published battery metadata, from a local catalog dir or the hub.
+
+    With ``source`` a local directory, each entry is a bundle's ``battery.json``
+    plus a ``path`` key, for every bundle directly under it (Stage 1 behavior;
+    directories without a ``battery.json`` are skipped). With ``source`` omitted
+    (or not a local directory), the hub repo's root ``manifest.json`` is
+    downloaded and its ``batteries`` list returned — one summary row per
+    published battery. Torch-free either way.
+    """
+    if source is not None and Path(source).is_dir():
+        root = Path(source)
+        out: List[Dict[str, Any]] = []
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            meta_path = child / METADATA_FILENAME
+            if not meta_path.exists():
+                continue
+            info = json.loads(meta_path.read_text(encoding="utf-8"))
+            info["path"] = str(child)
+            out.append(info)
+        return out
+
+    resolved_repo = _resolve_repo(repo)
+    try:
+        path = _hf_hub_download(resolved_repo, MANIFEST_FILENAME, revision)
+    except RouterConfigurationError:
+        raise
+    except Exception as exc:
+        raise RouterConfigurationError(
+            f"Could not download the battery catalog ({MANIFEST_FILENAME}) from "
+            f"{resolved_repo!r}: {exc}. Check your network connection; pass a "
+            "local catalog directory as the first argument to list on-disk "
+            "bundles instead."
+        ) from exc
+    manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    return list(manifest.get("batteries", []))
