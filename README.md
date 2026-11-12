@@ -137,6 +137,60 @@ compiler, calibration, and gate don't change.
 Runtime cost is the point: every decision runs locally on CPU, in tens of
 milliseconds, at $0 and zero LLM calls.
 
+## Batteries
+
+A battery is the compiled, frozen decision unit — the thing a compile produces.
+Each `run()` / `decide()` writes one to disk as `battery_<task>_<hash>.py`: the
+slug comes from a `name=` you pass, or is derived from the query, and the hash
+is the content address that keys the cache. A battery is self-contained — it
+carries its task-specific parameters inline (routing labels, calibration, the
+distilled head or LoRA weights) and loads only the shared base checkpoint at
+runtime.
+
+The same decision can also be distributed as a portable **bundle** — the
+decision path only, as data rather than code — so a battery can live on a hub as
+weights plus config while the runtime stays in the installed package. A battery
+in this form is a **data-only classifier**: it maps a projected record context
+to a calibrated label, confidence, full distribution, and an abstention flag.
+The synthesized action handlers are app-side glue, so they stay on your side —
+a loaded battery reproduces the decision, not handler dispatch.
+
+### Using a pre-built battery from the hub
+
+```python
+strot.list_batteries()               # catalog from the hub (default strot-ai/batteries)
+strot.battery_info("cyber-intent")   # its spec sheet, no weights loaded
+pipe = strot.load("cyber-intent")    # downloads the bundle, builds the runtime
+pipe.decide(context)                 # calibrated label + confidence + abstention
+```
+
+`decide()` takes the already-projected context the decision model sees;
+projection is compiled code, not bundle data, so you supply it. `load()` needs
+the base model present — install the `[local]` extra and run `prefetch_nlu`, or
+set `STROT_NLU_CHECKPOINT` — and errors clearly if it is missing rather than
+failing deep in an import. A **local path** loads a bundle off disk; a **bare
+name** resolves from the hub. The repo is pinned by default and overridable with
+`repo=` or `STROT_BATTERY_REPO`.
+
+The catalog is fine-tuned batteries — the ones worth distributing. A zero-shot
+battery is just the no-`optimize` route; its "weights" are the shared base model,
+so there is nothing data-only to ship. Distilled and fine-tuned batteries are
+the exportable ones.
+
+### Exporting a battery as a portable bundle
+
+```python
+strot.export_bundle(asset_or_source_or_path, out_dir)
+```
+
+This writes `battery.json` (task metadata, labels, calibration, schema
+fingerprint — pure JSON) plus `weights.safetensors` (the distilled head or the
+adapter tensors — data only, no code) into `out_dir`. The argument is a compiled
+asset, its source string, or a path to a compiled `.py`. The data is read
+straight out of the asset's module-level literals, so a bundle cannot drift from
+the baked artifact. The self-contained `.py` is the alternative standalone
+format when you would rather ship the whole thing.
+
 ## What's actually going on under the hood
 
 - The optimizer compiles once; the battery decides forever. The compiled
