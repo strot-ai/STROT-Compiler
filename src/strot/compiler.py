@@ -1376,16 +1376,80 @@ class StrotCompiler:
                         f"question {name!r}: predicate requires instructions."
                     )
             else:  # choice
-                options = spec.get("options")
-                if (
-                    not isinstance(options, list)
-                    or not 2 <= len(options) <= 20
-                    or len(set(options)) != len(options)
-                    or not all(isinstance(o, str) and o for o in options)
+                StrotCompiler._validate_choice_spec(name, spec)
+
+    @staticmethod
+    def _choice_pairs(spec: Mapping[str, Any]) -> List["tuple[Any, Optional[str]]"]:
+        """Normalize a choice spec into ordered ``(value, description)`` pairs.
+
+        The ``choices`` key carries ``[{"value": ..., "description": ...}, ...]``
+        (description optional). The deprecated ``options`` alias is a bare list
+        of values with no descriptions.
+        """
+        choices = spec.get("choices")
+        if choices is not None:
+            return [(c["value"], c.get("description")) for c in choices]
+        return [(value, None) for value in spec.get("options", [])]
+
+    @staticmethod
+    def _validate_choice_spec(name: str, spec: Mapping[str, Any]) -> None:
+        """Validate a choice question: ``choices`` (rich) or ``options`` (alias)."""
+        choices, options = spec.get("choices"), spec.get("options")
+        if choices is not None and options is not None:
+            raise RouterConfigurationError(
+                f"question {name!r}: set either 'choices' or the deprecated "
+                "'options' alias, not both."
+            )
+        if choices is not None:
+            if not isinstance(choices, list) or not 2 <= len(choices) <= 255:
+                raise RouterConfigurationError(
+                    f"question {name!r}: choice needs 2-255 choices."
+                )
+            values: List[Any] = []
+            for choice in choices:
+                if not isinstance(choice, Mapping) or "value" not in choice:
+                    raise RouterConfigurationError(
+                        f"question {name!r}: each choice must be a mapping with a "
+                        "'value' (and an optional 'description')."
+                    )
+                value = choice["value"]
+                if not isinstance(value, (str, bool)) or (
+                    isinstance(value, str) and not value
                 ):
                     raise RouterConfigurationError(
-                        f"question {name!r}: choice needs 2-20 unique non-empty options."
+                        f"question {name!r}: choice values must be non-empty "
+                        "strings or booleans."
                     )
+                description = choice.get("description")
+                if description is not None and (
+                    not isinstance(description, str) or not description.strip()
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: choice 'description' must be a "
+                        "non-empty string when present."
+                    )
+                values.append(value)
+        elif options is not None:
+            if (
+                not isinstance(options, list)
+                or not 2 <= len(options) <= 255
+                or not all(isinstance(o, (str, bool)) and o != "" for o in options)
+            ):
+                raise RouterConfigurationError(
+                    f"question {name!r}: choice needs 2-255 unique non-empty "
+                    "values (deprecated 'options' alias)."
+                )
+            values = list(options)
+        else:
+            raise RouterConfigurationError(
+                f"question {name!r}: choice needs 'choices' "
+                "(or the deprecated 'options' alias)."
+            )
+        keyed = [(type(v).__name__, v) for v in values]
+        if len(set(keyed)) != len(keyed):
+            raise RouterConfigurationError(
+                f"question {name!r}: choice values must be unique."
+            )
 
     def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
         """Construct the decide-mode prompt: expand a typed-question config for the model."""
@@ -1407,9 +1471,11 @@ class StrotCompiler:
                 "- `QUESTIONS: Dict[str, Any]` literal with the SAME question "
                 "names. Per question: keep \"type\" and \"instructions\" (write "
                 "crisp instructions if the config omits them). For 'choice' add "
-                "\"criteria\": a dict mapping EVERY option (exact strings) to a "
-                "short discriminative description using vocabulary from the "
-                "records. For 'score' add \"min\" (copy the config int) and "
+                "\"criteria\": a dict mapping EVERY choice value (exact, as given "
+                "in the config - keep booleans as booleans) to a short "
+                "discriminative description using vocabulary from the records; "
+                "sharpen each config 'description' where present. For 'score' add "
+                "\"min\" (copy the config int) and "
                 "\"rubric\": a list of exactly (max - min + 1) short level "
                 "labels, in order from min to max, grounded in the "
                 "instructions' anchors. For 'predicate' (or the deprecated "
@@ -1453,11 +1519,12 @@ class StrotCompiler:
             if not isinstance(item.get("instructions"), str) or not item["instructions"].strip():
                 return f"question {name!r}: instructions must be a non-empty string"
             if spec["type"] == "choice":
+                values = [value for value, _ in self._choice_pairs(spec)]
                 criteria = item.get("criteria")
-                if not isinstance(criteria, dict) or set(criteria) != set(spec["options"]):
+                if not isinstance(criteria, dict) or set(criteria) != set(values):
                     return (
                         f"question {name!r}: criteria keys must exactly match "
-                        f"the options {spec['options']}"
+                        f"the choice values {values}"
                     )
                 if not all(isinstance(v, str) and v.strip() for v in criteria.values()):
                     return f"question {name!r}: criteria descriptions must be non-empty strings"
@@ -1505,10 +1572,12 @@ class StrotCompiler:
                     raise RouterConfigurationError(
                         f"golden[{i}]: unknown question {qname!r}."
                     )
-                if spec["type"] == "choice" and expected not in spec["options"]:
-                    raise RouterConfigurationError(
-                        f"golden[{i}].{qname}: expected must be one of {spec['options']}."
-                    )
+                if spec["type"] == "choice":
+                    values = [value for value, _ in StrotCompiler._choice_pairs(spec)]
+                    if expected not in values:
+                        raise RouterConfigurationError(
+                            f"golden[{i}].{qname}: expected must be one of {values}."
+                        )
                 if spec["type"] in ("predicate", "boolean") and not isinstance(expected, bool):
                     raise RouterConfigurationError(
                         f"golden[{i}].{qname}: predicate expectation must be true/false."
@@ -1546,10 +1615,10 @@ class StrotCompiler:
             for qname, expected in case["expect"].items():
                 qtype = questions[qname]["type"]
                 if qtype == "choice":
-                    got = decision["choices"][qname]["selected"]
+                    got = decision["choices"][qname]["choice"]
                     if got != expected:
                         failures.append(
-                            f"golden[{i}].{qname}: selected {got!r}, expected {expected!r}"
+                            f"golden[{i}].{qname}: chose {got!r}, expected {expected!r}"
                         )
                 elif qtype in ("predicate", "boolean"):
                     p = decision["predicates"][qname]["probability"]

@@ -522,7 +522,7 @@ class CompiledDecider:
                 }}
             else:
                 output["choices"][name] = {{
-                    "selected": answer["choice"],
+                    "choice": answer["choice"],
                     "probabilities": {{
                         key: round(float(p), 4)
                         for key, p in answer["probabilities"].items()

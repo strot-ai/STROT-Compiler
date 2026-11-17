@@ -528,9 +528,15 @@ def decide(
           "is_bug_report": {"type": "predicate", "instructions": "..."},
           "customer_sentiment": {"type": "score", "min": 1, "max": 5,
                                   "instructions": "..."},
-          "routing_bucket": {"type": "choice",
-                              "options": ["billing_team", "engineering_team"]},
+          "routing_bucket": {"type": "choice", "choices": [
+              {"value": "billing_team", "description": "payments, invoices, refunds"},
+              {"value": "engineering_team", "description": "crashes, bugs, defects"}]},
         }
+
+    A ``"choice"`` value may be a string or a boolean; each choice's
+    ``"description"`` is optional and guides the compile-phase criteria. The
+    bare ``"options": [value, ...]`` list is still accepted as a deprecated
+    alias (values only, no descriptions).
 
     A ``"predicate"`` question returns a probability (0-1 likelihood the
     statement is true); ``"boolean"`` is still accepted as a deprecated alias.
@@ -539,7 +545,7 @@ def decide(
 
         {"predicates": {name: {"type": "predicate", "probability": 0.99}},
          "scores": {name: {"value": 1.8, "confidence": 0.89}},
-         "choices": {name: {"selected": ..., "probabilities": {...},
+         "choices": {name: {"choice": ..., "probabilities": {...},
                              "confidence": 0.94}}}
 
     The compile phase (once per config + schema) synthesizes choice criteria,

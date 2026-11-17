@@ -399,7 +399,7 @@ class TestRun:
         if mode == "run":
             assert warm.outcomes[0]["action"] == "defect"
         else:
-            assert warm.outcomes[0]["decision"]["choices"]["team"]["selected"] == "engineering"
+            assert warm.outcomes[0]["decision"]["choices"]["team"]["choice"] == "engineering"
 
     def test_lazy_string_spec_not_resolved_on_hit(self, tmp_path, fake_runtime):
         strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
@@ -1079,7 +1079,9 @@ DECIDE_CONFIG = {
     "is_bug": {"type": "predicate", "instructions": "Does this mention crashes or errors?"},
     "sentiment": {"type": "score", "min": 1, "max": 3,
                   "instructions": "1 is angry complaint, 3 is happy praise."},
-    "team": {"type": "choice", "options": ["billing", "engineering"]},
+    "team": {"type": "choice", "choices": [
+        {"value": "billing", "description": "charges, invoices, payments"},
+        {"value": "engineering", "description": "crashes, bugs, defects"}]},
 }
 
 VALID_DECIDE = '''```python
@@ -1112,11 +1114,11 @@ class TestDecide:
         assert set(crash) == {"predicates", "scores", "choices"}
         assert crash["predicates"]["is_bug"]["type"] == "predicate"
         assert crash["predicates"]["is_bug"]["probability"] > 0.9
-        assert crash["choices"]["team"]["selected"] == "engineering"
+        assert crash["choices"]["team"]["choice"] == "engineering"
         assert set(crash["choices"]["team"]["probabilities"]) == {"billing", "engineering"}
         assert 0.0 <= crash["choices"]["team"]["confidence"] <= 1.0
         billing = result.outcomes[0]["decision"]  # body: "double billing charge"
-        assert billing["choices"]["team"]["selected"] == "billing"
+        assert billing["choices"]["team"]["choice"] == "billing"
         assert 1.0 <= billing["scores"]["sentiment"]["value"] <= 3.0
         assert billing["scores"]["sentiment"]["value"] < 1.5  # angry complaint
         # Warm call: no LLM.
@@ -1148,6 +1150,29 @@ def route_context(record: dict) -> str:
         assert crash["predicates"]["is_bug"]["type"] == "predicate"
         assert crash["predicates"]["is_bug"]["probability"] > 0.9
 
+    def test_decide_accepts_deprecated_options_alias(self, tmp_path, fake_runtime):
+        # The bare "options" list (values only, no descriptions) is still
+        # accepted as a deprecated alias for the richer "choices" form and
+        # produces the same value-keyed choice output.
+        config = {
+            "team": {"type": "choice", "options": ["billing", "engineering"]},
+        }
+        expansion = '''```python
+QUESTIONS = {
+    "team": {"type": "choice", "instructions": "Which team should handle this?",
+             "criteria": {"billing": "billing charge payment",
+                          "engineering": "crash defect bug"}},
+}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
+```'''
+        result = strot.decide(SAMPLE, config, llm=ScriptedLLM([expansion]), state=tmp_path)
+        crash = result.outcomes[1]["decision"]  # body: "app crash defect"
+        assert crash["choices"]["team"]["choice"] == "engineering"
+        assert set(crash["choices"]["team"]["probabilities"]) == {"billing", "engineering"}
+
     def test_decide_accepts_full_config_json_string(self, tmp_path, fake_runtime):
         config = json.dumps({"model": "decision-model", "state": "ignored",
                              "questions": DECIDE_CONFIG})
@@ -1169,7 +1194,7 @@ def route_context(record: dict) -> str:
         golden = [{"record": SAMPLE[1], "expect": {"team": "engineering", "is_bug": True}}]
         result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path, golden=golden)
         assert result.attempts == 2
-        assert result.outcomes[1]["decision"]["choices"]["team"]["selected"] == "engineering"
+        assert result.outcomes[1]["decision"]["choices"]["team"]["choice"] == "engineering"
 
     def test_decide_golden_validation_before_llm(self, tmp_path):
         golden = [{"record": SAMPLE[0], "expect": {"nope": "billing"}}]
