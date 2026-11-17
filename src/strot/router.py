@@ -38,19 +38,18 @@ from .exceptions import FallbackException, RouterConfigurationError
 _DEFAULT_BASE_MODEL = "SupersonicLabs/Julia-1"
 _FAST_BASE_MODEL = "answerdotai/ModernBERT-base"
 
-#: Public STROT model names -> internal base encoder. ``strot-1`` is the
-#: default zero-shot decision tier; ``smart`` is its alias (the same strong
-#: default); ``fast`` is the lighter encoder used for the fine-tune tier.
-#: Power users can still pass a raw base id through ``nlu=`` directly — this
-#: map is only the branded, documented front door.
+#: Public STROT model names -> internal base encoder. ``zero-shot`` is the
+#: default decision tier — strong out of the box with no training; ``fast`` is
+#: the lighter encoder used for the fine-tune tier. Power users can still pass
+#: a raw base id through ``nlu=`` directly — this map is only the branded,
+#: documented front door.
 STROT_MODELS: Dict[str, str] = {
-    "strot-1": _DEFAULT_BASE_MODEL,
-    "smart": _DEFAULT_BASE_MODEL,
+    "zero-shot": _DEFAULT_BASE_MODEL,
     "fast": _FAST_BASE_MODEL,
 }
 
 #: The default STROT model the public API advertises (never the base id).
-DEFAULT_STROT_MODEL = "strot-1"
+DEFAULT_STROT_MODEL = "zero-shot"
 
 #: Internal default encoder (still the keying/runtime default when no branded
 #: model is given). Kept for back-compat with code/tests that import it.
