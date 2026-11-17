@@ -1356,16 +1356,7 @@ class StrotCompiler:
                     "('boolean' is a deprecated alias for 'predicate')."
                 )
             if spec["type"] == "score":
-                minimum, maximum = spec.get("min"), spec.get("max")
-                if (
-                    type(minimum) is not int
-                    or type(maximum) is not int
-                    or not 2 <= (maximum - minimum + 1) <= 20
-                ):
-                    raise RouterConfigurationError(
-                        f"question {name!r}: score needs int min < max spanning "
-                        "2-20 levels (the decision model's option range)."
-                    )
+                StrotCompiler._validate_score_spec(name, spec)
                 if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
                     raise RouterConfigurationError(
                         f"question {name!r}: score requires instructions anchoring the scale."
@@ -1377,6 +1368,74 @@ class StrotCompiler:
                     )
             else:  # choice
                 StrotCompiler._validate_choice_spec(name, spec)
+
+    @staticmethod
+    def _score_levels(spec: Mapping[str, Any]) -> List["tuple[str, Optional[str]]"]:
+        """Normalize a score spec into ordered ``(label, description)`` levels.
+
+        The ``levels`` key carries ``[{"label": ..., "description": ...}, ...]``
+        (description optional), lowest to highest. The deprecated ``min``/``max``
+        alias synthesizes one level per integer in ``min..max`` (the integers
+        themselves as labels, no descriptions).
+        """
+        levels = spec.get("levels")
+        if levels is not None:
+            return [(str(level["label"]), level.get("description")) for level in levels]
+        minimum, maximum = spec["min"], spec["max"]
+        return [(str(value), None) for value in range(minimum, maximum + 1)]
+
+    @staticmethod
+    def _validate_score_spec(name: str, spec: Mapping[str, Any]) -> None:
+        """Validate a score question: ``levels`` (rich) or ``min``/``max`` (alias)."""
+        levels = spec.get("levels")
+        has_range = spec.get("min") is not None or spec.get("max") is not None
+        if levels is not None and has_range:
+            raise RouterConfigurationError(
+                f"question {name!r}: set either 'levels' or the deprecated "
+                "'min'/'max' alias, not both."
+            )
+        if levels is not None:
+            if not isinstance(levels, list) or not 2 <= len(levels) <= 10:
+                raise RouterConfigurationError(
+                    f"question {name!r}: score needs 2-10 ordered levels."
+                )
+            seen: List[str] = []
+            for level in levels:
+                if not isinstance(level, Mapping) or "label" not in level:
+                    raise RouterConfigurationError(
+                        f"question {name!r}: each level must be a mapping with a "
+                        "'label' (and an optional 'description')."
+                    )
+                label = level["label"]
+                if not isinstance(label, str) or not label.strip():
+                    raise RouterConfigurationError(
+                        f"question {name!r}: level labels must be non-empty strings."
+                    )
+                description = level.get("description")
+                if description is not None and (
+                    not isinstance(description, str) or not description.strip()
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: level 'description' must be a "
+                        "non-empty string when present."
+                    )
+                seen.append(label)
+            if len(set(seen)) != len(seen):
+                raise RouterConfigurationError(
+                    f"question {name!r}: level labels must be unique."
+                )
+        else:
+            minimum, maximum = spec.get("min"), spec.get("max")
+            if (
+                type(minimum) is not int
+                or type(maximum) is not int
+                or not 2 <= (maximum - minimum + 1) <= 10
+            ):
+                raise RouterConfigurationError(
+                    f"question {name!r}: score needs 'levels' (2-10 ordered "
+                    "labeled levels) or the deprecated int min < max alias "
+                    "spanning 2-10 levels."
+                )
 
     @staticmethod
     def _choice_pairs(spec: Mapping[str, Any]) -> List["tuple[Any, Optional[str]]"]:
@@ -1451,6 +1510,30 @@ class StrotCompiler:
                 f"question {name!r}: choice values must be unique."
             )
 
+    @staticmethod
+    def _prompt_config(questions: Mapping[str, Any]) -> Dict[str, Any]:
+        """Config as the synthesizer should see it: score levels always explicit.
+
+        The deprecated score ``min``/``max`` alias is expanded into an ordered
+        ``levels`` list so the synthesizer only ever reasons about labeled
+        levels, never a bare integer range.
+        """
+        shown: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            if spec.get("type") == "score":
+                shown[name] = {
+                    key: value
+                    for key, value in spec.items()
+                    if key not in ("min", "max", "levels")
+                }
+                shown[name]["levels"] = [
+                    {"label": label, **({"description": desc} if desc else {})}
+                    for label, desc in StrotCompiler._score_levels(spec)
+                ]
+            else:
+                shown[name] = dict(spec)
+        return shown
+
     def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
         """Construct the decide-mode prompt: expand a typed-question config for the model."""
         return "\n".join(
@@ -1463,7 +1546,7 @@ class StrotCompiler:
                 schema.to_json(),
                 "",
                 "## DECISION CONFIG (typed questions)",
-                json.dumps(questions, indent=2),
+                json.dumps(self._prompt_config(questions), indent=2),
                 "",
                 "## OUTPUT CONTRACT",
                 "Emit exactly one ```python code block containing EXACTLY two "
@@ -1475,10 +1558,11 @@ class StrotCompiler:
                 "in the config - keep booleans as booleans) to a short "
                 "discriminative description using vocabulary from the records; "
                 "sharpen each config 'description' where present. For 'score' add "
-                "\"min\" (copy the config int) and "
-                "\"rubric\": a list of exactly (max - min + 1) short level "
-                "labels, in order from min to max, grounded in the "
-                "instructions' anchors. For 'predicate' (or the deprecated "
+                "\"rubric\": a list of {\"label\": <config level label, exact>, "
+                "\"description\": <short discriminative description grounded in "
+                "the instructions' anchors and the records' vocabulary>} entries, "
+                "one per config level, in the SAME order the config lists them "
+                "(lowest to highest). For 'predicate' (or the deprecated "
                 "'boolean' alias) add \"criteria\": {\"false\": <short "
                 "negative-case description>, \"true\": <short positive-case "
                 "description>}.",
@@ -1529,19 +1613,29 @@ class StrotCompiler:
                 if not all(isinstance(v, str) and v.strip() for v in criteria.values()):
                     return f"question {name!r}: criteria descriptions must be non-empty strings"
             elif spec["type"] == "score":
-                expected_len = spec["max"] - spec["min"] + 1
+                labels = [label for label, _ in self._score_levels(spec)]
                 rubric = item.get("rubric")
-                if item.get("min") != spec["min"]:
-                    return f"question {name!r}: min must equal {spec['min']}"
-                if (
-                    not isinstance(rubric, list)
-                    or len(rubric) != expected_len
-                    or not all(isinstance(v, str) and v.strip() for v in rubric)
-                ):
+                if not isinstance(rubric, list) or len(rubric) != len(labels):
                     return (
                         f"question {name!r}: rubric must be a list of exactly "
-                        f"{expected_len} non-empty level labels"
+                        f"{len(labels)} ordered levels (one per config level)"
                     )
+                for level, label in zip(rubric, labels):
+                    if (
+                        not isinstance(level, dict)
+                        or str(level.get("label")) != label
+                    ):
+                        return (
+                            f"question {name!r}: each rubric level must be a "
+                            "mapping whose 'label' matches the config levels, in "
+                            f"order: {labels}"
+                        )
+                    description = level.get("description")
+                    if not isinstance(description, str) or not description.strip():
+                        return (
+                            f"question {name!r}: each rubric level needs a "
+                            "non-empty 'description'"
+                        )
             else:  # predicate (or the deprecated boolean alias)
                 criteria = item.get("criteria")
                 if not isinstance(criteria, dict) or set(criteria) != {"false", "true"}:
@@ -1583,15 +1677,11 @@ class StrotCompiler:
                         f"golden[{i}].{qname}: predicate expectation must be true/false."
                     )
                 if spec["type"] == "score":
-                    is_range = (
-                        isinstance(expected, (list, tuple))
-                        and len(expected) == 2
-                        and all(isinstance(v, (int, float)) for v in expected)
-                    )
-                    if not is_range and not isinstance(expected, (int, float)):
+                    labels = [label for label, _ in StrotCompiler._score_levels(spec)]
+                    if expected not in labels:
                         raise RouterConfigurationError(
-                            f"golden[{i}].{qname}: score expectation must be a "
-                            "number or [low, high] range."
+                            f"golden[{i}].{qname}: score expectation must be one "
+                            f"of the level labels {labels}."
                         )
 
     def _test_golden_decider(
@@ -1628,16 +1718,10 @@ class StrotCompiler:
                             f"{'true' if expected else 'false'}"
                         )
                 else:  # score
-                    value = decision["scores"][qname]["value"]
-                    low, high = (
-                        expected
-                        if isinstance(expected, (list, tuple))
-                        else (expected - 0.5, expected + 0.5)
-                    )
-                    if not low <= value <= high:
+                    got = decision["scores"][qname]["score"]
+                    if got != expected:
                         failures.append(
-                            f"golden[{i}].{qname}: value={value}, expected "
-                            f"within [{low}, {high}]"
+                            f"golden[{i}].{qname}: scored {got!r}, expected {expected!r}"
                         )
         sys.modules.pop("strot_golden_gate", None)
         if failures:

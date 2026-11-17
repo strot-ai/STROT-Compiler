@@ -480,11 +480,18 @@ def _julia_questions() -> Dict[str, Any]:
             "instructions": spec["instructions"],
         }}
         if spec["type"] == "score":
-            question["criteria"] = list(spec["rubric"])
+            # Ordered level descriptions are what the model discriminates on;
+            # the labels are mapped back onto the answer at output time.
+            question["criteria"] = [level["description"] for level in spec["rubric"]]
         else:
             question["criteria"] = spec["criteria"]
         prepared[name] = question
     return prepared
+
+
+def _score_labels(spec: Mapping[str, Any]) -> List[str]:
+    """Ordered level labels for a score question (lowest to highest)."""
+    return [level["label"] for level in spec["rubric"]]
 
 
 class CompiledDecider:
@@ -515,9 +522,16 @@ class CompiledDecider:
                     "probability": round(float(answer["noul"]), 4),
                 }}
             elif answer["type"] == "score":
-                value = QUESTIONS[name]["min"] + float(answer["score"])
+                labels = _score_labels(QUESTIONS[name])
+                # The model answers with an expected level index; snap it to the
+                # nearest ordered level and report that level's label.
+                index = max(0, min(len(labels) - 1, round(float(answer["score"]))))
                 output["scores"][name] = {{
-                    "value": round(value, 2),
+                    "score": labels[index],
+                    "probabilities": {{
+                        labels[int(key)]: round(float(p), 4)
+                        for key, p in answer["probabilities"].items()
+                    }},
                     "confidence": round(float(answer["max_probability"]), 4),
                 }}
             else:

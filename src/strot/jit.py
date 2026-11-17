@@ -526,8 +526,11 @@ def decide(
 
         {
           "is_bug_report": {"type": "predicate", "instructions": "..."},
-          "customer_sentiment": {"type": "score", "min": 1, "max": 5,
-                                  "instructions": "..."},
+          "customer_sentiment": {"type": "score", "instructions": "...",
+                                  "levels": [
+                                      {"label": "angry", "description": "..."},
+                                      {"label": "neutral", "description": "..."},
+                                      {"label": "happy", "description": "..."}]},
           "routing_bucket": {"type": "choice", "choices": [
               {"value": "billing_team", "description": "payments, invoices, refunds"},
               {"value": "engineering_team", "description": "crashes, bugs, defects"}]},
@@ -538,13 +541,20 @@ def decide(
     bare ``"options": [value, ...]`` list is still accepted as a deprecated
     alias (values only, no descriptions).
 
+    A ``"score"`` carries 2-10 ordered ``"levels"`` (lowest to highest), each a
+    ``{"label": ..., "description": ...}`` mapping (description optional); the
+    answer is the best-matching level's label. The bare ``"min"``/``"max"``
+    integer range is still accepted as a deprecated alias (one level per
+    integer, the integers as labels).
+
     A ``"predicate"`` question returns a probability (0-1 likelihood the
     statement is true); ``"boolean"`` is still accepted as a deprecated alias.
 
     Each outcome's ``decision`` is typed decision JSON::
 
         {"predicates": {name: {"type": "predicate", "probability": 0.99}},
-         "scores": {name: {"value": 1.8, "confidence": 0.89}},
+         "scores": {name: {"score": "neutral", "probabilities": {...},
+                           "confidence": 0.89}},
          "choices": {name: {"choice": ..., "probabilities": {...},
                              "confidence": 0.94}}}
 

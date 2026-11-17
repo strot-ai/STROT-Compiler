@@ -1077,8 +1077,12 @@ class TestEpisodeLog:
 
 DECIDE_CONFIG = {
     "is_bug": {"type": "predicate", "instructions": "Does this mention crashes or errors?"},
-    "sentiment": {"type": "score", "min": 1, "max": 3,
-                  "instructions": "1 is angry complaint, 3 is happy praise."},
+    "sentiment": {"type": "score",
+                  "instructions": "angry is a complaint, happy is praise.",
+                  "levels": [
+                      {"label": "angry", "description": "angry complaint"},
+                      {"label": "neutral", "description": "neutral request"},
+                      {"label": "happy", "description": "happy praise"}]},
     "team": {"type": "choice", "choices": [
         {"value": "billing", "description": "charges, invoices, payments"},
         {"value": "engineering", "description": "crashes, bugs, defects"}]},
@@ -1089,9 +1093,11 @@ QUESTIONS = {
     "is_bug": {"type": "predicate", "instructions": "Does this mention crashes or errors?",
                "criteria": {"false": "normal request no malfunction",
                             "true": "crash defect error malfunction"}},
-    "sentiment": {"type": "score", "min": 1,
-                  "instructions": "1 is angry complaint, 3 is happy praise.",
-                  "rubric": ["angry complaint charge dispute", "neutral request", "happy praise"]},
+    "sentiment": {"type": "score",
+                  "instructions": "angry is a complaint, happy is praise.",
+                  "rubric": [{"label": "angry", "description": "angry complaint charge dispute"},
+                             {"label": "neutral", "description": "neutral request"},
+                             {"label": "happy", "description": "happy praise"}]},
     "team": {"type": "choice", "instructions": "Which team should handle this?",
              "criteria": {"billing": "billing charge payment",
                           "engineering": "crash defect bug"}},
@@ -1119,8 +1125,10 @@ class TestDecide:
         assert 0.0 <= crash["choices"]["team"]["confidence"] <= 1.0
         billing = result.outcomes[0]["decision"]  # body: "double billing charge"
         assert billing["choices"]["team"]["choice"] == "billing"
-        assert 1.0 <= billing["scores"]["sentiment"]["value"] <= 3.0
-        assert billing["scores"]["sentiment"]["value"] < 1.5  # angry complaint
+        sentiment = billing["scores"]["sentiment"]
+        assert sentiment["score"] == "angry"  # "charge" overlaps the angry level
+        assert set(sentiment["probabilities"]) == {"angry", "neutral", "happy"}
+        assert 0.0 <= sentiment["confidence"] <= 1.0
         # Warm call: no LLM.
         warm = strot.decide(SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(), state=tmp_path)
         assert warm.cache_hit is True
@@ -1181,8 +1189,34 @@ def route_context(record: dict) -> str:
 
     def test_decide_validates_config_before_any_llm_call(self, tmp_path):
         bad = {"q": {"type": "score", "min": 1, "max": 99, "instructions": "x"}}
-        with pytest.raises(RouterConfigurationError, match="2-20"):
+        with pytest.raises(RouterConfigurationError, match="2-10"):
             strot.decide(SAMPLE, bad, llm=ExplodingLLM(), state=tmp_path)
+
+    def test_decide_accepts_deprecated_min_max_alias(self, tmp_path, fake_runtime):
+        # The bare "min"/"max" integer range is still accepted as a deprecated
+        # alias for "levels": one level per integer, the integers as labels. It
+        # must compile, run, and produce a labeled score under "scores".
+        config = {
+            "sentiment": {"type": "score", "min": 1, "max": 3,
+                          "instructions": "1 is angry complaint, 3 is happy praise."},
+        }
+        expansion = '''```python
+QUESTIONS = {
+    "sentiment": {"type": "score",
+                  "instructions": "1 is angry complaint, 3 is happy praise.",
+                  "rubric": [{"label": "1", "description": "angry complaint charge dispute"},
+                             {"label": "2", "description": "neutral request"},
+                             {"label": "3", "description": "happy praise"}]},
+}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
+```'''
+        result = strot.decide(SAMPLE, config, llm=ScriptedLLM([expansion]), state=tmp_path)
+        billing = result.outcomes[0]["decision"]  # body: "double billing charge"
+        assert billing["scores"]["sentiment"]["score"] == "1"  # angry level label
+        assert set(billing["scores"]["sentiment"]["probabilities"]) == {"1", "2", "3"}
 
     def test_decide_golden_gate_rejects_and_repairs(self, tmp_path, fake_runtime):
         swapped = VALID_DECIDE.replace(
@@ -1203,8 +1237,10 @@ def route_context(record: dict) -> str:
 
     def test_decide_expansion_errors_feed_repair_loop(self, tmp_path, fake_runtime):
         missing_rubric = VALID_DECIDE.replace(
-            '"rubric": ["angry complaint charge dispute", "neutral request", "happy praise"]',
-            '"rubric": ["angry", "happy"]',
+            '"rubric": [{"label": "angry", "description": "angry complaint charge dispute"},\n'
+            '                             {"label": "neutral", "description": "neutral request"},\n'
+            '                             {"label": "happy", "description": "happy praise"}]',
+            '"rubric": [{"label": "angry", "description": "angry"}]',
         )
         llm = ScriptedLLM([missing_rubric, VALID_DECIDE])
         result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
