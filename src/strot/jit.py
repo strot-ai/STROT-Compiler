@@ -43,7 +43,7 @@ from .compiler import (
     openai_llm_client,
 )
 from .exceptions import RouterConfigurationError, SchemaIntrospectionError
-from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
+from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL, resolve_model
 from .schema import DatasetSchema, introspect_schema
 
 #: ``llm`` parameter: a client callable, or a lazy spec string resolved only
@@ -290,7 +290,8 @@ def run(
     query: str,
     action_registry: Mapping[str, str],
     llm: LLMSpec = "openai/gpt-4o",
-    nlu: str = DEFAULT_NLU_MODEL,
+    nlu: Optional[str] = None,
+    model: Optional[str] = None,
     state: Union[str, Path] = ".strot",
     sample_size: int = 25,
     max_retries: int = 3,
@@ -401,6 +402,7 @@ def run(
     if golden is not None:
         StrotCompiler.validate_golden_run(golden, action_registry)
     effective_measure = (target_risk is not None) if measure_labels is None else measure_labels
+    nlu = resolve_model(model, nlu)  # branded STROT model name -> internal base encoder
     key = cache_key(
         query, action_registry, nlu, schema, question, confidence_threshold,
         golden=golden, target_risk=target_risk, measure_labels=effective_measure,
@@ -506,7 +508,8 @@ def decide(
     data: Any,
     questions: Union[str, Mapping[str, Any]],
     llm: LLMSpec = "openai/gpt-4o",
-    nlu: str = DEFAULT_NLU_MODEL,
+    nlu: Optional[str] = None,
+    model: Optional[str] = None,
     state: Union[str, Path] = ".strot",
     sample_size: int = 25,
     max_retries: int = 3,
@@ -562,6 +565,7 @@ def decide(
     sample = records[:sample_size]
     schema = introspect_schema(sample)
     canonical_config = json.dumps(questions, sort_keys=True)
+    nlu = resolve_model(model, nlu)  # branded STROT model name -> internal base encoder
     key = cache_key(
         canonical_config, None, nlu, schema, None, 0.0, mode="decide",
         golden=golden, optimize=optimize, reuse_adapter=reuse_adapter,

@@ -25,7 +25,9 @@ from .exceptions import (
 from .router import (
     CONFIDENCE_THRESHOLD,
     DEFAULT_NLU_MODEL,
+    DEFAULT_STROT_MODEL,
     MAX_FLAT_OPTIONS,
+    STROT_MODELS,
     FineTunedAdapterStrategy,
     HostedApiStrategy,
     LocalEncoderStrategy,
@@ -34,6 +36,7 @@ from .router import (
     RuntimeStrategy,
     create_router,
     create_strategy,
+    resolve_model,
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
@@ -76,6 +79,9 @@ __all__ = [
     "SchemaIntrospectionError",
     "CONFIDENCE_THRESHOLD",
     "DEFAULT_NLU_MODEL",
+    "DEFAULT_STROT_MODEL",
+    "STROT_MODELS",
+    "resolve_model",
     "MAX_FLAT_OPTIONS",
     "RuntimeStrategy",
     "LocalEncoderStrategy",

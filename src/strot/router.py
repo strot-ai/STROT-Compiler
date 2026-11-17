@@ -31,9 +31,56 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .exceptions import FallbackException, RouterConfigurationError
 
-DEFAULT_NLU_MODEL = "SupersonicLabs/Julia-1"
+#: The internal base encoders. These identifiers never surface on the public
+#: API, in default output, or in docs — callers select a STROT model by its
+#: branded name (:data:`STROT_MODELS`) and the base id is resolved here. The
+#: license attribution for both base models lives in the repo NOTICE/README.
+_DEFAULT_BASE_MODEL = "SupersonicLabs/Julia-1"
+_FAST_BASE_MODEL = "answerdotai/ModernBERT-base"
+
+#: Public STROT model names -> internal base encoder. ``strot-1`` is the
+#: default zero-shot decision tier; ``smart`` is its alias (the same strong
+#: default); ``fast`` is the lighter encoder used for the fine-tune tier.
+#: Power users can still pass a raw base id through ``nlu=`` directly — this
+#: map is only the branded, documented front door.
+STROT_MODELS: Dict[str, str] = {
+    "strot-1": _DEFAULT_BASE_MODEL,
+    "smart": _DEFAULT_BASE_MODEL,
+    "fast": _FAST_BASE_MODEL,
+}
+
+#: The default STROT model the public API advertises (never the base id).
+DEFAULT_STROT_MODEL = "strot-1"
+
+#: Internal default encoder (still the keying/runtime default when no branded
+#: model is given). Kept for back-compat with code/tests that import it.
+DEFAULT_NLU_MODEL = _DEFAULT_BASE_MODEL
 CONFIDENCE_THRESHOLD = 0.40
 MAX_FLAT_OPTIONS = 20
+
+
+def resolve_model(model: Optional[str], nlu: Optional[str] = None) -> str:
+    """Resolve the public model-selection args to an internal base encoder.
+
+    ``nlu`` is the advanced escape hatch (a raw base checkpoint id); when set
+    it wins verbatim so power users keep full control. Otherwise ``model`` is a
+    branded STROT name resolved through :data:`STROT_MODELS`; an unknown name
+    that nonetheless looks like a checkpoint path (contains ``/``) is passed
+    through so a raw id in ``model=`` is not rejected outright. ``None``/empty
+    for both falls back to the default STROT model.
+    """
+    if nlu:
+        return nlu
+    if not model:
+        return STROT_MODELS[DEFAULT_STROT_MODEL]
+    if model in STROT_MODELS:
+        return STROT_MODELS[model]
+    if "/" in model:  # a raw checkpoint id handed to model= directly
+        return model
+    raise RouterConfigurationError(
+        f"Unknown STROT model {model!r}; choose one of "
+        f"{', '.join(sorted(STROT_MODELS))} or pass a raw checkpoint id via nlu=."
+    )
 
 #: Model-name prefixes that resolve to the hosted (Implementation Beta) runtime.
 HOSTED_PROVIDER_PREFIXES: Tuple[str, ...] = ("openai/", "anthropic/", "azure/", "gemini/")
