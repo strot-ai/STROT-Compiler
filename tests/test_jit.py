@@ -1245,3 +1245,27 @@ def route_context(record: dict) -> str:
         llm = ScriptedLLM([missing_rubric, VALID_DECIDE])
         result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
         assert result.attempts == 2
+
+    def test_confidence_threshold_refuses_only_low_confidence_answers(self, tmp_path, fake_runtime):
+        # A high threshold is an opt-in per-question refusal: unsure answers
+        # become {"refusal": True} while confident ones still answer. For the
+        # crash ticket the sentiment levels share no words with the body, so
+        # that score is near-uniform (unsure) and must refuse, while is_bug and
+        # team overlap strongly and must survive.
+        result = strot.decide(
+            SAMPLE, DECIDE_CONFIG, llm=ScriptedLLM([VALID_DECIDE]),
+            state=tmp_path, confidence_threshold=0.8,
+        )
+        crash = result.outcomes[1]["decision"]  # body: "app crash defect"
+        assert crash["scores"]["sentiment"] == {"refusal": True}
+        assert crash["predicates"]["is_bug"]["probability"] > 0.9
+        assert crash["choices"]["team"]["choice"] == "engineering"
+
+    def test_no_threshold_never_refuses(self, tmp_path, fake_runtime):
+        # Dispatch-by-default: with no threshold set, nothing is ever a refusal
+        # even when a question is near-uniform.
+        result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=ScriptedLLM([VALID_DECIDE]), state=tmp_path)
+        for outcome in result.outcomes:
+            for group in outcome["decision"].values():
+                for answer in group.values():
+                    assert "refusal" not in answer

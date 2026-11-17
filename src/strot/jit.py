@@ -504,6 +504,29 @@ def run(
     return result
 
 
+def _apply_refusals(decision: Dict[str, Any], threshold: float) -> Dict[str, Any]:
+    """Replace below-threshold answers with ``{"refusal": True}``, in place.
+
+    A post-hoc policy over an already-produced decision: it never touches the
+    compiled battery or the wire shapes, only swaps a whole answer for a
+    refusal when the model is not sure enough. Confidence per type is the
+    ``confidence`` field for scores and choices; a predicate carries a
+    probability instead, so its confidence is ``max(p, 1 - p)`` - how sure it
+    is either way. A single global threshold; a per-question override could be
+    layered on later if a config ever needs it.
+    """
+    for group, answers in decision.items():
+        for qname, answer in answers.items():
+            if group == "predicates":
+                p = answer["probability"]
+                confidence = max(p, 1.0 - p)
+            else:
+                confidence = answer["confidence"]
+            if confidence < threshold:
+                answers[qname] = {"refusal": True}
+    return decision
+
+
 def decide(
     data: Any,
     questions: Union[str, Mapping[str, Any]],
@@ -517,6 +540,7 @@ def decide(
     golden: Optional[List[Mapping[str, Any]]] = None,
     optimize: bool = False,
     reuse_adapter: Optional[Mapping[str, Any]] = None,
+    confidence_threshold: Optional[float] = None,
     name: Optional[str] = None,
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
@@ -566,6 +590,13 @@ def decide(
     ``optimize`` and ``reuse_adapter`` are accepted for API parity with
     :func:`run` and participate in the cache key; decide mode has no
     routing-tier escalation, so they are otherwise inert here.
+
+    ``confidence_threshold`` is an opt-in per-question refusal policy: when set,
+    any answer whose confidence falls below it is replaced with
+    ``{"refusal": True}`` while the other questions still answer. It is a
+    post-hoc view applied after the compiled battery runs - NOT part of the
+    battery or the cache key, so changing it never forces a recompile. With the
+    default ``None``, nothing is ever refused (dispatch-by-default).
 
     ``name`` is an optional label for the compiled battery. It seeds the on-disk
     filename slug (``battery_<slug>_<hash>.py``); when omitted the slug is
@@ -652,7 +683,10 @@ def decide(
     module = _load_artifact(artifact_path, key)
     result.pipeline = module.CompiledDecider()
     for index, record in enumerate(records):
+        decision = result.pipeline.process(record)
+        if confidence_threshold is not None:
+            decision = _apply_refusals(decision, confidence_threshold)
         result.outcomes.append(
-            {"index": index, "record": record, "decision": result.pipeline.process(record)}
+            {"index": index, "record": record, "decision": decision}
         )
     return result
