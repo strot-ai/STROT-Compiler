@@ -428,7 +428,7 @@ Synthesized by strot-ai (STROT: Structured Task Reasoning and
 Output Transformation, arXiv:2505.01636) in decide mode: a
 typed-question config compiled against the verified schema. Per record, the
 local decision model answers every question in one batched pass and the
-output is exclusively type-safe JSON (booleans / scores / choices with
+output is exclusively type-safe JSON (predicates / scores / choices with
 probabilities and confidences) - nothing is generated, only selected,
 scored, and computed.
 
@@ -469,13 +469,14 @@ DECIDE_FOOTER_TEMPLATE = '''\
 def _julia_questions() -> Dict[str, Any]:
     """Expand QUESTIONS into the decision model's native typed format.
 
-    STROT's public type "boolean" maps to the model package's internal
-    wire type at this boundary only; it never appears in STROT's API.
+    STROT's public type "predicate" (and its deprecated "boolean" alias) maps
+    to the model package's internal wire type at this boundary only; the wire
+    name never appears in STROT's API.
     """
     prepared: Dict[str, Any] = {{}}
     for name, spec in QUESTIONS.items():
         question: Dict[str, Any] = {{
-            "type": "noul" if spec["type"] == "boolean" else spec["type"],
+            "type": "noul" if spec["type"] in ("predicate", "boolean") else spec["type"],
             "instructions": spec["instructions"],
         }}
         if spec["type"] == "score":
@@ -506,11 +507,11 @@ class CompiledDecider:
     def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         state = route_context(dict(record))  # compile-time-synthesized projection
         answers = self._engine.predict(state=state, questions=self._questions)["answers"]
-        output: Dict[str, Dict[str, Any]] = {{"booleans": {{}}, "scores": {{}}, "choices": {{}}}}
+        output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
         for name, answer in answers.items():
-            if answer["type"] == "noul":  # model package's wire name for boolean
-                output["booleans"][name] = {{
-                    "type": "boolean",
+            if answer["type"] == "noul":  # model package's wire name for the predicate
+                output["predicates"][name] = {{
+                    "type": "predicate",
                     "probability": round(float(answer["noul"]), 4),
                 }}
             elif answer["type"] == "score":

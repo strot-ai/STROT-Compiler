@@ -525,22 +525,25 @@ def decide(
     object with a top-level ``"questions"`` key is also accepted)::
 
         {
-          "is_bug_report": {"type": "boolean", "instructions": "..."},
+          "is_bug_report": {"type": "predicate", "instructions": "..."},
           "customer_sentiment": {"type": "score", "min": 1, "max": 5,
                                   "instructions": "..."},
           "routing_bucket": {"type": "choice",
                               "options": ["billing_team", "engineering_team"]},
         }
 
+    A ``"predicate"`` question returns a probability (0-1 likelihood the
+    statement is true); ``"boolean"`` is still accepted as a deprecated alias.
+
     Each outcome's ``decision`` is typed decision JSON::
 
-        {"booleans": {name: {"type": "boolean", "probability": 0.99}},
+        {"predicates": {name: {"type": "predicate", "probability": 0.99}},
          "scores": {name: {"value": 1.8, "confidence": 0.89}},
          "choices": {name: {"selected": ..., "probabilities": {...},
                              "confidence": 0.94}}}
 
     The compile phase (once per config + schema) synthesizes choice criteria,
-    score rubrics, boolean case descriptions, and the state projection; at
+    score rubrics, predicate case descriptions, and the state projection; at
     runtime the local ML decision model answers all questions per record in
     one batched pass. Output is bounded, type-safe JSON - nothing generated.
 
