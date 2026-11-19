@@ -562,6 +562,140 @@ if __name__ == "__main__":
             print(json.dumps(decider.process(json.loads(line)), default=str))
 '''
 
+DECIDE_DISTILLED_HEADER_TEMPLATE = '''\
+"""Compiled STROT decision model. DO NOT EDIT BY HAND.
+
+Synthesized by strot-ai (STROT: Structured Task Reasoning and Output
+Transformation, arXiv:2505.01636) in decide mode. Per record the frozen encoder
+produces one embedding and a compile-time-distilled logistic head per question
+answers it; output is exclusively type-safe JSON (predicates / scores / choices
+with probabilities and confidences) - nothing is generated, only selected.
+
+    base encoder : {nlu_model}
+
+Runtime dependency: pip install strot-ai[local] (torch + transformers).
+"""
+
+import json
+import math
+import os
+from typing import Any, Dict, List, Mapping, Sequence
+
+try:
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        "This distilled decision model embeds records with the local encoder: "
+        "pip install strot-ai[local]"
+    ) from _exc
+
+NLU_MODEL = {nlu_model!r}
+
+DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
+
+#: The original typed-question config this model was compiled from.
+QUESTIONS_CONFIG: Dict[str, Any] = {config_literal}
+'''
+
+DECIDE_DISTILLED_RUNTIME_TEMPLATE = '''\
+# --- Runtime: one compile-time-distilled head per question on the frozen encoder ---
+# Each head is a logistic classifier trained at compile time on teacher-labeled
+# records (train fold only); weights are baked in QUESTION_HEADS as literals.
+
+
+def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
+                  bias: Sequence[float]) -> List[float]:
+    logits = [sum(w * x for w, x in zip(row, vector)) + b
+              for row, b in zip(weights, bias)]
+    peak = max(logits)
+    exps = [math.exp(z - peak) for z in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+class CompiledDecider:
+    """Frozen-encoder embedding + one distilled head per question."""
+
+    def __init__(self) -> None:
+        checkpoint = os.environ.get("STROT_NLU_CHECKPOINT")
+        if checkpoint is None:
+            from pathlib import Path
+
+            if Path(NLU_MODEL).is_dir():
+                checkpoint = NLU_MODEL
+            else:
+                from huggingface_hub import snapshot_download
+
+                checkpoint = snapshot_download(NLU_MODEL)
+        if os.path.isdir(os.path.join(checkpoint, "encoder")):
+            self._tokenizer = AutoTokenizer.from_pretrained(checkpoint + "/tokenizer")
+            config = AutoConfig.from_pretrained(checkpoint + "/encoder")
+            self._model = AutoModel.from_config(config)
+            state = load_file(checkpoint + "/model.safetensors")
+            self._model.load_state_dict(
+                {{
+                    key[len("encoder."):]: value
+                    for key, value in state.items()
+                    if key.startswith("encoder.")
+                }},
+                strict=False,
+            )
+        else:
+            self._tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+            self._model = AutoModel.from_pretrained(checkpoint, trust_remote_code=True)
+        self._model.eval()
+
+    def _embed(self, text: str) -> List[float]:
+        inputs = self._tokenizer(
+            [text], return_tensors="pt", padding=True, truncation=True, max_length=256,
+        )
+        with torch.no_grad():
+            hidden = self._model(**inputs).last_hidden_state
+        mask = inputs["attention_mask"].unsqueeze(-1).float()
+        return ((hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0))[0].tolist()
+
+    def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        vector = self._embed(route_context(dict(record)))  # synthesized projection
+        output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
+        for name, head in QUESTION_HEADS.items():
+            probs = _head_softmax(vector, head["weights"], head["bias"])
+            classes = head["classes"]
+            if head["type"] == "predicate":
+                p_true = probs[classes.index(True)]
+                output["predicates"][name] = {{
+                    "type": "predicate", "probability": round(float(p_true), 4),
+                }}
+            elif head["type"] == "score":
+                idx = max(range(len(probs)), key=probs.__getitem__)
+                output["scores"][name] = {{
+                    "score": classes[idx],
+                    "probabilities": {{classes[i]: round(float(p), 4)
+                                       for i, p in enumerate(probs)}},
+                    "confidence": round(float(max(probs)), 4),
+                }}
+            else:
+                idx = max(range(len(probs)), key=probs.__getitem__)
+                output["choices"][name] = {{
+                    "choice": classes[idx],
+                    "probabilities": {{classes[i]: round(float(p), 4)
+                                       for i, p in enumerate(probs)}},
+                    "confidence": round(float(max(probs)), 4),
+                }}
+        return output
+
+
+if __name__ == "__main__":
+    import sys
+
+    decider = CompiledDecider()
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            print(json.dumps(decider.process(json.loads(line)), default=str))
+'''
+
 ASSET_FOOTER_TEMPLATE = '''\
 # --- Statically generated execution paths (STROT synthesizer output) ---
 {generated_paths}

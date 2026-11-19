@@ -1773,61 +1773,196 @@ class StrotCompiler:
             )
         return None
 
+    @staticmethod
+    def _question_runtime(spec: Mapping[str, Any]) -> "tuple[str, List[Any]]":
+        """``(base_type, ordered classes)`` for a question's distilled head.
+
+        predicate -> ``[False, True]`` (the head reports P(true)); choice -> the
+        choice values in order; score -> the ordered level labels.
+        """
+        qtype = spec["type"]
+        if qtype in ("predicate", "boolean"):
+            return "predicate", [False, True]
+        if qtype == "choice":
+            return "choice", [value for value, _ in StrotCompiler._choice_pairs(spec)]
+        return "score", [label for label, _ in StrotCompiler._score_levels(spec)]
+
+    @staticmethod
+    def _literal_assignment(code: str, name: str) -> Any:
+        """Literal-eval the value of a top-level ``name = ...`` assignment."""
+        for node in ast.parse(code).body:
+            target = None
+            if isinstance(node, ast.Assign) and node.targets:
+                target = getattr(node.targets[0], "id", None)
+            elif isinstance(node, ast.AnnAssign):
+                target = getattr(node.target, "id", None)
+            if target == name:
+                return ast.literal_eval(node.value)
+        raise ValueError(f"no top-level {name!r} assignment")
+
+    def build_decide_teacher_prompt(
+        self, questions: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
+    ) -> str:
+        """Ask the teacher LLM to answer every question for every record - the
+        training labels each per-question head is distilled from."""
+        spec_lines = []
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            allowed = ("true or false" if base == "predicate"
+                       else "exactly one of: " + ", ".join(repr(c) for c in classes))
+            spec_lines.append(
+                f"- {name!r} ({base}): {spec.get('instructions', '')} "
+                f"Answer with {allowed}."
+            )
+        return "\n".join([
+            "You are the STROT teacher. Answer every question for every record "
+            "below - these answers train a small local model, so be accurate and "
+            "internally consistent.",
+            "",
+            "## QUESTIONS",
+            "\n".join(spec_lines),
+            "",
+            "## RECORDS",
+            json.dumps([dict(r) for r in records], indent=2, default=str),
+            "",
+            "## OUTPUT CONTRACT",
+            "Emit exactly one ```python code block with a single top-level "
+            "definition and nothing else:",
+            f"- `ANSWERS: list` of EXACTLY {len(records)} dicts, one per record "
+            "in the SAME order. Each dict maps EVERY question name to that "
+            "record's answer: predicate -> a Python bool (True/False); choice -> "
+            "exactly one allowed value (keep booleans as booleans); score -> "
+            "exactly one allowed level label (a string).",
+        ])
+
+    def _validate_decide_labels(
+        self, code: str, n: int, questions: Mapping[str, Any]
+    ) -> Optional[str]:
+        try:
+            answers = self._literal_assignment(code, "ANSWERS")
+        except Exception as exc:
+            return f"ANSWERS must be a single literal list assignment: {exc}"
+        if not isinstance(answers, list) or len(answers) != n:
+            got = len(answers) if isinstance(answers, list) else "a non-list"
+            return f"ANSWERS must have exactly {n} entries (got {got})."
+        for i, row in enumerate(answers):
+            if not isinstance(row, dict):
+                return f"ANSWERS[{i}] must be a dict."
+            for name, spec in questions.items():
+                if name not in row:
+                    return f"ANSWERS[{i}] is missing question {name!r}."
+                base, classes = self._question_runtime(spec)
+                value = row[name]
+                if base == "predicate" and not isinstance(value, bool):
+                    return f"ANSWERS[{i}][{name!r}] must be a bool."
+                if base != "predicate" and value not in classes:
+                    return (
+                        f"ANSWERS[{i}][{name!r}]={value!r} is not an allowed "
+                        f"{base} answer."
+                    )
+        return None
+
     def compile_decide(
         self,
         sample: Any,
         questions: Mapping[str, Any],
         golden: Optional[List[Mapping[str, Any]]] = None,
     ) -> CompiledAsset:
-        """Decide mode: compile a typed-question decision config.
+        """Decide mode: compile one distilled head per typed question.
 
-        The synthesis agent expands the config (criteria descriptions, score
-        rubrics, predicate case descriptions) against the verified schema and
-        writes the state projection; the local decision model answers all
-        questions per record at runtime in one batched pass. With ``golden``,
-        candidates are executed against known-answer records inside the
-        repair loop and only promoted when every expectation holds.
+        The synthesizer writes the state projection; the teacher LLM answers
+        every question for every sampled record; a logistic head per question is
+        trained on the frozen encoder's embeddings (the same head-first path as
+        routing) and baked in. There is no zero-shot router - the heads are the
+        model. With ``golden``, the baked model is run against known-answer
+        records and rejected if any expectation fails.
         """
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
-                "decide mode currently requires a local decision model "
+                "decide mode requires a local encoder to embed records "
                 f"(got {self.nlu_model!r})."
             )
         self.validate_questions_config(questions)
         if golden is not None:
             self.validate_golden_decide(golden, questions)
         schema = introspect_schema(sample)
+        records = list(sample)
+        from . import distill as distill_mod
+
+        if len(records) < distill_mod.MIN_DISTILL_RECORDS:
+            raise RouterConfigurationError(
+                f"decide needs at least {distill_mod.MIN_DISTILL_RECORDS} sample "
+                f"records to distill its heads (got {len(records)}); raise "
+                "sample_size."
+            )
+
+        # 1. Synthesize the state projection (route_context). The decide prompt
+        # also expands criteria/rubrics; the heads learn from labels rather than
+        # criteria, so only route_context is used - the block is kept in the
+        # baked model as a record of the synthesis.
         prompt = self.build_decide_prompt(schema, questions)
-        header = templates.DECIDE_HEADER_TEMPLATE.format(
-            nlu_model=self.nlu_model,
-            schema_literal=repr(schema.to_dict()),
-            config_literal=repr(dict(questions)),
-        )
         promoted: Dict[str, str] = {}
 
         def validate(code: str) -> Optional[str]:
             error = self._validate_decide_candidate(code, questions)
             if error:
                 return error
-            source = (
-                "\n\n".join(
-                    [header, templates.DECIDE_FOOTER_TEMPLATE.format(generated_paths=code)]
-                )
-                + "\n"
-            )
-            try:
-                ast.parse(source)
-            except SyntaxError as exc:  # template regression guard
-                return f"Assembled decision asset failed syntax validation: {exc}"
-            if golden:
-                error = self._test_golden_decider(source, golden, questions)
-                if error:
-                    return error
-            promoted["source"] = source
+            promoted["code"] = code
             return None
 
         _, attempts = self._synthesize_with(prompt, validate)
-        source = promoted["source"]
+        code = promoted["code"]
+        ns: Dict[str, Any] = {}
+        exec(compile(code, "<decide-projection>", "exec"), ns)
+        contexts = [ns["route_context"](dict(record)) for record in records]
+
+        # 2. Teacher labels: every question answered for every record.
+        from . import pii
+
+        masked = pii.mask_records(records, maskers=pii.default_maskers())
+        labels_code, _ = self._synthesize_with(
+            self.build_decide_teacher_prompt(questions, masked),
+            lambda c: self._validate_decide_labels(c, len(records), questions),
+        )
+        answers = self._literal_assignment(labels_code, "ANSWERS")
+
+        # 3. Frozen-encoder embeddings - one per record, shared by every head.
+        vectors = distill_mod.make_encoder_embedder(
+            self._resolve_compile_checkpoint()
+        )(contexts)
+
+        # 4. One logistic head per question.
+        question_heads: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            y = [classes.index(answers[i][name]) for i in range(len(records))]
+            head_w, head_b = distill_mod.train_head(
+                vectors, y, n_classes=len(classes)
+            )
+            question_heads[name] = {
+                "type": base, "classes": classes,
+                "weights": head_w, "bias": head_b,
+            }
+
+        # 5. Bake the distilled decision model.
+        header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
+            nlu_model=self.nlu_model,
+            schema_literal=repr(schema.to_dict()),
+            config_literal=repr(dict(questions)),
+        )
+        heads_literal = "QUESTION_HEADS: Dict[str, Any] = " + repr(question_heads)
+        source = "\n\n".join(
+            [header, code, heads_literal,
+             templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format()]
+        ) + "\n"
+        if golden:
+            error = self._test_golden_decider(source, golden, questions)
+            if error:
+                raise CompilationError(
+                    "Distilled decision model does not satisfy the golden "
+                    f"records:\n{error}",
+                    attempts=attempts, last_error=error,
+                )
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,
@@ -1835,6 +1970,7 @@ class StrotCompiler:
             goal=json.dumps(questions, sort_keys=True),
             schema=schema,
             attempts=attempts,
+            model_search={"winner": "distilled", "n_records": len(records)},
         )
 
     def _assemble(
