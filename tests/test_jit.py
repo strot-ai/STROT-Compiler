@@ -663,6 +663,32 @@ class TestDistill:
                               state=tmp_path, sample_size=28, distill=True, execute=False)
         assert plain.cache_key != distilled.cache_key
 
+    def test_bare_encoder_compiles_head_first_without_julia(self, tmp_path, monkeypatch):
+        # A bare HF encoder has no zero-shot router: the compile must distill a
+        # head directly and never import julia. Deliberately no fake_runtime
+        # (that installs a fake julia) - the point is the path needs none.
+        import strot.distill as distill_mod
+        from strot.compiler import StrotCompiler
+
+        monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
+        monkeypatch.setattr(StrotCompiler, "_is_bare_encoder", lambda self: True)
+        monkeypatch.setattr(
+            distill_mod, "make_encoder_embedder", lambda ckpt: self._keyword_embedder
+        )
+        result = strot.run(
+            self.BIG_SAMPLE, QUERY, REGISTRY,
+            llm=ScriptedLLM([VALID_PATHS, self.TEACHER]), state=tmp_path,
+            sample_size=28, distill=True, measure_labels=True, execute=False,
+        )
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["runtime_kind"] == "distilled"
+        assert meta["model_search"]["winner"] == "distilled"
+        assert meta["model_search"]["zero_shot"] == 0.0  # sentinel: no zero-shot router
+        assert meta["label_search"] is None  # Julia label-search skipped for a bare encoder
+        source = result.artifact_path.read_text()
+        assert "HEAD_WEIGHTS" in source
+        assert "import julia" not in source and "from julia" not in source
+
 
 class TestOptimize:
     """The optimize flag + fine-tune escalation (no torch: finetune_adapter is

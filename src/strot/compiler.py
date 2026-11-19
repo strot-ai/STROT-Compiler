@@ -689,6 +689,32 @@ class StrotCompiler:
 
         return snapshot_download(self.nlu_model)
 
+    def _is_bare_encoder(self) -> bool:
+        """True when the base is a standard HF encoder (``config.json`` at the
+        checkpoint root, no Julia-style ``encoder/`` wrapper) rather than a
+        self-contained decision model.
+
+        Bare encoders compile *head-first*: a standalone encoder cannot route
+        zero-shot, so the distilled head is the floor (no Julia router, no
+        zero-shot baseline, no Julia-based label search). The empty checkpoints
+        the test suite points ``STROT_NLU_CHECKPOINT`` at have no ``config.json``,
+        so they stay on the Julia path. Cached per compiler.
+        """
+        cached = getattr(self, "_bare_encoder_cache", None)
+        if cached is not None:
+            return cached
+        import os
+
+        try:
+            ckpt = str(self._resolve_compile_checkpoint())
+            result = os.path.isfile(os.path.join(ckpt, "config.json")) and not (
+                os.path.isdir(os.path.join(ckpt, "encoder"))
+            )
+        except Exception:
+            result = False
+        self._bare_encoder_cache = result
+        return result
+
     def _measure_labelings(
         self,
         source: str,
@@ -871,6 +897,7 @@ class StrotCompiler:
             or target_accuracy is not None or optimize
         ):
             records = _sample_records(sample)
+            bare = self._is_bare_encoder()
             if distill or optimize:
                 from . import distill as distill_mod
 
@@ -938,7 +965,10 @@ class StrotCompiler:
             # calibration never has to re-run a torch-only adapter at compile.
             _ft_calibrate_dist: Optional[List[List[float]]] = None
 
-            if measure_labels:
+            # Label search runs the synthesized labels through the zero-shot
+            # router; a bare encoder has no such router, so it is skipped (the
+            # distilled head below learns the labels directly).
+            if measure_labels and not bare:
                 winner, winner_labels, scores = self._measure_labelings(
                     source, records_measure, true_measure, action_registry, question, goal
                 )
@@ -970,29 +1000,40 @@ class StrotCompiler:
             if distill or optimize:
                 from . import distill as distill_mod
 
-                module = self._load_candidate_module(source)
-                try:
-                    contexts = [
-                        module.route_context(dict(record)) for record in records
-                    ]
-                    routing_question = question or (
-                        f"Which execution path best achieves the goal: {goal}?"
-                    )
-                    router = module._RuntimeRouter()
-                    zero_shot_correct = 0
-                    for i in measure_ix:
-                        decision = router.select(
-                            contexts[i], routing_question, module._ROUTING_OPTIONS
+                if bare:
+                    # Bare encoder: no zero-shot router. Project records with the
+                    # synthesized route_context alone (no Julia import) and let the
+                    # distilled head be the floor - a 0.0 baseline it always beats.
+                    _ns: Dict[str, Any] = {}
+                    exec(compile(final_code, "<route-context>", "exec"), _ns)
+                    contexts = [_ns["route_context"](dict(record)) for record in records]
+                    zero_shot_acc = 0.0
+                else:
+                    module = self._load_candidate_module(source)
+                    try:
+                        contexts = [
+                            module.route_context(dict(record)) for record in records
+                        ]
+                        routing_question = question or (
+                            f"Which execution path best achieves the goal: {goal}?"
                         )
-                        if decision.index == true_indices[i]:
-                            zero_shot_correct += 1
-                finally:
-                    import sys as _sys
+                        router = module._RuntimeRouter()
+                        zero_shot_correct = 0
+                        for i in measure_ix:
+                            decision = router.select(
+                                contexts[i], routing_question, module._ROUTING_OPTIONS
+                            )
+                            if decision.index == true_indices[i]:
+                                zero_shot_correct += 1
+                    finally:
+                        import sys as _sys
 
-                    _sys.modules.pop("strot_golden_gate", None)
-                zero_shot_acc = round(zero_shot_correct / len(measure_ix), 4)
+                        _sys.modules.pop("strot_golden_gate", None)
+                    zero_shot_acc = round(zero_shot_correct / len(measure_ix), 4)
 
                 model_search = {
+                    # A bare encoder has no zero-shot router; 0.0 is the sentinel
+                    # floor the distilled head is measured against and adopted over.
                     "zero_shot": zero_shot_acc,
                     "n_train": len(train_ix),
                     "n_measure": len(measure_ix),

@@ -193,18 +193,24 @@ class _RuntimeRouter:
                 from huggingface_hub import snapshot_download
 
                 checkpoint = snapshot_download(NLU_MODEL)
-        self._tokenizer = AutoTokenizer.from_pretrained(checkpoint + "/tokenizer")
-        config = AutoConfig.from_pretrained(checkpoint + "/encoder")
-        self._model = AutoModel.from_config(config)
-        state = load_file(checkpoint + "/model.safetensors")
-        self._model.load_state_dict(
-            {{
-                key[len("encoder."):]: value
-                for key, value in state.items()
-                if key.startswith("encoder.")
-            }},
-            strict=False,
-        )
+        if os.path.isdir(os.path.join(checkpoint, "encoder")):
+            # Wrapped decision model: extract the encoder from composite weights.
+            self._tokenizer = AutoTokenizer.from_pretrained(checkpoint + "/tokenizer")
+            config = AutoConfig.from_pretrained(checkpoint + "/encoder")
+            self._model = AutoModel.from_config(config)
+            state = load_file(checkpoint + "/model.safetensors")
+            self._model.load_state_dict(
+                {{
+                    key[len("encoder."):]: value
+                    for key, value in state.items()
+                    if key.startswith("encoder.")
+                }},
+                strict=False,
+            )
+        else:
+            # Standard HF encoder (the base STROT compiles on).
+            self._tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+            self._model = AutoModel.from_pretrained(checkpoint, trust_remote_code=True)
         self._model.eval()
 
     def embed(self, context: str) -> List[float]:

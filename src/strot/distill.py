@@ -31,33 +31,51 @@ MIN_DISTILL_RECORDS = 24  #: below this, folds are too small to train or judge
 
 
 def make_encoder_embedder(checkpoint: str, batch_size: int = 16) -> EmbedFn:
-    """Production embedder: mean-pooled last hidden state of the checkpoint's
-    frozen encoder (the same encoder the zero-shot runtime uses)."""
+    """Production embedder: mean-pooled last hidden state of the frozen encoder.
+
+    Handles two checkpoint layouts:
+
+    * **Standard HuggingFace encoder** (the default base, e.g. a ModernBERT) —
+      a hub id or local dir that ``AutoModel.from_pretrained`` loads directly.
+    * **Wrapped decision model** (a self-contained predictor whose encoder is
+      stored under an ``encoder/`` config dir with ``"encoder."``-prefixed
+      tensors in the root ``model.safetensors``) — the encoder is extracted and
+      loaded on its own.
+    """
     try:
+        import os
+
         import torch
-        from safetensors.torch import load_file
-        from transformers import AutoConfig, AutoModel, AutoTokenizer
+        from transformers import AutoModel, AutoTokenizer
     except ImportError as exc:
         raise RouterConfigurationError(
             "Distillation needs the local runtime deps: pip install strot-ai[local]"
         ) from exc
-    # The checkpoint stores all weights in the root model.safetensors with an
-    # "encoder." prefix; the encoder/ dir holds only the config.
-    tokenizer = AutoTokenizer.from_pretrained(f"{checkpoint}/tokenizer")
-    config = AutoConfig.from_pretrained(f"{checkpoint}/encoder")
-    model = AutoModel.from_config(config)
-    state = load_file(f"{checkpoint}/model.safetensors")
-    encoder_state = {
-        key[len("encoder."):]: value
-        for key, value in state.items()
-        if key.startswith("encoder.")
-    }
-    if not encoder_state:
-        raise RouterConfigurationError(
-            "Checkpoint has no 'encoder.'-prefixed tensors; cannot build the "
-            "distillation embedder from it."
-        )
-    model.load_state_dict(encoder_state, strict=False)
+
+    if os.path.isdir(os.path.join(str(checkpoint), "encoder")):
+        # Wrapped decision model: pull the encoder out of the composite weights.
+        from safetensors.torch import load_file
+        from transformers import AutoConfig
+
+        tokenizer = AutoTokenizer.from_pretrained(f"{checkpoint}/tokenizer")
+        config = AutoConfig.from_pretrained(f"{checkpoint}/encoder")
+        model = AutoModel.from_config(config)
+        state = load_file(f"{checkpoint}/model.safetensors")
+        encoder_state = {
+            key[len("encoder."):]: value
+            for key, value in state.items()
+            if key.startswith("encoder.")
+        }
+        if not encoder_state:
+            raise RouterConfigurationError(
+                "Checkpoint has an encoder/ dir but no 'encoder.'-prefixed "
+                "tensors; cannot build the distillation embedder from it."
+            )
+        model.load_state_dict(encoder_state, strict=False)
+    else:
+        # Standard HF encoder (the base STROT compiles on).
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        model = AutoModel.from_pretrained(checkpoint, trust_remote_code=True)
     model.eval()
 
     def embed(texts: List[str]) -> List[List[float]]:
