@@ -227,8 +227,10 @@ class _RuntimeRouter:
 
     def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
         vector = self.embed(context)
+        # Compile-time-fitted logit-space temperature (honest confidence).
+        _t = globals().get("HEAD_TEMPERATURE", 1.0)
         logits = [
-            sum(w * x for w, x in zip(row, vector)) + b
+            (sum(w * x for w, x in zip(row, vector)) + b) / _t
             for row, b in zip(HEAD_WEIGHTS, HEAD_BIAS)
         ]
         peak = max(logits)

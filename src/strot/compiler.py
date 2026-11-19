@@ -1086,10 +1086,30 @@ class StrotCompiler:
                                 "centroids": centroids, "threshold": threshold,
                                 "percentile": 0.95, "basis": "distilled_frozen_encoder",
                             }
+                        # Calibrate-by-default: fit a logit-space temperature on
+                        # the held-out calib fold from the head's own logits (no
+                        # Julia distribution collection). Skipped when a target_*
+                        # policy will fit the process-level temperature instead,
+                        # so the two never compound.
+                        head_temp = 1.0
+                        if (target_risk is None and target_accuracy is None
+                                and len(calib_ix) >= 4):
+                            from . import calibrate as calibrate_mod
+
+                            calib_logits = [
+                                [sum(w * x for w, x in zip(row, v)) + b
+                                 for row, b in zip(head_w, head_b)]
+                                for v in embed([contexts[i] for i in calib_ix])
+                            ]
+                            head_temp = calibrate_mod.fit_temperature_logits(
+                                calib_logits, [true_indices[i] for i in calib_ix]
+                            )
+                            model_search["head_temperature"] = head_temp
                         head_code = (
                             "\n\n# Compile-time-distilled head (train fold only)\n"
                             f"HEAD_WEIGHTS = {head_w!r}\n"
-                            f"HEAD_BIAS = {head_b!r}"
+                            f"HEAD_BIAS = {head_b!r}\n"
+                            f"HEAD_TEMPERATURE = {head_temp!r}"
                         )
                         candidate_code = final_code + head_code
                         candidate_source = self._assemble(

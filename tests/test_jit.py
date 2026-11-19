@@ -689,6 +689,7 @@ class TestDistill:
         assert meta["label_search"] is None  # Julia label-search skipped for a bare encoder
         source = result.artifact_path.read_text()
         assert "HEAD_WEIGHTS" in source
+        assert "HEAD_TEMPERATURE" in source  # calibrate-by-default on the head
         assert "import julia" not in source and "from julia" not in source
 
 
