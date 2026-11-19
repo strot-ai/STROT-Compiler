@@ -471,8 +471,9 @@ DECIDE_DISTILLED_RUNTIME_TEMPLATE = '''\
 
 
 def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
-                  bias: Sequence[float]) -> List[float]:
-    logits = [sum(w * x for w, x in zip(row, vector)) + b
+                  bias: Sequence[float], temperature: float = 1.0) -> List[float]:
+    """softmax((W.x + b) / T) - temperature fitted at compile time per head."""
+    logits = [(sum(w * x for w, x in zip(row, vector)) + b) / temperature
               for row, b in zip(weights, bias)]
     peak = max(logits)
     exps = [math.exp(z - peak) for z in logits]
@@ -525,7 +526,8 @@ class CompiledDecider:
         vector = self._embed(route_context(dict(record)))  # synthesized projection
         output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
         for name, head in QUESTION_HEADS.items():
-            probs = _head_softmax(vector, head["weights"], head["bias"])
+            probs = _head_softmax(vector, head["weights"], head["bias"],
+                                  head.get("temperature", 1.0))
             classes = head["classes"]
             if head["type"] == "predicate":
                 p_true = probs[classes.index(True)]

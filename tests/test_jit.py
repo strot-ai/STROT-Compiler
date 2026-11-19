@@ -1211,6 +1211,8 @@ class TestDecide:
         assert heads["sentiment"]["classes"] == ["angry", "neutral", "happy"]
         assert heads["team"]["type"] == "choice"
         assert heads["team"]["classes"] == ["billing", "engineering"]
+        # Each head carries a compile-time-fitted temperature for honest confidence.
+        assert all("temperature" in h for h in heads.values())
         # Warm call: no LLM.
         warm = strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(),
                             state=tmp_path, sample_size=28, execute=False)

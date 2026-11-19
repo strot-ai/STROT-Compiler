@@ -1930,18 +1930,38 @@ class StrotCompiler:
         vectors = distill_mod.make_encoder_embedder(
             self._resolve_compile_checkpoint()
         )(contexts)
+        # Fold hygiene: each head trains on one fold; its temperature is fit on a
+        # disjoint fold so the baked confidence is honest, not overfit.
+        from . import calibrate as calibrate_mod
 
-        # 4. One logistic head per question.
+        train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
+            list(range(len(records)))
+        )
+        fit_ix = train_ix + measure_ix
+
+        # 4. One calibrated logistic head per question.
         question_heads: Dict[str, Any] = {}
         for name, spec in questions.items():
             base, classes = self._question_runtime(spec)
             y = [classes.index(answers[i][name]) for i in range(len(records))]
             head_w, head_b = distill_mod.train_head(
-                vectors, y, n_classes=len(classes)
+                [vectors[i] for i in fit_ix], [y[i] for i in fit_ix],
+                n_classes=len(classes),
+            )
+            calib_logits = [
+                [sum(w * x for w, x in zip(row, vectors[i])) + b
+                 for row, b in zip(head_w, head_b)]
+                for i in calib_ix
+            ]
+            temperature = (
+                calibrate_mod.fit_temperature_logits(
+                    calib_logits, [y[i] for i in calib_ix]
+                )
+                if len(calib_ix) >= 4 else 1.0
             )
             question_heads[name] = {
                 "type": base, "classes": classes,
-                "weights": head_w, "bias": head_b,
+                "weights": head_w, "bias": head_b, "temperature": temperature,
             }
 
         # 5. Bake the distilled decision model.
