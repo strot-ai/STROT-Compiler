@@ -158,7 +158,12 @@ def _fresh_compiled_modules():
 
 @pytest.fixture
 def fake_runtime(monkeypatch, tmp_path):
+    import strot.router
+
     monkeypatch.setitem(sys.modules, "julia", _build_fake_julia())
+    # Pin the base to Julia so these back-compat tests exercise the zero-shot
+    # decision runtime; production defaults to a head-first encoder.
+    monkeypatch.setitem(strot.router.STROT_MODELS, "zero-shot", "SupersonicLabs/Julia-1")
     # Point checkpoint resolution at a local dir so the artifact never tries
     # a Hugging Face download during tests.
     monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
@@ -433,9 +438,13 @@ class TestRun:
         unroutable = [o for o in result.outcomes if o["record"]["ticket_id"] == 3][0]
         assert unroutable["confidence"] < 0.40  # the low confidence is shown, not hidden
 
-    def test_execute_false_warms_cache_without_runtime(self, tmp_path):
+    def test_execute_false_warms_cache_without_runtime(self, tmp_path, monkeypatch):
         # No fake torch here: loading the artifact would fail, proving the
-        # warm-only path never touches the runtime.
+        # warm-only path never touches the runtime. Zero-shot base so compile
+        # does not train a head either.
+        import strot.router
+
+        monkeypatch.setitem(strot.router.STROT_MODELS, "zero-shot", "SupersonicLabs/Julia-1")
         llm = ScriptedLLM([VALID_PATHS])
         result = strot.run(SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, execute=False)
         assert result.artifact_path.exists()

@@ -35,7 +35,7 @@ from .exceptions import FallbackException, RouterConfigurationError
 #: API, in default output, or in docs — callers select a STROT model by its
 #: branded name (:data:`STROT_MODELS`) and the base id is resolved here. The
 #: license attribution for both base models lives in the repo NOTICE/README.
-_DEFAULT_BASE_MODEL = "SupersonicLabs/Julia-1"
+_DEFAULT_BASE_MODEL = "Alibaba-NLP/gte-modernbert-base"
 _FAST_BASE_MODEL = "answerdotai/ModernBERT-base"
 
 #: Public STROT model names -> internal base encoder. ``zero-shot`` is the

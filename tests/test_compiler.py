@@ -54,6 +54,9 @@ class ScriptedLLM:
 
 
 def make_compiler(llm, **kwargs):
+    # These tests exercise the Julia (zero-shot) compile path; production
+    # defaults to a head-first encoder.
+    kwargs.setdefault("nlu_model", "SupersonicLabs/Julia-1")
     return StrotCompiler(llm_client=llm, **kwargs)
 
 

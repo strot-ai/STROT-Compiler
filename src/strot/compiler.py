@@ -690,28 +690,27 @@ class StrotCompiler:
         return snapshot_download(self.nlu_model)
 
     def _is_bare_encoder(self) -> bool:
-        """True when the base is a standard HF encoder (``config.json`` at the
-        checkpoint root, no Julia-style ``encoder/`` wrapper) rather than a
-        self-contained decision model.
+        """True when the base is a standard HF encoder (compiles *head-first*)
+        rather than a Julia-style self-contained decision model.
 
-        Bare encoders compile *head-first*: a standalone encoder cannot route
-        zero-shot, so the distilled head is the floor (no Julia router, no
-        zero-shot baseline, no Julia-based label search). The empty checkpoints
-        the test suite points ``STROT_NLU_CHECKPOINT`` at have no ``config.json``,
-        so they stay on the Julia path. Cached per compiler.
+        A bare encoder cannot route zero-shot, so the distilled head is the
+        floor (no Julia router, no zero-shot baseline, no Julia-based label
+        search). Detected by id with no download - the Julia decision model is
+        the only non-bare base; a locally resolved checkpoint carrying an
+        ``encoder/`` wrapper is also treated as a decision model. Cached.
         """
         cached = getattr(self, "_bare_encoder_cache", None)
         if cached is not None:
             return cached
         import os
 
-        try:
-            ckpt = str(self._resolve_compile_checkpoint())
-            result = os.path.isfile(os.path.join(ckpt, "config.json")) and not (
-                os.path.isdir(os.path.join(ckpt, "encoder"))
-            )
-        except Exception:
-            result = False
+        if self.runtime_kind != "local":
+            result = False  # a hosted API runtime, not a local encoder
+        elif self.nlu_model in ("SupersonicLabs/Julia-1",):
+            result = False  # Julia is a self-contained decision model
+        else:
+            override = os.environ.get("STROT_NLU_CHECKPOINT")
+            result = not (override and os.path.isdir(os.path.join(override, "encoder")))
         self._bare_encoder_cache = result
         return result
 
@@ -855,6 +854,11 @@ class StrotCompiler:
         if golden is not None:
             self.validate_golden_run(golden, action_registry)
         schema = introspect_schema(sample)
+        # A bare encoder cannot route zero-shot, so the default is head-first:
+        # train a distilled head. Julia (a self-contained decision model) keeps
+        # its zero-shot path.
+        if self._is_bare_encoder() and not distill and not optimize:
+            distill = True
         expected = [handler_name(key) for key in action_registry]
         if len(set(expected)) != len(expected):
             raise CompilationError(

@@ -14,6 +14,15 @@ from strot.jit import _resolve_llm
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _julia_base(monkeypatch):
+    # These CLI tests exercise synthesis + caching on the zero-shot path;
+    # production defaults to a head-first encoder.
+    import strot.router
+
+    monkeypatch.setitem(strot.router.STROT_MODELS, "zero-shot", "SupersonicLabs/Julia-1")
+
+
 def test_codex_process_repairs_and_reuses_cache(monkeypatch, tmp_path):
     cases = json.loads((FIXTURES / "support_tickets.json").read_text(encoding="utf-8"))
     example = runpy.run_path(str(Path(__file__).parents[1] / "examples/end_to_end.py"))

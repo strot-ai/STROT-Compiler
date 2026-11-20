@@ -21,7 +21,8 @@ class TestFactory:
     def test_default_resolves_to_local(self):
         strategy = create_strategy()
         assert isinstance(strategy, LocalEncoderStrategy)
-        assert strategy.nlu_model == "SupersonicLabs/Julia-1"
+        # The default base is now a standard encoder (head-first), not Julia.
+        assert strategy.nlu_model == "Alibaba-NLP/gte-modernbert-base"
 
     @pytest.mark.parametrize("name", ["openai/gpt-4o-mini", "anthropic/claude-haiku-4-5"])
     def test_provider_prefixes_resolve_to_hosted(self, name):
