@@ -531,15 +531,11 @@ def decide(
     data: Any,
     questions: Union[str, Mapping[str, Any]],
     llm: LLMSpec = "openai/gpt-4o",
-    nlu: Optional[str] = None,
-    model: Optional[str] = None,
     state: Union[str, Path] = ".strot",
     sample_size: int = 25,
     max_retries: int = 3,
     execute: bool = True,
     golden: Optional[List[Mapping[str, Any]]] = None,
-    optimize: bool = False,
-    reuse_adapter: Optional[Mapping[str, Any]] = None,
     confidence_threshold: Optional[float] = None,
     name: Optional[str] = None,
 ) -> RunResult:
@@ -587,9 +583,8 @@ def decide(
     runtime the local ML decision model answers all questions per record in
     one batched pass. Output is bounded, type-safe JSON - nothing generated.
 
-    ``optimize`` and ``reuse_adapter`` are accepted for API parity with
-    :func:`run` and participate in the cache key; decide mode has no
-    routing-tier escalation, so they are otherwise inert here.
+    The base encoder is a STROT decision - not a caller choice - so there is no
+    ``nlu``/``model`` argument; questions compile to one distilled head each.
 
     ``confidence_threshold`` is an opt-in per-question refusal policy: when set,
     any answer whose confidence falls below it is replaced with
@@ -615,10 +610,9 @@ def decide(
     sample = records[:sample_size]
     schema = introspect_schema(sample)
     canonical_config = json.dumps(questions, sort_keys=True)
-    nlu = resolve_model(model, nlu)  # branded STROT model name -> internal base encoder
+    nlu = DEFAULT_NLU_MODEL  # STROT owns the base encoder; it is not a caller choice
     key = cache_key(
-        canonical_config, None, nlu, schema, None, 0.0, mode="decide",
-        golden=golden, optimize=optimize, reuse_adapter=reuse_adapter,
+        canonical_config, None, nlu, schema, None, 0.0, mode="decide", golden=golden,
     )
     # The canonical config is JSON, so auto-slug off the question names instead.
     slug = _battery_slug(name, " ".join(questions))
