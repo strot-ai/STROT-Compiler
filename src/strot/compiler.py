@@ -38,6 +38,9 @@ from .schema import DatasetSchema, introspect_schema
 #: A generative LLM client is any callable mapping a prompt to raw model text.
 LLMClient = Callable[[str], str]
 
+#: Below this many labeled records for a class, its head under-learns; warn.
+MIN_CLASS_RECORDS = 3
+
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
@@ -1949,6 +1952,25 @@ class StrotCompiler:
             lambda c: self._validate_decide_labels(c, len(records), questions),
         )
         answers = self._literal_assignment(labels_code, "ANSWERS")
+
+        # Coverage guard: a head can only learn an outcome it has seen. Warn on
+        # thin classes so the author brings records covering each outcome
+        # (bring-your-own-data; a logistic head needs only a few per class).
+        import warnings
+
+        for name, spec in questions.items():
+            _, classes = self._question_runtime(spec)
+            counts: Dict[Any, int] = {}
+            for row in answers:
+                counts[row[name]] = counts.get(row[name], 0) + 1
+            thin = [c for c in classes if counts.get(c, 0) < MIN_CLASS_RECORDS]
+            if thin:
+                warnings.warn(
+                    f"decide: question {name!r} has thin coverage for {thin} "
+                    f"(<{MIN_CLASS_RECORDS} labeled records each); the head will "
+                    "under-learn these outcomes. Bring more records covering them.",
+                    stacklevel=2,
+                )
 
         # 3. Frozen-encoder embeddings - one per record, shared by every head.
         vectors = distill_mod.make_encoder_embedder(

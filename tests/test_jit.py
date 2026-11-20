@@ -1228,6 +1228,26 @@ class TestDecide:
                             state=tmp_path, sample_size=28, execute=False)
         assert warm.cache_hit is True
 
+    def test_decide_warns_on_thin_class_coverage(self, tmp_path, fake_runtime, decide_encoder):
+        # A head can't learn an outcome it never sees: if the teacher labels every
+        # record "billing", the "engineering" class is empty and compile warns.
+        config = {"team": {"type": "choice",
+                           "choices": [{"value": "billing"}, {"value": "engineering"}]}}
+        expansion = '''```python
+QUESTIONS = {
+    "team": {"type": "choice", "instructions": "which team",
+             "criteria": {"billing": "billing", "engineering": "engineering"}},
+}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
+```'''
+        teacher = "```python\nANSWERS = " + repr([{"team": "billing"}] * 28) + "\n```"
+        with pytest.warns(UserWarning, match="thin coverage"):
+            strot.decide(DECIDE_SAMPLE, config, llm=ScriptedLLM([expansion, teacher]),
+                         state=tmp_path, sample_size=28, execute=False)
+
     def test_decide_accepts_deprecated_boolean_alias(self, tmp_path, fake_runtime, decide_encoder):
         # "boolean" is a deprecated alias for "predicate": it must still
         # compile, run, and produce the same probability output under the
