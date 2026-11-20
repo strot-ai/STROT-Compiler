@@ -1202,6 +1202,32 @@ def decide_encoder(monkeypatch):
     monkeypatch.setattr(distill_mod, "make_encoder_embedder", lambda ckpt: _decide_embed)
 
 
+class TestProposeQuestions:
+    def test_proposes_a_validated_typed_question_set(self, tmp_path):
+        # Intake: one-line intent -> a typed question config, ready for decide().
+        proposed = '''```python
+QUESTIONS = {
+    "is_bug": {"type": "predicate", "instructions": "Is this a bug report?"},
+    "team": {"type": "choice", "instructions": "Which team?",
+             "choices": [{"value": "billing"}, {"value": "engineering"}]},
+}
+```'''
+        questions = strot.propose_questions(
+            SAMPLE, "triage support tickets", llm=ScriptedLLM([proposed])
+        )
+        assert set(questions) == {"is_bug", "team"}
+        assert questions["is_bug"]["type"] == "predicate"
+        assert questions["team"]["type"] == "choice"
+        assert [c["value"] for c in questions["team"]["choices"]] == ["billing", "engineering"]
+
+    def test_invalid_proposal_feeds_the_repair_loop(self, tmp_path):
+        bad = '```python\nQUESTIONS = {"q": {"type": "bogus", "instructions": "x"}}\n```'
+        good = ('```python\nQUESTIONS = {"ok": {"type": "predicate", '
+                '"instructions": "is it urgent?"}}\n```')
+        questions = strot.propose_questions(SAMPLE, "flag urgent", llm=ScriptedLLM([bad, good]))
+        assert set(questions) == {"ok"}
+
+
 class TestDecide:
     def test_decide_compiles_one_head_per_question(self, tmp_path, fake_runtime, decide_encoder):
         # Head-first: each typed question becomes a distilled head on the encoder

@@ -42,7 +42,7 @@ from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_sche
 
 __version__ = "0.12.0"
 
-from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
+from .jit import RunResult, decide, propose_questions, run  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
 
 # Battery distribution: a compiled catalog classifier as data (bundle on disk)
@@ -59,6 +59,7 @@ from .battery import (  # noqa: E402
 __all__ = [
     "run",
     "decide",
+    "propose_questions",
     "RunResult",
     "prefetch_nlu",
     "Battery",

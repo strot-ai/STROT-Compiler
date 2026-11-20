@@ -527,6 +527,33 @@ def _apply_refusals(decision: Dict[str, Any], threshold: float) -> Dict[str, Any
     return decision
 
 
+def propose_questions(
+    data: Any,
+    intent: str,
+    llm: LLMSpec = "openai/gpt-4o",
+    sample_size: int = 25,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """Intake: propose a typed question set from a one-line decision intent.
+
+    The LLM reads ``intent`` and the data schema and designs a small
+    ``{name: {type, ...}}`` config (predicate / choice / score). It designs the
+    decision schema only - it does not label, train, or invent data. Review and
+    edit the result, then pass it to :func:`decide`::
+
+        questions = strot.propose_questions(tickets, "triage support tickets")
+        # ...author reviews/edits questions...
+        strot.decide(tickets, questions)
+    """
+    sample = as_records(data)[:sample_size]
+    compiler = StrotCompiler(
+        nlu_model=DEFAULT_NLU_MODEL,
+        llm_client=_resolve_llm(llm),
+        max_retries=max_retries,
+    )
+    return compiler.propose_questions(sample, intent)
+
+
 def decide(
     data: Any,
     questions: Union[str, Mapping[str, Any]],

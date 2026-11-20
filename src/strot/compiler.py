@@ -1602,6 +1602,64 @@ class StrotCompiler:
                 shown[name] = dict(spec)
         return shown
 
+    def build_propose_prompt(self, schema: DatasetSchema, intent: str) -> str:
+        """Intake prompt: propose a typed question set from a one-line intent."""
+        return "\n".join([
+            "You are the STROT intake designer. From a one-line decision intent "
+            "and the dataset schema, propose the SMALL set of typed questions a "
+            "decision model should answer per record. You design the schema - you "
+            "do not write programs and you do not invent data.",
+            "",
+            "## DECISION INTENT",
+            intent,
+            "",
+            "## VERIFIED DATASET SCHEMA",
+            schema.to_json(),
+            "",
+            "## OUTPUT CONTRACT",
+            "Emit exactly one ```python code block containing a single top-level "
+            "`QUESTIONS: Dict[str, Any]` literal and nothing else. Each entry maps a "
+            "short snake_case name to a spec:",
+            '- predicate: {"type": "predicate", "instructions": <one line>}',
+            '- choice:    {"type": "choice", "instructions": <one line>, '
+            '"choices": [{"value": <str|bool>, "description": <short>}...]}',
+            '- score:     {"type": "score", "instructions": <one line>, '
+            '"levels": [{"label": <str>, "description": <short>}...]} '
+            "(2-10 levels, ordered lowest to highest)",
+            "",
+            "Rules: only questions the intent actually needs (prefer few); ground "
+            "options/levels in the schema's fields and vocabulary; no other "
+            "statements.",
+        ])
+
+    def propose_questions(self, sample: Any, intent: str) -> Dict[str, Any]:
+        """Intake: synthesize a typed question set from a one-line intent.
+
+        Returns a validated ``questions`` config for the author to review and
+        edit before :meth:`compile_decide`. The LLM designs the decision schema
+        here; it does not train or invent data.
+        """
+        schema = introspect_schema(sample)
+        prompt = self.build_propose_prompt(schema, intent)
+        promoted: Dict[str, Any] = {}
+
+        def validate(code: str) -> Optional[str]:
+            try:
+                questions = self._literal_assignment(code, "QUESTIONS")
+            except Exception as exc:
+                return f"QUESTIONS must be a single top-level literal dict: {exc}"
+            if not isinstance(questions, dict) or not questions:
+                return "QUESTIONS must be a non-empty dict."
+            try:
+                self.validate_questions_config(questions)
+            except RouterConfigurationError as exc:
+                return str(exc)
+            promoted["questions"] = questions
+            return None
+
+        self._synthesize_with(prompt, validate)
+        return promoted["questions"]
+
     def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
         """Construct the decide-mode prompt: expand a typed-question config for the model."""
         return "\n".join(
