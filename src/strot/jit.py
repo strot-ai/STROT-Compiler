@@ -28,7 +28,7 @@ import importlib.util
 import json
 import re
 import sys
-from threading import RLock
+from threading import RLock, Thread
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
@@ -76,12 +76,16 @@ class DecisionModel:
         questions: Optional[Dict[str, Any]] = None,
         confidence_threshold: Optional[float] = None,
         pipeline: Any = None,
+        tier: str = "head",
     ) -> None:
         self.artifact_path = Path(artifact_path)
         self.questions = questions  #: the typed question config this model answers
         self.confidence_threshold = confidence_threshold
+        self.tier = tier  #: "lite" | "head" - which tier is serving right now
         self._key = key
         self._pipeline = pipeline
+        self._lock = RLock()
+        self._thread: Optional[Thread] = None  #: warm-start background upgrade
 
     def _ensure_pipeline(self) -> Any:
         if self._pipeline is None:
@@ -91,10 +95,31 @@ class DecisionModel:
 
     def __call__(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         """Decide one record: returns typed decision JSON (locally, on CPU)."""
-        decision = self._ensure_pipeline().process(record)
+        with self._lock:
+            decision = self._ensure_pipeline().process(record)
         if self.confidence_threshold is not None:
             decision = _apply_refusals(decision, self.confidence_threshold)
         return decision
+
+    def _swap_to(
+        self, artifact_path: Union[str, Path], key: str,
+        questions: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Hot-swap the backing artifact (warm-start: lite -> trained head)."""
+        with self._lock:
+            self.artifact_path = Path(artifact_path)
+            self._key = key
+            self._pipeline = None  # lazy-reload the upgraded head on next call
+            if questions is not None:
+                self.questions = questions
+            self.tier = "head"
+
+    def wait(self, timeout: Optional[float] = None) -> "DecisionModel":
+        """Block until a warm-start upgrade finishes (no-op if not warm)."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+        return self
 
     def save(self, path: Union[str, Path]) -> Path:
         """Write the self-contained model to ``path`` (``.strot`` if no suffix)."""
@@ -161,6 +186,16 @@ class RunResult:
     def save(self, path: Union[str, Path]) -> Path:
         """Write the compiled model to one ``.strot`` file; returns the path."""
         return self.model.save(path)
+
+    @property
+    def tier(self) -> str:
+        """Which tier is serving now - ``"lite"`` until a warm upgrade swaps in ``"head"``."""
+        return self.model.tier
+
+    def wait(self, timeout: Optional[float] = None) -> "RunResult":
+        """Block until a warm-start head upgrade finishes (no-op if not warm)."""
+        self.model.wait(timeout)
+        return self
 
     def summary(self) -> Dict[str, Any]:
         if self.mode == "decide":
@@ -675,6 +710,7 @@ def decide(
     confidence_threshold: Optional[float] = None,
     name: Optional[str] = None,
     mode: str = "head",
+    warm: bool = False,
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
@@ -751,7 +787,48 @@ def decide(
     description, scored by cosine - no teacher pass, no training, instant, and it
     brings no data. Use ``lite`` to try a decision immediately, ``head`` once you
     want the accuracy of training on your records.
+
+    ``warm`` starts the model serving immediately with the ``lite`` tier (local,
+    $0) and trains the ``head`` in a background thread, hot-swapping it in when
+    ready. ``result(record)`` never blocks: it answers from ``lite`` until the
+    head lands, then from the head. ``result.tier`` reports which is serving and
+    ``result.wait()`` blocks until the upgrade finishes. The caller must have
+    enough records to train the head, same as ``mode="head"``.
     """
+    if warm:
+        # Resolve a bare intent once, then share the config across both tiers so
+        # the background head reuses the lite floor's schema (no re-design).
+        if isinstance(questions, str):
+            try:
+                json.loads(questions)
+            except (json.JSONDecodeError, ValueError):
+                questions = _design_questions(data, questions, llm, sample_size, max_retries)
+        common = dict(
+            llm=llm, state=state, sample_size=sample_size, max_retries=max_retries,
+            golden=golden, confidence_threshold=confidence_threshold, name=name,
+        )
+        floor = decide(data, questions, execute=execute, mode="lite", warm=False, **common)
+        model = floor.model
+        model.tier = "lite"
+
+        def _upgrade_to_head() -> None:
+            try:
+                trained = decide(data, questions, execute=False, mode="head",
+                                 warm=False, **common)
+                model._swap_to(
+                    trained.artifact_path, trained.cache_key, trained.questions
+                )
+            except Exception as exc:  # keep lite serving; never crash the thread
+                _log_episode(state, {
+                    "kind": "decide", "status": "warm_upgrade_failed",
+                    "error": str(exc)[:500],
+                })
+
+        thread = Thread(target=_upgrade_to_head, name="strot-warm-head", daemon=True)
+        model._thread = thread
+        thread.start()
+        return floor
+
     designed_from_intent = None
     if isinstance(questions, str):
         try:

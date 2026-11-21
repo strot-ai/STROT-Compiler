@@ -1288,6 +1288,27 @@ class TestDecide:
         assert lite.cache_key != head.cache_key
         assert lite.artifact_path != head.artifact_path
 
+    def test_decide_warm_serves_lite_then_upgrades_to_head(
+        self, tmp_path, fake_runtime, decide_encoder
+    ):
+        # warm=True: lite serves instantly; the head trains in a background
+        # thread and hot-swaps in. Scripts (consumed in order): lite projection,
+        # then head projection + teacher. The lite call finishes before the
+        # thread starts, so consumption is deterministic.
+        llm = ScriptedLLM([VALID_DECIDE, VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+        result = strot.decide(
+            DECIDE_SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path,
+            sample_size=28, execute=False, warm=True,
+        )
+        assert result.tier == "lite"
+        lite_path = result.model.artifact_path
+
+        result.wait(timeout=30)
+        assert result.tier == "head"
+        assert result.model.artifact_path != lite_path  # swapped to the trained head
+        heads = _baked_heads(result.model.artifact_path.read_text())
+        assert set(heads) == {"is_bug", "sentiment", "team"}
+
     def test_decide_rejects_unknown_mode(self, tmp_path, fake_runtime, decide_encoder):
         with pytest.raises(strot.RouterConfigurationError):
             strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(),
