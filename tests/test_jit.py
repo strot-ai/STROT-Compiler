@@ -1254,6 +1254,45 @@ class TestDecide:
                             state=tmp_path, sample_size=28, execute=False)
         assert warm.cache_hit is True
 
+    def test_decide_lite_mode_builds_prototype_heads_without_a_teacher(
+        self, tmp_path, fake_runtime, decide_encoder
+    ):
+        # lite = zero-shot: synthesize the projection, embed each class's
+        # description as a prototype, bake. No teacher-labeling pass, so the LLM
+        # script holds only the projection (one call, not two).
+        result = strot.decide(
+            DECIDE_SAMPLE, DECIDE_CONFIG, llm=ScriptedLLM([VALID_DECIDE]),
+            state=tmp_path, sample_size=28, execute=False, mode="lite",
+        )
+        assert result.mode == "decide"
+        heads = _baked_heads(result.artifact_path.read_text())
+        assert set(heads) == {"is_bug", "sentiment", "team"}
+        # choice/score: one L2-normalized prototype row per class, no training.
+        assert heads["team"]["classes"] == ["billing", "engineering"]
+        assert len(heads["team"]["weights"]) == 2
+        assert len(heads["sentiment"]["weights"]) == 3
+        for row in heads["team"]["weights"]:
+            assert abs(sum(x * x for x in row) ** 0.5 - 1.0) < 1e-6  # unit prototypes
+        # predicate: [-proto, +proto] -> a sigmoid around the statement.
+        neg, pos = heads["is_bug"]["weights"]
+        assert neg == [-x for x in pos]
+        # lite is uncalibrated (no labels to fit a temperature).
+        assert all(h["temperature"] == 1.0 for h in heads.values())
+
+    def test_decide_lite_and_head_cache_separately(self, tmp_path, fake_runtime, decide_encoder):
+        lite = strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ScriptedLLM([VALID_DECIDE]),
+                            state=tmp_path, sample_size=28, execute=False, mode="lite")
+        head = strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG,
+                            llm=ScriptedLLM([VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)]),
+                            state=tmp_path, sample_size=28, execute=False, mode="head")
+        assert lite.cache_key != head.cache_key
+        assert lite.artifact_path != head.artifact_path
+
+    def test_decide_rejects_unknown_mode(self, tmp_path, fake_runtime, decide_encoder):
+        with pytest.raises(strot.RouterConfigurationError):
+            strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(),
+                        state=tmp_path, execute=False, mode="deep")
+
     def test_decide_designs_schema_from_a_bare_intent(self, tmp_path, fake_runtime, decide_encoder):
         # AI-first quick path: a plain-language intent (not JSON) makes decide()
         # design the schema first, then compile. The chosen config surfaces on

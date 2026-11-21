@@ -674,6 +674,7 @@ def decide(
     golden: Optional[List[Mapping[str, Any]]] = None,
     confidence_threshold: Optional[float] = None,
     name: Optional[str] = None,
+    mode: str = "head",
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
@@ -743,6 +744,13 @@ def decide(
     filename slug (``battery_<slug>_<hash>.py``); when omitted the slug is
     auto-derived from the question names. Cosmetic only — not part of the cache
     key.
+
+    ``mode`` picks the tier. ``"head"`` (default) distills a calibrated logistic
+    head per question from teacher labels on your data. ``"lite"`` is the local
+    $0 zero-shot floor: each class becomes a prototype embedding of its
+    description, scored by cosine - no teacher pass, no training, instant, and it
+    brings no data. Use ``lite`` to try a decision immediately, ``head`` once you
+    want the accuracy of training on your records.
     """
     designed_from_intent = None
     if isinstance(questions, str):
@@ -766,10 +774,17 @@ def decide(
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
+    if mode not in ("lite", "head"):
+        raise RouterConfigurationError(
+            f"decide mode must be 'lite' or 'head' (got {mode!r})."
+        )
     canonical_config = json.dumps(questions, sort_keys=True)
     nlu = DEFAULT_NLU_MODEL  # STROT owns the base encoder; it is not a caller choice
+    # Fold the tier into the cache key so lite/head never collide. "head" keeps
+    # the bare "decide" key so existing head caches stay valid.
+    key_mode = "decide" if mode == "head" else f"decide-{mode}"
     key = cache_key(
-        canonical_config, None, nlu, schema, None, 0.0, mode="decide", golden=golden,
+        canonical_config, None, nlu, schema, None, 0.0, mode=key_mode, golden=golden,
     )
     # The canonical config is JSON, so auto-slug off the question names instead.
     slug = _battery_slug(name, " ".join(questions))
@@ -785,7 +800,7 @@ def decide(
         )
         try:
             asset = compiler.compile_decide(
-                sample=sample, questions=questions, golden=golden
+                sample=sample, questions=questions, golden=golden, mode=mode
             )
         except Exception as exc:
             _log_episode(state, {

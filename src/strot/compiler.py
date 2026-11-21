@@ -24,7 +24,7 @@ import re
 import types as _types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import templates
 from .exceptions import CompilationError, RouterConfigurationError
@@ -1947,21 +1947,79 @@ class StrotCompiler:
                     )
         return None
 
+    @staticmethod
+    def _l2norm(vec: Sequence[float]) -> List[float]:
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]
+
+    @staticmethod
+    def _lite_prototype_text(label: Any, description: Optional[str]) -> str:
+        """The text STROT embeds as a class's zero-shot prototype."""
+        if description:
+            return f"{label}: {description}"
+        return str(label)
+
+    def _lite_heads(self, questions: Mapping[str, Any]) -> Dict[str, Any]:
+        """Zero-shot ``lite`` heads: a prototype embedding per class, no training.
+
+        Each class becomes an L2-normalized prototype embedding of its
+        description; at runtime the record's embedding is scored against them
+        (the same linear ``weights @ x`` runtime as a trained head, so cosine
+        nearest-prototype). A predicate uses ``[-proto, +proto]`` so the two
+        logits are a sigmoid around the statement direction. No teacher labels,
+        no fold split - just the frozen encoder and the config's own text.
+        """
+        from . import distill as distill_mod
+
+        embedder = distill_mod.make_encoder_embedder(self._resolve_compile_checkpoint())
+        heads: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            if base == "predicate":
+                proto = self._l2norm(embedder([spec["instructions"]])[0])
+                weights = [[-x for x in proto], list(proto)]  # classes [False, True]
+                bias = [0.0, 0.0]
+            else:
+                pairs = (
+                    self._choice_pairs(spec) if base == "choice"
+                    else self._score_levels(spec)
+                )
+                texts = [self._lite_prototype_text(label, desc) for label, desc in pairs]
+                weights = [self._l2norm(v) for v in embedder(texts)]
+                bias = [0.0] * len(classes)
+            heads[name] = {
+                "type": base, "classes": classes,
+                "weights": weights, "bias": bias, "temperature": 1.0,
+            }
+        return heads
+
     def compile_decide(
         self,
         sample: Any,
         questions: Mapping[str, Any],
         golden: Optional[List[Mapping[str, Any]]] = None,
+        mode: str = "head",
     ) -> CompiledAsset:
-        """Decide mode: compile one distilled head per typed question.
+        """Decide mode: compile one decision head per typed question.
 
-        The synthesizer writes the state projection; the teacher LLM answers
-        every question for every sampled record; a logistic head per question is
-        trained on the frozen encoder's embeddings (the same head-first path as
-        routing) and baked in. There is no zero-shot router - the heads are the
-        model. With ``golden``, the baked model is run against known-answer
-        records and rejected if any expectation fails.
+        ``mode`` picks the tier:
+
+        * ``"lite"`` - zero-shot prototype heads: each class is an embedding of
+          its description, scored by cosine at runtime. No teacher labels, no
+          training; the synthesizer still writes the state projection. The local
+          $0 floor (instant, bring-no-data).
+        * ``"head"`` (default) - the teacher LLM answers every question for every
+          sampled record; a calibrated logistic head per question is trained on
+          the frozen encoder's embeddings and baked in.
+
+        With ``golden``, the baked model is run against known-answer records and
+        rejected if any expectation fails.
         """
+        if mode not in ("lite", "head"):
+            raise RouterConfigurationError(
+                f"decide mode must be 'lite' or 'head' (got {mode!r}); the "
+                "'deep' fine-tune tier is not yet wired for decide."
+            )
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
                 "decide mode requires a local encoder to embed records "
@@ -1974,7 +2032,7 @@ class StrotCompiler:
         records = list(sample)
         from . import distill as distill_mod
 
-        if len(records) < distill_mod.MIN_DISTILL_RECORDS:
+        if mode == "head" and len(records) < distill_mod.MIN_DISTILL_RECORDS:
             raise RouterConfigurationError(
                 f"decide needs at least {distill_mod.MIN_DISTILL_RECORDS} sample "
                 f"records to distill its heads (got {len(records)}); raise "
@@ -1997,6 +2055,16 @@ class StrotCompiler:
 
         _, attempts = self._synthesize_with(prompt, validate)
         code = promoted["code"]
+
+        if mode == "lite":
+            # Zero-shot tier: prototype heads from the config's own text, no
+            # teacher pass and no training. The projection above is still baked.
+            question_heads = self._lite_heads(questions)
+            return self._bake_decider(
+                question_heads, code, schema, questions, golden, attempts,
+                winner="lite",
+            )
+
         ns: Dict[str, Any] = {}
         exec(compile(code, "<decide-projection>", "exec"), ns)
         contexts = [ns["route_context"](dict(record)) for record in records]
@@ -2069,6 +2137,27 @@ class StrotCompiler:
             }
 
         # 5. Bake the distilled decision model.
+        return self._bake_decider(
+            question_heads, code, schema, questions, golden, attempts,
+            winner="distilled", n_records=len(records),
+        )
+
+    def _bake_decider(
+        self,
+        question_heads: Dict[str, Any],
+        code: str,
+        schema: DatasetSchema,
+        questions: Mapping[str, Any],
+        golden: Optional[List[Mapping[str, Any]]],
+        attempts: int,
+        winner: str,
+        n_records: Optional[int] = None,
+    ) -> CompiledAsset:
+        """Bake baked heads + projection into a self-contained decider asset.
+
+        Shared by the ``lite`` (prototype) and ``head`` (distilled) tiers - they
+        differ only in how ``question_heads`` was fitted; the runtime is one.
+        """
         header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
             schema_literal=repr(schema.to_dict()),
@@ -2083,7 +2172,7 @@ class StrotCompiler:
             error = self._test_golden_decider(source, golden, questions)
             if error:
                 raise CompilationError(
-                    "Distilled decision model does not satisfy the golden "
+                    "Decision model does not satisfy the golden "
                     f"records:\n{error}",
                     attempts=attempts, last_error=error,
                 )
@@ -2094,7 +2183,7 @@ class StrotCompiler:
             goal=json.dumps(questions, sort_keys=True),
             schema=schema,
             attempts=attempts,
-            model_search={"winner": "distilled", "n_records": len(records)},
+            model_search={"winner": winner, "n_records": n_records},
         )
 
     def _assemble(
