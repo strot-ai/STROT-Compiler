@@ -1202,7 +1202,7 @@ def decide_encoder(monkeypatch):
     monkeypatch.setattr(distill_mod, "make_encoder_embedder", lambda ckpt: _decide_embed)
 
 
-class TestProposeQuestions:
+class TestQuestions:
     def test_proposes_a_validated_typed_question_set(self, tmp_path):
         # Intake: one-line intent -> a typed question config, ready for decide().
         proposed = '''```python
@@ -1212,7 +1212,7 @@ QUESTIONS = {
              "choices": [{"value": "billing"}, {"value": "engineering"}]},
 }
 ```'''
-        questions = strot.propose_questions(
+        questions = strot.questions(
             SAMPLE, "triage support tickets", llm=ScriptedLLM([proposed])
         )
         assert set(questions) == {"is_bug", "team"}
@@ -1224,7 +1224,7 @@ QUESTIONS = {
         bad = '```python\nQUESTIONS = {"q": {"type": "bogus", "instructions": "x"}}\n```'
         good = ('```python\nQUESTIONS = {"ok": {"type": "predicate", '
                 '"instructions": "is it urgent?"}}\n```')
-        questions = strot.propose_questions(SAMPLE, "flag urgent", llm=ScriptedLLM([bad, good]))
+        questions = strot.questions(SAMPLE, "flag urgent", llm=ScriptedLLM([bad, good]))
         assert set(questions) == {"ok"}
 
 

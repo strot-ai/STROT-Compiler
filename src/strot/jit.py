@@ -527,21 +527,21 @@ def _apply_refusals(decision: Dict[str, Any], threshold: float) -> Dict[str, Any
     return decision
 
 
-def propose_questions(
+def questions(
     data: Any,
     intent: str,
     llm: LLMSpec = "openai/gpt-4o",
     sample_size: int = 25,
     max_retries: int = 3,
 ) -> Dict[str, Any]:
-    """Intake: propose a typed question set from a one-line decision intent.
+    """Intake: design a typed question set from a one-line decision intent.
 
     The LLM reads ``intent`` and the data schema and designs a small
     ``{name: {type, ...}}`` config (predicate / choice / score). It designs the
     decision schema only - it does not label, train, or invent data. Review and
     edit the result, then pass it to :func:`decide`::
 
-        questions = strot.propose_questions(tickets, "triage support tickets")
+        questions = strot.questions(tickets, "triage support tickets")
         # ...author reviews/edits questions...
         strot.decide(tickets, questions)
     """
