@@ -565,6 +565,133 @@ if __name__ == "__main__":
             print(json.dumps(decider.process(json.loads(line)), default=str))
 '''
 
+DECIDE_FINETUNED_RUNTIME_TEMPLATE = '''\
+# --- Runtime: shared top-N LoRA adapter + one head per question ---
+# ADAPTER / ADAPTER_CONFIG hold a cached-lower + top-N LoRA adapter trained
+# jointly over all questions at compile time (train fold); each head in
+# QUESTION_HEADS was then refit + calibrated on the adapted embedding.
+import torch.nn as _nn
+from huggingface_hub import snapshot_download
+
+
+class _PassthroughLayer(_nn.Module):
+    def __init__(self, attention_type: Any) -> None:
+        super().__init__()
+        self.attention_type = attention_type
+
+    def forward(self, hidden_states: Any, **kwargs: Any) -> Any:
+        return (hidden_states,)
+
+
+class _LoRALinear(_nn.Module):
+    def __init__(self, inner: Any, r: int, alpha: int) -> None:
+        super().__init__()
+        self.inner = inner
+        self.A = _nn.Parameter(torch.zeros(inner.in_features, r))
+        self.B = _nn.Parameter(torch.zeros(r, inner.out_features))
+        self.scaling = alpha / r
+
+    def forward(self, x: Any) -> Any:
+        return self.inner(x) + (x @ self.A @ self.B) * self.scaling
+
+
+def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
+                  bias: Sequence[float], temperature: float = 1.0) -> List[float]:
+    """softmax((W.x + b) / T) - temperature fitted at compile time per head."""
+    logits = [(sum(w * x for w, x in zip(row, vector)) + b) / temperature
+              for row, b in zip(weights, bias)]
+    peak = max(logits)
+    exps = [math.exp(z - peak) for z in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+class CompiledDecider:
+    """Shared LoRA-adapted encoder embedding + one head per question."""
+
+    def __init__(self) -> None:
+        config = ADAPTER_CONFIG
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        path = snapshot_download(config["base_model"])
+        self._tokenizer = AutoTokenizer.from_pretrained(path)
+        model = AutoModel.from_pretrained(path).to(self._device)
+        for p in model.parameters():
+            p.requires_grad = False
+        n_layers = int(config["n_layers"])
+        cut = int(config["cut"])
+        self._max_len = int(config["max_length"])
+
+        def _wrap(module: Any) -> None:
+            for name, child in list(module.named_children()):
+                if isinstance(child, _nn.Linear):
+                    setattr(module, name, _LoRALinear(
+                        child, int(config["lora_rank"]), int(config["lora_alpha"])))
+                else:
+                    _wrap(child)
+
+        # Serving runs the real frozen lower layers; only top-N carry the adapter.
+        for i in range(cut, n_layers):
+            _wrap(model.layers[i])
+        own = dict(model.named_parameters())
+        for name, value in ADAPTER.items():
+            if name in own:
+                own[name].data = torch.tensor(value, device=self._device)
+        model.eval()
+        self._model = model
+
+    def _embed(self, text: str) -> List[float]:
+        enc = self._tokenizer(
+            [text], padding="max_length", truncation=True,
+            max_length=self._max_len, return_tensors="pt",
+        )
+        ids = enc["input_ids"].to(self._device)
+        mask = enc["attention_mask"].to(self._device)
+        with torch.no_grad():
+            last = self._model(input_ids=ids, attention_mask=mask).last_hidden_state
+        m = mask.unsqueeze(-1).float()
+        return ((last * m).sum(1) / m.sum(1).clamp(min=1.0))[0].cpu().tolist()
+
+    def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        vector = self._embed(route_context(dict(record)))  # synthesized projection
+        output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
+        for name, head in QUESTION_HEADS.items():
+            probs = _head_softmax(vector, head["weights"], head["bias"],
+                                  head.get("temperature", 1.0))
+            classes = head["classes"]
+            if head["type"] == "predicate":
+                p_true = probs[classes.index(True)]
+                output["predicates"][name] = {{
+                    "type": "predicate", "probability": round(float(p_true), 4),
+                }}
+            elif head["type"] == "score":
+                idx = max(range(len(probs)), key=probs.__getitem__)
+                output["scores"][name] = {{
+                    "score": classes[idx],
+                    "probabilities": {{classes[i]: round(float(p), 4)
+                                       for i, p in enumerate(probs)}},
+                    "confidence": round(float(max(probs)), 4),
+                }}
+            else:
+                idx = max(range(len(probs)), key=probs.__getitem__)
+                output["choices"][name] = {{
+                    "choice": classes[idx],
+                    "probabilities": {{classes[i]: round(float(p), 4)
+                                       for i, p in enumerate(probs)}},
+                    "confidence": round(float(max(probs)), 4),
+                }}
+        return output
+
+
+if __name__ == "__main__":
+    import sys
+
+    decider = CompiledDecider()
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            print(json.dumps(decider.process(json.loads(line)), default=str))
+'''
+
 ASSET_FOOTER_TEMPLATE = '''\
 # --- Statically generated execution paths (STROT synthesizer output) ---
 {generated_paths}

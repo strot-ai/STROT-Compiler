@@ -131,6 +131,174 @@ def _import_torch():
         ) from exc
 
 
+@dataclass
+class DecideAdaptResult:
+    """A shared LoRA adapter plus the adapted embeddings it produces.
+
+    ``adapter`` is the trainable LoRA state (nested python floats, no head - the
+    decide heads are refit outside on ``vectors``). ``vectors`` is one adapted
+    pooled embedding per input record, in input order, ready for the same
+    per-question head-train + calibrate path the frozen tier uses. ``config``
+    carries what the runtime needs to rebuild the adapter forward.
+    """
+
+    adapter: Dict[str, Any]
+    vectors: List[List[float]]
+    config: Dict[str, Any] = field(default_factory=dict)
+
+
+def finetune_decide(
+    texts: Sequence[str],
+    question_labels: Dict[str, Sequence[int]],
+    question_classes: Dict[str, int],
+    train: Sequence[int],
+    config: Optional[FineTuneConfig] = None,
+) -> DecideAdaptResult:
+    """Train ONE shared cached-lower + top-N LoRA adapter for all questions.
+
+    The adapter is trained multi-task: a temporary head per question provides the
+    gradient (loss = sum of per-question cross-entropies on the ``train`` fold),
+    so the shared encoder adapts to the decision domain in a single pass. The
+    temporary heads are then discarded; the adapted pooled embedding for every
+    record is returned so the caller refits + calibrates the real decide heads on
+    the adapted representation (one forward pass per record at serving, N heads).
+    """
+    _import_torch()
+    import torch
+    import torch.nn as nn
+
+    cfg = config or FineTuneConfig()
+    if len(texts) < MIN_FINETUNE_RECORDS:
+        raise ValueError(
+            f"need >= {MIN_FINETUNE_RECORDS} records to fine-tune; got {len(texts)}"
+        )
+    from huggingface_hub import snapshot_download
+    from transformers import AutoModel, AutoTokenizer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    path = snapshot_download(cfg.base_model)
+    tok = AutoTokenizer.from_pretrained(path)
+    enc = tok(
+        list(texts), padding="max_length", truncation=True,
+        max_length=cfg.max_length, return_tensors="pt",
+    )
+    ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
+
+    base = AutoModel.from_pretrained(path).to(device).eval()
+    for p in base.parameters():
+        p.requires_grad = False
+    n_layers = len(base.layers)
+    cut = max(0, n_layers - cfg.top_layers)
+    dim = base.config.hidden_size
+
+    cache = torch.zeros(len(texts), cfg.max_length, dim, device=device)
+    with torch.no_grad():
+        for i in range(0, len(texts), 16):
+            out = base(input_ids=ids[i:i + 16], attention_mask=mask[i:i + 16],
+                       output_hidden_states=True)
+            cache[i:i + 16] = out.hidden_states[cut]
+    del base
+
+    class _Passthrough(nn.Module):
+        def __init__(self, attention_type):
+            super().__init__()
+            self.attention_type = attention_type
+
+        def forward(self, hidden_states, **kwargs):
+            return (hidden_states,)
+
+    class _LoRALinear(nn.Module):
+        def __init__(self, inner, r, alpha):
+            super().__init__()
+            self.inner = inner
+            for p in self.inner.parameters():
+                p.requires_grad = False
+            self.A = nn.Parameter(torch.empty(inner.in_features, r))
+            self.B = nn.Parameter(torch.zeros(r, inner.out_features))
+            nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+            self.scaling = alpha / r
+
+        def forward(self, x):
+            return self.inner(x) + (x @ self.A @ self.B) * self.scaling
+
+    def _wrap(module):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear):
+                setattr(module, name, _LoRALinear(child, cfg.lora_rank, cfg.lora_alpha))
+            else:
+                _wrap(child)
+
+    torch.manual_seed(cfg.seed)
+    model = AutoModel.from_pretrained(path).to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    for i in range(cut):
+        model.layers[i] = _Passthrough(model.layers[i].attention_type)
+    for i in range(cut, n_layers):
+        _wrap(model.layers[i])
+    names = list(question_classes)
+    heads = nn.ModuleDict(
+        {name: nn.Linear(dim, question_classes[name]).to(device) for name in names}
+    )
+    ys = {name: torch.tensor(list(question_labels[name]), device=device) for name in names}
+    inject: Dict[str, Any] = {"buf": None}
+
+    def _hook(_module, args, kwargs):
+        return ((inject["buf"],) + tuple(args[1:]), kwargs)
+
+    handle = model.layers[cut].register_forward_pre_hook(_hook, with_kwargs=True)
+
+    def _pooled(idx):
+        inject["buf"] = cache[idx]
+        last = model(input_ids=ids[idx], attention_mask=mask[idx]).last_hidden_state
+        m = mask[idx].unsqueeze(-1).float()
+        return (last * m).sum(1) / m.sum(1).clamp(min=1.0)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    for head in heads.values():
+        trainable += list(head.parameters())
+    opt = torch.optim.Adam(trainable, lr=cfg.learning_rate)
+    loss_fn = nn.CrossEntropyLoss()
+    train_idx = torch.tensor(list(train), device=device)
+    model.train()
+    for head in heads.values():
+        head.train()
+    for ep in range(cfg.epochs):
+        order = torch.randperm(
+            len(train_idx), generator=torch.Generator().manual_seed(cfg.seed * 9 + ep)
+        )
+        for i in range(0, len(train_idx), 16):
+            batch = train_idx[order[i:i + 16]]
+            opt.zero_grad()
+            pooled = _pooled(batch)
+            loss = sum(loss_fn(heads[name](pooled), ys[name][batch]) for name in names)
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    vectors: List[List[float]] = []
+    with torch.no_grad():
+        for i in range(0, len(texts), 16):
+            batch = torch.arange(i, min(i + 16, len(texts)), device=device)
+            vectors.extend(_pooled(batch).cpu().tolist())
+    handle.remove()
+
+    adapter = {
+        name: p.detach().cpu().tolist()
+        for name, p in model.named_parameters() if p.requires_grad
+    }
+    return DecideAdaptResult(
+        adapter=adapter,
+        vectors=vectors,
+        config={
+            "base_model": cfg.base_model, "top_layers": cfg.top_layers,
+            "cut": cut, "n_layers": n_layers, "lora_rank": cfg.lora_rank,
+            "lora_alpha": cfg.lora_alpha, "max_length": cfg.max_length,
+            "device": device,
+        },
+    )
+
+
 def finetune_adapter(
     texts: Sequence[str],
     labels: Sequence[int],

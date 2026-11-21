@@ -1312,7 +1312,44 @@ class TestDecide:
     def test_decide_rejects_unknown_mode(self, tmp_path, fake_runtime, decide_encoder):
         with pytest.raises(strot.RouterConfigurationError):
             strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(),
-                        state=tmp_path, execute=False, mode="deep")
+                        state=tmp_path, execute=False, mode="turbo")
+
+    def test_decide_deep_bakes_a_shared_adapter_runtime(
+        self, tmp_path, fake_runtime, decide_encoder, monkeypatch
+    ):
+        # deep = one shared LoRA adapter + refit heads. Fine-tuning needs torch,
+        # so stub the trainer with a fake adapter + separable adapted vectors and
+        # verify the wiring: the baked model carries ADAPTER/ADAPTER_CONFIG and the
+        # LoRA-adapted decider runtime, with one head per question.
+        import strot.finetune as ft
+
+        def _fake_finetune_decide(contexts, q_labels, q_classes, train):
+            return ft.DecideAdaptResult(
+                adapter={"model.layers.21.attn.Wo.A": [[0.0], [0.0], [0.0]]},
+                vectors=_decide_embed(contexts),
+                config={"base_model": "answerdotai/ModernBERT-base", "cut": 18,
+                        "n_layers": 22, "lora_rank": 16, "lora_alpha": 32,
+                        "max_length": 128, "device": "cpu"},
+            )
+
+        monkeypatch.setattr(ft, "finetune_decide", _fake_finetune_decide)
+        monkeypatch.setattr(ft, "MIN_FINETUNE_RECORDS", 1)
+
+        llm = ScriptedLLM([VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+        result = strot.decide(
+            DECIDE_SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path,
+            sample_size=28, execute=False, mode="deep",
+        )
+        source = result.artifact_path.read_text()
+        assert "ADAPTER_CONFIG" in source and "_LoRALinear" in source
+        assert "class CompiledDecider" in source
+        assert set(_baked_heads(source)) == {"is_bug", "sentiment", "team"}
+
+    def test_decide_deep_needs_enough_records(self, tmp_path, fake_runtime, decide_encoder):
+        # The real floor (MIN_FINETUNE_RECORDS) guards deep before any training.
+        with pytest.raises(strot.RouterConfigurationError):
+            strot.decide(DECIDE_SAMPLE[:10], DECIDE_CONFIG, llm=ExplodingLLM(),
+                        state=tmp_path, sample_size=10, execute=False, mode="deep")
 
     def test_decide_designs_schema_from_a_bare_intent(self, tmp_path, fake_runtime, decide_encoder):
         # AI-first quick path: a plain-language intent (not JSON) makes decide()

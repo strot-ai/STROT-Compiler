@@ -2015,10 +2015,9 @@ class StrotCompiler:
         With ``golden``, the baked model is run against known-answer records and
         rejected if any expectation fails.
         """
-        if mode not in ("lite", "head"):
+        if mode not in ("lite", "head", "deep"):
             raise RouterConfigurationError(
-                f"decide mode must be 'lite' or 'head' (got {mode!r}); the "
-                "'deep' fine-tune tier is not yet wired for decide."
+                f"decide mode must be 'lite', 'head', or 'deep' (got {mode!r})."
             )
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
@@ -2038,6 +2037,16 @@ class StrotCompiler:
                 f"records to distill its heads (got {len(records)}); raise "
                 "sample_size."
             )
+        if mode == "deep":
+            from . import finetune as finetune_mod
+
+            if len(records) < finetune_mod.MIN_FINETUNE_RECORDS:
+                raise RouterConfigurationError(
+                    f"decide mode='deep' needs at least "
+                    f"{finetune_mod.MIN_FINETUNE_RECORDS} records to fine-tune the "
+                    f"shared adapter (got {len(records)}); raise sample_size or use "
+                    "mode='head'."
+                )
 
         # 1. Synthesize the state projection (route_context). The decide prompt
         # also expands criteria/rubrics; the heads learn from labels rather than
@@ -2098,18 +2107,41 @@ class StrotCompiler:
                     stacklevel=2,
                 )
 
-        # 3. Frozen-encoder embeddings - one per record, shared by every head.
-        vectors = distill_mod.make_encoder_embedder(
-            self._resolve_compile_checkpoint()
-        )(contexts)
         # Fold hygiene: each head trains on one fold; its temperature is fit on a
-        # disjoint fold so the baked confidence is honest, not overfit.
+        # disjoint fold so the baked confidence is honest, not overfit. (For deep,
+        # the shared adapter also trains on the train fold only.)
         from . import calibrate as calibrate_mod
 
         train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
             list(range(len(records)))
         )
         fit_ix = train_ix + measure_ix
+
+        # 3. Per-record embeddings shared by every head. head/lite use the frozen
+        # encoder; deep adapts a shared top-N LoRA to the domain first and refits
+        # the heads on the adapted embedding (one forward pass per record).
+        adapter: Optional[Dict[str, Any]] = None
+        adapter_config: Optional[Dict[str, Any]] = None
+        if mode == "deep":
+            from . import finetune as finetune_mod
+
+            q_labels: Dict[str, List[int]] = {}
+            q_classes: Dict[str, int] = {}
+            for name, spec in questions.items():
+                _, classes = self._question_runtime(spec)
+                q_labels[name] = [
+                    classes.index(answers[i][name]) for i in range(len(records))
+                ]
+                q_classes[name] = len(classes)
+            adapt = finetune_mod.finetune_decide(
+                contexts, q_labels, q_classes, train=train_ix,
+            )
+            vectors = adapt.vectors
+            adapter, adapter_config = adapt.adapter, adapt.config
+        else:
+            vectors = distill_mod.make_encoder_embedder(
+                self._resolve_compile_checkpoint()
+            )(contexts)
 
         # 4. One calibrated logistic head per question.
         question_heads: Dict[str, Any] = {}
@@ -2136,10 +2168,11 @@ class StrotCompiler:
                 "weights": head_w, "bias": head_b, "temperature": temperature,
             }
 
-        # 5. Bake the distilled decision model.
+        # 5. Bake the decision model.
         return self._bake_decider(
             question_heads, code, schema, questions, golden, attempts,
-            winner="distilled", n_records=len(records),
+            winner=("fine_tuned" if mode == "deep" else "distilled"),
+            n_records=len(records), adapter=adapter, adapter_config=adapter_config,
         )
 
     def _bake_decider(
@@ -2152,11 +2185,14 @@ class StrotCompiler:
         attempts: int,
         winner: str,
         n_records: Optional[int] = None,
+        adapter: Optional[Dict[str, Any]] = None,
+        adapter_config: Optional[Dict[str, Any]] = None,
     ) -> CompiledAsset:
         """Bake baked heads + projection into a self-contained decider asset.
 
-        Shared by the ``lite`` (prototype) and ``head`` (distilled) tiers - they
-        differ only in how ``question_heads`` was fitted; the runtime is one.
+        Shared by all tiers - they differ only in how ``question_heads`` was
+        fitted. ``lite``/``head`` embed with the frozen encoder; ``deep`` passes
+        an ``adapter`` and bakes the LoRA-adapted runtime instead.
         """
         header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
@@ -2164,10 +2200,14 @@ class StrotCompiler:
             config_literal=repr(dict(questions)),
         )
         heads_literal = "QUESTION_HEADS: Dict[str, Any] = " + repr(question_heads)
-        source = "\n\n".join(
-            [header, code, heads_literal,
-             templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format()]
-        ) + "\n"
+        parts = [header, code, heads_literal]
+        if adapter is not None:
+            parts.append("ADAPTER: Dict[str, Any] = " + repr(adapter))
+            parts.append("ADAPTER_CONFIG: Dict[str, Any] = " + repr(adapter_config))
+            parts.append(templates.DECIDE_FINETUNED_RUNTIME_TEMPLATE.format())
+        else:
+            parts.append(templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format())
+        source = "\n\n".join(parts) + "\n"
         if golden:
             error = self._test_golden_decider(source, golden, questions)
             if error:

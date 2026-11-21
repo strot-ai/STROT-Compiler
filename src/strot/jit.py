@@ -781,12 +781,13 @@ def decide(
     auto-derived from the question names. Cosmetic only — not part of the cache
     key.
 
-    ``mode`` picks the tier. ``"head"`` (default) distills a calibrated logistic
-    head per question from teacher labels on your data. ``"lite"`` is the local
-    $0 zero-shot floor: each class becomes a prototype embedding of its
-    description, scored by cosine - no teacher pass, no training, instant, and it
-    brings no data. Use ``lite`` to try a decision immediately, ``head`` once you
-    want the accuracy of training on your records.
+    ``mode`` picks the tier. ``"lite"`` is the local $0 zero-shot floor: each
+    class becomes a prototype embedding of its description, scored by cosine - no
+    teacher pass, no training, instant. ``"head"`` (default) distills a calibrated
+    logistic head per question from teacher labels on your data. ``"deep"`` adds a
+    shared top-N LoRA adapter trained over all questions (needs the ``[finetune]``
+    extra and more records), then refits + calibrates the heads on the adapted
+    embedding - the ceiling tier for when a frozen head is representation-bound.
 
     ``warm`` starts the model serving immediately with the ``lite`` tier (local,
     $0) and trains the ``head`` in a background thread, hot-swapping it in when
@@ -851,9 +852,9 @@ def decide(
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
-    if mode not in ("lite", "head"):
+    if mode not in ("lite", "head", "deep"):
         raise RouterConfigurationError(
-            f"decide mode must be 'lite' or 'head' (got {mode!r})."
+            f"decide mode must be 'lite', 'head', or 'deep' (got {mode!r})."
         )
     canonical_config = json.dumps(questions, sort_keys=True)
     nlu = DEFAULT_NLU_MODEL  # STROT owns the base encoder; it is not a caller choice
