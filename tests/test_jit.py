@@ -1309,6 +1309,23 @@ class TestDecide:
         heads = _baked_heads(result.model.artifact_path.read_text())
         assert set(heads) == {"is_bug", "sentiment", "team"}
 
+    def test_decide_recompile_is_history_independent(self, tmp_path, fake_runtime, decide_encoder):
+        # Invariant "recompile, don't increment": a model's weights are a pure
+        # function of its own (data, questions, mode) - a fresh fit from the
+        # frozen base, never a warm-start from prior weights. So an intervening
+        # compile of a DIFFERENT model cannot perturb a later recompile. If a
+        # warm-start path is ever added, this reproduction breaks.
+        def _heads(data, state):
+            llm = ScriptedLLM([VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+            r = strot.decide(data, DECIDE_CONFIG, llm=llm, state=state,
+                             sample_size=28, execute=False, mode="head")
+            return _baked_heads(r.artifact_path.read_text())
+
+        first = _heads(DECIDE_SAMPLE, tmp_path / "a1")
+        _heads(list(reversed(DECIDE_SAMPLE)), tmp_path / "b")  # different model trains in between
+        again = _heads(DECIDE_SAMPLE, tmp_path / "a2")          # fresh state -> a real recompile
+        assert first == again  # byte-identical: no carried-over training state
+
     def test_decide_rejects_unknown_mode(self, tmp_path, fake_runtime, decide_encoder):
         with pytest.raises(strot.RouterConfigurationError):
             strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(),

@@ -2011,6 +2011,18 @@ class StrotCompiler:
         * ``"head"`` (default) - the teacher LLM answers every question for every
           sampled record; a calibrated logistic head per question is trained on
           the frozen encoder's embeddings and baked in.
+        * ``"deep"`` - a shared top-N LoRA adapter is fine-tuned over all
+          questions, then the heads are refit on the adapted embedding.
+
+        Invariant - **recompile, don't increment**: every compile trains a FRESH
+        head (and, for ``deep``, a fresh adapter) from the frozen base on the
+        current data; it NEVER warm-starts from previously trained weights. A
+        compiled model's weights are a pure function of its own
+        ``(data, questions, mode)`` - independent of what was compiled before.
+        This is what keeps continuous optimization immune to catastrophic
+        forgetting: retraining on accumulated data is a clean re-fit, not a
+        sequential update that could erode earlier quality. Do not add a
+        warm-start-from-prior-weights path without revisiting that guarantee.
 
         With ``golden``, the baked model is run against known-answer records and
         rejected if any expectation fails.

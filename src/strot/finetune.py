@@ -162,6 +162,12 @@ def finetune_decide(
     temporary heads are then discarded; the adapted pooled embedding for every
     record is returned so the caller refits + calibrates the real decide heads on
     the adapted representation (one forward pass per record at serving, N heads).
+
+    The LoRA adapter is initialized fresh every call (A kaiming, B zeros) from
+    the frozen base - part of decide's recompile-don't-increment invariant (see
+    ``StrotCompiler.compile_decide``). Do not thread in a prior adapter to
+    continue training on new-data-only; recompile on the accumulated data so the
+    fit stays forgetting-free.
     """
     _import_torch()
     import torch

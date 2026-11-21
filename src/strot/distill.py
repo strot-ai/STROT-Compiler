@@ -124,6 +124,11 @@ def train_head(
 
     Returns (weights[n_classes][dim], bias[n_classes]). Deterministic given
     the seed. Small-data regime by design: hundreds of examples, seconds.
+
+    Fresh random init every call (seeded) - part of decide's recompile-don't-
+    increment invariant (see ``StrotCompiler.compile_decide``). Never add an
+    ``init_weights`` / warm-start parameter that continues from previously
+    trained weights; that would reintroduce catastrophic-forgetting risk.
     """
     if not embeddings or len(embeddings) != len(labels):
         raise ValueError("need equal, non-empty embeddings and labels")
