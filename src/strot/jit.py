@@ -67,6 +67,7 @@ class RunResult:
     pipeline: Any = None  #: live CompiledPipeline for streaming further records
     attempts: int = 0  #: synthesizer attempts (0 on a cache hit)
     mode: str = "decision"
+    questions: Optional[Dict[str, Any]] = None  #: the config decided on (handy when decide() designed it from a bare intent)
 
     def summary(self) -> Dict[str, Any]:
         if self.mode == "decide":
@@ -545,6 +546,21 @@ def questions(
         # ...author reviews/edits questions...
         strot.decide(tickets, questions)
     """
+    return _design_questions(data, intent, llm, sample_size, max_retries)
+
+
+def _design_questions(
+    data: Any,
+    intent: str,
+    llm: LLMSpec,
+    sample_size: int,
+    max_retries: int,
+) -> Dict[str, Any]:
+    """Shared schema-design step: LLM proposes a typed question set from an intent.
+
+    Used both by the public :func:`questions` intake and by :func:`decide` when
+    it is handed a bare intent instead of a config.
+    """
     sample = as_records(data)[:sample_size]
     compiler = StrotCompiler(
         nlu_model=DEFAULT_NLU_MODEL,
@@ -568,8 +584,18 @@ def decide(
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
-    ``questions`` is a typed-question config (a dict or JSON string; a full config
-    object with a top-level ``"questions"`` key is also accepted)::
+    ``questions`` is either a **typed-question config** or a **bare intent**:
+
+    * A config - a dict or JSON string; a full config object with a top-level
+      ``"questions"`` key is also accepted. This is the reproducible path: you
+      hold the schema, review it, and version-control it.
+    * A plain-language **intent** string (anything that is not JSON) - the LLM
+      designs the schema for you first, then compiles. This is the AI-first
+      quick path: ``strot.decide(data, "triage support tickets")``. The schema
+      it chose is returned on ``result.questions`` so you can inspect it; once
+      you like it, pin it via :func:`questions` for a reproducible build.
+
+    A config looks like::
 
         {
           "is_bug_report": {"type": "predicate", "instructions": "..."},
@@ -625,8 +651,19 @@ def decide(
     auto-derived from the question names. Cosmetic only — not part of the cache
     key.
     """
+    designed_from_intent = None
     if isinstance(questions, str):
-        questions = json.loads(questions)
+        try:
+            parsed = json.loads(questions)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, Mapping):
+            questions = parsed  # a JSON config string
+        else:
+            # Bare intent prose: let the LLM design the schema (AI-first quick path).
+            # Reproducible production use should pin the result via strot.questions().
+            designed_from_intent = questions
+            questions = _design_questions(data, questions, llm, sample_size, max_retries)
     if isinstance(questions, Mapping) and isinstance(questions.get("questions"), Mapping):
         questions = questions["questions"]  # accept a full config object with a questions key
     StrotCompiler.validate_questions_config(questions)
@@ -667,7 +704,7 @@ def decide(
         _log_episode(state, {
             "kind": "decide", "status": "promoted", "cache_key": key,
             "questions": list(questions), "golden_count": len(golden or []),
-            "attempts": asset.attempts,
+            "attempts": asset.attempts, "designed_from_intent": designed_from_intent,
         })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -697,6 +734,7 @@ def decide(
         cache_key=key,
         attempts=attempts,
         mode="decide",
+        questions=dict(questions),
     )
     if not execute:
         return result

@@ -1254,6 +1254,31 @@ class TestDecide:
                             state=tmp_path, sample_size=28, execute=False)
         assert warm.cache_hit is True
 
+    def test_decide_designs_schema_from_a_bare_intent(self, tmp_path, fake_runtime, decide_encoder):
+        # AI-first quick path: a plain-language intent (not JSON) makes decide()
+        # design the schema first, then compile. The chosen config surfaces on
+        # result.questions so the author can inspect/pin it.
+        designed = '''```python
+QUESTIONS = {
+    "is_bug": {"type": "predicate", "instructions": "Does this mention crashes or errors?"},
+    "sentiment": {"type": "score", "instructions": "angry is a complaint, happy is praise.",
+                  "levels": [{"label": "angry", "description": "angry complaint"},
+                             {"label": "neutral", "description": "neutral request"},
+                             {"label": "happy", "description": "happy praise"}]},
+    "team": {"type": "choice", "choices": [
+        {"value": "billing", "description": "charges, invoices, payments"},
+        {"value": "engineering", "description": "crashes, bugs, defects"}]},
+}
+```'''
+        llm = ScriptedLLM([designed, VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+        result = strot.decide(
+            DECIDE_SAMPLE, "triage support tickets", llm=llm, state=tmp_path,
+            sample_size=28, execute=False,
+        )
+        assert result.mode == "decide"
+        assert set(result.questions) == {"is_bug", "sentiment", "team"}
+        assert set(_baked_heads(result.artifact_path.read_text())) == {"is_bug", "sentiment", "team"}
+
     def test_decide_warns_on_thin_class_coverage(self, tmp_path, fake_runtime, decide_encoder):
         # A head can't learn an outcome it never sees: if the teacher labels every
         # record "billing", the "engineering" class is empty and compile warns.
