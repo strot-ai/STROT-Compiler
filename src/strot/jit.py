@@ -55,9 +55,82 @@ _ARTIFACT_LOCK = RLock()
 _SLUG_MAX_LEN = 24
 
 
+class DecisionModel:
+    """A compiled, self-contained decision model.
+
+    Returned by :func:`decide` and reloaded by :func:`load_model`. It is
+    callable - ``model(record)`` returns the typed decision for one record -
+    and saveable - ``model.save("name")`` writes the whole model to one
+    ``.strot`` file (heads baked in; the encoder downloads by id at runtime)::
+
+        model = strot.decide(tickets, "triage support tickets")
+        model(tickets[0])            # -> {"predicates": {...}, "choices": {...}, ...}
+        model.save("ticket-triage")  # -> Path("ticket-triage.strot")
+        same = strot.load_model("ticket-triage")
+    """
+
+    def __init__(
+        self,
+        artifact_path: Union[str, Path],
+        key: str,
+        questions: Optional[Dict[str, Any]] = None,
+        confidence_threshold: Optional[float] = None,
+        pipeline: Any = None,
+    ) -> None:
+        self.artifact_path = Path(artifact_path)
+        self.questions = questions  #: the typed question config this model answers
+        self.confidence_threshold = confidence_threshold
+        self._key = key
+        self._pipeline = pipeline
+
+    def _ensure_pipeline(self) -> Any:
+        if self._pipeline is None:
+            module = _load_artifact(self.artifact_path, self._key)
+            self._pipeline = module.CompiledDecider()
+        return self._pipeline
+
+    def __call__(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        """Decide one record: returns typed decision JSON (locally, on CPU)."""
+        decision = self._ensure_pipeline().process(record)
+        if self.confidence_threshold is not None:
+            decision = _apply_refusals(decision, self.confidence_threshold)
+        return decision
+
+    def save(self, path: Union[str, Path]) -> Path:
+        """Write the self-contained model to ``path`` (``.strot`` if no suffix)."""
+        dest = Path(path)
+        if dest.suffix == "":
+            dest = dest.with_suffix(".strot")
+        if dest.parent != Path("."):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.artifact_path.read_bytes())
+        return dest
+
+
+def load_model(path: Union[str, Path]) -> DecisionModel:
+    """Load a decision model saved by :meth:`DecisionModel.save`.
+
+    ``path`` is the ``.strot`` file (the suffix is optional). The returned model
+    is callable on a record and re-saveable. Running it needs ``strot-ai[local]``
+    (torch/transformers) to load the encoder.
+    """
+    p = Path(path)
+    if p.suffix == "" and not p.exists():
+        p = p.with_suffix(".strot")
+    if not p.exists():
+        raise FileNotFoundError(f"No decision model at {str(p)!r}.")
+    key = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+    return DecisionModel(artifact_path=p, key=key)
+
+
 @dataclass
 class RunResult:
-    """Outcome of one :func:`run` call over a dataset."""
+    """Outcome of one :func:`run` call over a dataset.
+
+    For a :func:`decide` outcome this is also the decision model: it is callable
+    (``result(record)``) and saveable (``result.save("name")``), delegating to a
+    :class:`DecisionModel` over the same compiled artifact.
+    """
 
     outcomes: List[Dict[str, Any]]
     fallbacks: List[Dict[str, Any]]
@@ -68,6 +141,26 @@ class RunResult:
     attempts: int = 0  #: synthesizer attempts (0 on a cache hit)
     mode: str = "decision"
     questions: Optional[Dict[str, Any]] = None  #: the config decided on (handy when decide() designed it from a bare intent)
+    confidence_threshold: Optional[float] = None  #: refusal policy carried onto the callable model
+    _model: Any = field(default=None, compare=False, repr=False)
+
+    @property
+    def model(self) -> DecisionModel:
+        """The compiled artifact as a reusable, saveable :class:`DecisionModel`."""
+        if self._model is None:
+            self._model = DecisionModel(
+                self.artifact_path, self.cache_key, self.questions,
+                self.confidence_threshold, pipeline=self.pipeline,
+            )
+        return self._model
+
+    def __call__(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        """Decide one further record against the compiled model."""
+        return self.model(record)
+
+    def save(self, path: Union[str, Path]) -> Path:
+        """Write the compiled model to one ``.strot`` file; returns the path."""
+        return self.model.save(path)
 
     def summary(self) -> Dict[str, Any]:
         if self.mode == "decide":
@@ -735,6 +828,7 @@ def decide(
         attempts=attempts,
         mode="decide",
         questions=dict(questions),
+        confidence_threshold=confidence_threshold,
     )
     if not execute:
         return result

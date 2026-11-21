@@ -1279,6 +1279,43 @@ QUESTIONS = {
         assert set(result.questions) == {"is_bug", "sentiment", "team"}
         assert set(_baked_heads(result.artifact_path.read_text())) == {"is_bug", "sentiment", "team"}
 
+    def test_decide_result_is_a_callable_saveable_model(self, tmp_path, fake_runtime, decide_encoder):
+        # The decide() result is the model: callable + saveable to one .strot file,
+        # reloadable with load_model. (Inference itself needs a real encoder, so
+        # here we verify the save/load plumbing, not the baked head's output.)
+        llm = ScriptedLLM([VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+        result = strot.decide(
+            DECIDE_SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path,
+            sample_size=28, execute=False,
+        )
+        assert callable(result) and callable(result.model)
+
+        dest = result.save(tmp_path / "ticket-triage")
+        assert dest == tmp_path / "ticket-triage.strot"
+        assert dest.read_bytes() == result.artifact_path.read_bytes()  # self-contained copy
+
+        reloaded = strot.load_model(tmp_path / "ticket-triage")  # suffix optional
+        assert isinstance(reloaded, strot.DecisionModel)
+        assert reloaded.artifact_path == dest
+
+    def test_decision_model_call_delegates_and_applies_refusals(self, tmp_path):
+        # __call__ runs the pipeline and applies the carried refusal threshold.
+        class FakePipeline:
+            def process(self, record):
+                return {"choices": {"team": {"choice": "billing", "confidence": 0.4}}}
+
+        raw = strot.DecisionModel(tmp_path / "m.strot", key="k", pipeline=FakePipeline())
+        assert raw({"x": 1})["choices"]["team"]["choice"] == "billing"
+
+        guarded = strot.DecisionModel(
+            tmp_path / "m.strot", key="k", confidence_threshold=0.7, pipeline=FakePipeline()
+        )
+        assert guarded({"x": 1})["choices"]["team"] == {"refusal": True}
+
+    def test_load_model_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            strot.load_model(tmp_path / "nope")
+
     def test_decide_warns_on_thin_class_coverage(self, tmp_path, fake_runtime, decide_encoder):
         # A head can't learn an outcome it never sees: if the teacher labels every
         # record "billing", the "engineering" class is empty and compile warns.
