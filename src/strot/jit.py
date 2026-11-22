@@ -60,13 +60,13 @@ class DecisionModel:
     """A compiled, self-contained decision model.
 
     Returned by :func:`decide` and reloaded by :func:`load_model`. It is
-    callable - ``model(record)`` returns the typed decision for one record -
-    and saveable - ``model.save("name")`` writes the whole model to one
+    callable - ``model(record)`` returns the typed decision for one record - and
+    dispatchable - ``model.dispatch("name")`` puts it into service as one
     ``.strot`` file (heads baked in; the encoder downloads by id at runtime)::
 
         model = strot.decide(tickets, "triage support tickets")
-        model(tickets[0])            # -> {"predicates": {...}, "choices": {...}, ...}
-        model.save("ticket-triage")  # -> Path("ticket-triage.strot")
+        model(tickets[0])                # -> {"predicates": {...}, "choices": {...}, ...}
+        model.dispatch("ticket-triage")  # -> Path("ticket-triage.strot")
         same = strot.load_model("ticket-triage")
     """
 
@@ -87,6 +87,8 @@ class DecisionModel:
         self._pipeline = pipeline
         self._lock = RLock()
         self._thread: Optional[Thread] = None  #: warm-start background upgrade
+        self._trace_path: Optional[Path] = None
+        self._trace_record = False
 
     def _ensure_pipeline(self) -> Any:
         if self._pipeline is None:
@@ -94,13 +96,46 @@ class DecisionModel:
             self._pipeline = module.CompiledDecider()
         return self._pipeline
 
+    def trace(self, path: Union[str, Path], include_record: bool = False) -> "DecisionModel":
+        """Log every decision to a JSONL file (the teacher's eyes); returns self.
+
+        Each call appends ``{ts, answers: {q: {value, confidence, refused}}}``.
+        ``include_record=True`` also logs the input record - off by default
+        (privacy). Read it back with :func:`strot.read_traces` /
+        :func:`strot.summarize_traces`.
+        """
+        self._trace_path = Path(path)
+        self._trace_record = include_record
+        return self
+
     def __call__(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         """Decide one record: returns typed decision JSON (locally, on CPU)."""
         with self._lock:
             decision = self._ensure_pipeline().process(record)
         if self.confidence_threshold is not None:
             decision = _apply_refusals(decision, self.confidence_threshold)
+        if self._trace_path is not None:
+            self._log_trace(record, decision)
         return decision
+
+    def _log_trace(self, record: Mapping[str, Any], decision: Dict[str, Any]) -> None:
+        # Best-effort; a trace write never breaks a decision.
+        try:
+            from datetime import datetime, timezone
+
+            from .trace import summarize_decision
+
+            entry: Dict[str, Any] = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "answers": summarize_decision(decision),
+            }
+            if self._trace_record:
+                entry["record"] = dict(record)
+            self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._trace_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        except OSError:
+            pass
 
     def _swap_to(
         self, artifact_path: Union[str, Path], key: str,
@@ -122,8 +157,10 @@ class DecisionModel:
             thread.join(timeout)
         return self
 
-    def save(self, path: Union[str, Path]) -> Path:
-        """Write the self-contained model to ``path`` (``.strot`` if no suffix)."""
+    def dispatch(self, path: Union[str, Path]) -> Path:
+        """Put the model into service: write the self-contained model to ``path``
+        (``.strot`` if no suffix) - the one file you ship and reload with
+        :func:`strot.load_model`."""
         dest = Path(path)
         if dest.suffix == "":
             dest = dest.with_suffix(".strot")
@@ -132,9 +169,12 @@ class DecisionModel:
         dest.write_bytes(self.artifact_path.read_bytes())
         return dest
 
+    #: Back-compat alias for :meth:`dispatch`.
+    save = dispatch
+
 
 def load_model(path: Union[str, Path]) -> DecisionModel:
-    """Load a decision model saved by :meth:`DecisionModel.save`.
+    """Load a decision model saved by :meth:`DecisionModel.dispatch`.
 
     ``path`` is the ``.strot`` file (the suffix is optional). The returned model
     is callable on a record and re-saveable. Running it needs ``strot-ai[local]``
@@ -154,7 +194,7 @@ class RunResult:
     """Outcome of one :func:`run` call over a dataset.
 
     For a :func:`decide` outcome this is also the decision model: it is callable
-    (``result(record)``) and saveable (``result.save("name")``), delegating to a
+    (``result(record)``) and dispatchable (``result.dispatch("name")``), delegating to a
     :class:`DecisionModel` over the same compiled artifact.
     """
 
@@ -184,9 +224,12 @@ class RunResult:
         """Decide one further record against the compiled model."""
         return self.model(record)
 
-    def save(self, path: Union[str, Path]) -> Path:
-        """Write the compiled model to one ``.strot`` file; returns the path."""
-        return self.model.save(path)
+    def dispatch(self, path: Union[str, Path]) -> Path:
+        """Put the compiled model into service: one self-contained ``.strot`` file."""
+        return self.model.dispatch(path)
+
+    #: Back-compat alias for :meth:`dispatch`.
+    save = dispatch
 
     @property
     def tier(self) -> str:

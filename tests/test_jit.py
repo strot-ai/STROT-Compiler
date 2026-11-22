@@ -476,7 +476,7 @@ QUESTIONS = {
         )
         assert callable(result) and callable(result.model)
 
-        dest = result.save(tmp_path / "ticket-triage")
+        dest = result.dispatch(tmp_path / "ticket-triage")
         assert dest == tmp_path / "ticket-triage.strot"
         assert dest.read_bytes() == result.artifact_path.read_bytes()  # self-contained copy
 

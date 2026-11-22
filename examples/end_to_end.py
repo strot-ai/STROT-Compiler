@@ -40,7 +40,7 @@ def main() -> None:
     print("\nDecision for ticket 101:\n", json.dumps(model(SUPPORT_TICKETS[0]), indent=2, default=str))
 
     # 4. Ship one self-contained model file; reload with strot.load_model(...).
-    path = model.save("ticket-triage")
+    path = model.dispatch("ticket-triage")
     print("\nSaved model:", path)
 
 

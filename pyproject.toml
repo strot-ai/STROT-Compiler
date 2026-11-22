@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "1.0.0"
+version = "1.1.0"
 description = "STROT: a decision compiler. Distill an LLM teacher into a specialized decision model that runs locally on CPU."
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
@@ -31,6 +31,9 @@ openai = { version = ">=1.30", optional = true }
 anthropic = { version = ">=0.80", optional = true }
 gliner = { version = ">=0.2", optional = true }
 sentencepiece = { version = ">=0.2", optional = true }
+# [mcp] = expose the compiler as MCP tools (python -m strot.mcp). The server
+# wraps strot's own functions; the SDK is optional so the core install stays tiny.
+mcp = { version = ">=2.0", optional = true }
 
 [tool.poetry.extras]
 local = ["transformers", "torch", "safetensors", "huggingface-hub"]
@@ -42,7 +45,8 @@ finetune = ["transformers", "torch", "safetensors", "huggingface-hub"]
 pii = ["gliner", "transformers", "torch", "sentencepiece"]
 openai = ["openai"]
 anthropic = ["anthropic"]
-all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic", "gliner", "sentencepiece"]
+mcp = ["mcp"]
+all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic", "gliner", "sentencepiece", "mcp"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"

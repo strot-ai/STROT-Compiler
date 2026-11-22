@@ -8,7 +8,7 @@ self-contained model that runs locally on CPU and emits typed decision JSON.
     questions = strot.questions(data, "triage support tickets")  # design the schema
     model = strot.decide(data, questions)                        # compile a model
     model(record)                                                # decide, locally
-    model.save("triage"); strot.load_model("triage")             # ship + reuse
+    model.dispatch("triage"); strot.load_model("triage")             # ship + reuse
 """
 
 from .compiler import (
@@ -29,14 +29,25 @@ from .exceptions import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
+from .evaluate import evaluate, score_decisions  # noqa: E402
+from .trace import cluster_rejections, drift_check, read_traces, summarize_traces  # noqa: E402
+from .inspect import inspect_data, pii_scan  # noqa: E402
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
     "decide",
     "questions",
+    "evaluate",
+    "score_decisions",
+    "read_traces",
+    "summarize_traces",
+    "cluster_rejections",
+    "drift_check",
+    "inspect_data",
+    "pii_scan",
     "load_model",
     "DecisionModel",
     "RunResult",
