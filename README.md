@@ -144,7 +144,21 @@ Tools cover the whole lifecycle — `inspect_data`, `pii_scan`, `design_question
 `compile_start`/`compile_status`, `decide`, `evaluate_model`, `read_traces`,
 `drift_check`, `cluster_rejections`, `recompile`, `set_status` (circuit breaker) —
 and a `strot_compiler` prompt (the playbook) teaches the agent how to use them.
-Point your MCP client at `python -m strot.mcp`.
+
+Point any MCP client at `python -m strot.mcp`. For Claude Desktop, add to
+`claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "strot": {
+      "command": "python",
+      "args": ["-m", "strot.mcp"],
+      "env": { "OPENAI_API_KEY": "sk-..." }
+    }
+  }
+}
+```
 
 Bake the encoder into your image for offline production:
 
@@ -153,6 +167,13 @@ RUN pip install "strot-ai[local]" \
  && python -c "import strot; strot.prefetch_nlu(local_dir='/opt/encoder')"
 ENV STROT_NLU_CHECKPOINT=/opt/encoder
 ```
+
+## Docs
+
+[DEVELOPERS.md](DEVELOPERS.md) covers the architecture — the compile path, the
+`lite`/`head`/`deep` tiers, calibration & the drift gate, the lifecycle
+primitives (`evaluate`, traces, `drift_check`, `cluster_rejections`), and the MCP
+agent surface.
 
 ## Contributing & contact
 
