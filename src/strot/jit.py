@@ -387,9 +387,8 @@ def _load_artifact(path: Path, key: str) -> Any:
         except Exception as exc:
             sys.modules.pop(module_name, None)
             raise RouterConfigurationError(
-                f"Compiled battery {path} failed to load: {exc}. The local runtime "
-                "needs strot-ai[local] (torch/transformers); the hosted runtime "
-                "needs strot-ai[hosted] (openai)."
+                f"Compiled model {path} failed to load: {exc}. Serving a decision "
+                "model needs strot-ai[local] (torch/transformers)."
             ) from exc
         module.__strot_source_stamp__ = stamp
         return module

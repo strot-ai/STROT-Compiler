@@ -43,8 +43,8 @@ def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMCli
         from openai import OpenAI
     except ImportError as exc:
         raise RouterConfigurationError(
-            "openai_llm_client requires the 'hosted' extra: "
-            "pip install strot-ai[hosted]"
+            "openai_llm_client requires the 'openai' extra: "
+            "pip install strot-ai[openai]"
         ) from exc
     client = OpenAI()
 
