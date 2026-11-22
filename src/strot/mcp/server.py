@@ -58,6 +58,22 @@ def decide(model_path: str, record: Dict[str, Any]) -> Dict[str, Any]:
     return tools.decide_record(model_path, record)
 
 
+@server.tool()
+def evaluate_model(
+    model_path: str, labeled: List[Dict[str, Any]], confidence_threshold: Optional[float] = None
+) -> Dict[str, Any]:
+    """Run a compiled model over labeled records -> accuracy/coverage/ECE. Needs [local]."""
+    return tools.evaluate_model(model_path, labeled, confidence_threshold=confidence_threshold)
+
+
+@server.tool()
+def score(
+    decisions: List[Dict[str, Any]], expected: List[Dict[str, Any]], confidence_threshold: Optional[float] = None
+) -> Dict[str, Any]:
+    """Score already-produced decisions against expected answers (torch-free)."""
+    return tools.score(decisions, expected, confidence_threshold=confidence_threshold)
+
+
 def main() -> None:
     server.run()
 

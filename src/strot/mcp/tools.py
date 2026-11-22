@@ -128,3 +128,29 @@ def decide_record(model_path: str, record: Dict[str, Any]) -> Dict[str, Any]:
     import strot
 
     return strot.load_model(model_path)(record)
+
+
+def evaluate_model(
+    model_path: str,
+    labeled: List[Dict[str, Any]],
+    confidence_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Run a compiled model over labeled records and score it (needs ``[local]``).
+
+    ``labeled`` is ``[{"record": {...}, "expect": {question: value}}, ...]``.
+    Returns accuracy / coverage / calibration (ECE) per question + overall.
+    """
+    import strot
+
+    return strot.evaluate(model_path, labeled, confidence_threshold=confidence_threshold)
+
+
+def score(
+    decisions: List[Dict[str, Any]],
+    expected: List[Dict[str, Any]],
+    confidence_threshold: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Score *already-produced* decisions against expected answers (torch-free)."""
+    import strot
+
+    return strot.score_decisions(decisions, expected, confidence_threshold=confidence_threshold)

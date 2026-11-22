@@ -32,11 +32,14 @@ from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_sche
 __version__ = "1.0.0"
 
 from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
+from .evaluate import evaluate, score_decisions  # noqa: E402
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
     "decide",
     "questions",
+    "evaluate",
+    "score_decisions",
     "load_model",
     "DecisionModel",
     "RunResult",
