@@ -1,303 +1,150 @@
 # STROT
 
-### The open decision system
+### A decision compiler
 
-**Compile System 2 reasoning into System 1 decisions — $0 at inference.**
-
-**LOW LATENCY · ULTRAFAST · CHEAP & FREE · 0 TOKENS · LOW CARBON · CPU INFERENCE ONLY**
+**Compile System-2 reasoning into System-1 decisions — $0 at inference.**
 
 [![PyPI](https://img.shields.io/pypi/v/strot-ai?color=7c3aed&label=pip%20install%20strot-ai)](https://pypi.org/project/strot-ai/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
-[![Live demo](https://img.shields.io/badge/%F0%9F%A4%97-live%20demo-ffce00)](https://huggingface.co/spaces/STROT-ai/STROT-AI-Compiler)
 
-**▶ [Try the live demo](https://huggingface.co/spaces/STROT-ai/STROT-AI-Compiler)** — decisions in your browser, no install, key-free.
+An LLM reasons through your task once, at compile time. STROT distills that
+judgment into a **specialized decision model** — a calibrated head on a frozen
+encoder, trained on *your* real data — that then makes every decision **locally,
+on CPU, at $0**: no API calls, no GPU, no per-record cost.
 
-An LLM reasons through your task once, at compile time. Every decision after runs
-on a small local model on **CPU** — no API calls, no GPU, no per-record cost:
-**faster, cheaper, and a fraction of the energy** of calling an LLM on every record.
-
-STROT compiles a decision task into a standalone pipeline. You describe the
-intent once (a query plus the set of actions it can take), an LLM compiles that
-into a frozen Python artifact, and from then on a small local model makes the
-actual decisions — on CPU, no API calls at runtime, bounded typed-JSON output.
-
-I built it because getting a small local model to reliably *decide* things
-(route this ticket, classify this text, score this record) is fiddly work, and
-accuracy swings hard depending on how you phrase the labels. STROT moves that
-work to compile time and freezes the result, the way a compiler moves work off
-the hot path.
+> **Status: early.** The core (a head on a frozen `gte-modernbert` encoder) is
+> benchmark-validated on Banking77 (93% full-data, 87% at 10 examples/class).
+> Bring your own data; treat this as a `v0`.
 
 ```bash
-pip install strot-ai
+pip install "strot-ai[local,anthropic]"
+export ANTHROPIC_API_KEY=...
 ```
 
 ```python
 import strot
 
-result = strot.run(
-    tickets,
-    query="Triage incoming support tickets into the correct workflow.",
-    action_registry={
-        "billing_dispute":  "Refunds, invoice corrections, double charges",
-        "technical_defect": "Crashes, bugs, broken behavior",
-    },
-    llm="anthropic/claude-opus-4-8",   # used once, on first compile only
-)
+# 1. Design the decision schema from a one-line intent (review/edit it).
+questions = strot.questions(tickets, "triage support tickets",
+                            llm="anthropic/claude-opus-4-8")
 
-for o in result.outcomes:
-    print(o["action"], round(o["confidence"], 2))
-# billing_dispute 0.97
-# technical_defect 0.94
+# 2. Compile a decision model — the LLM teacher labels your sample, a calibrated
+#    head per question is distilled onto the frozen encoder.
+model = strot.decide(tickets, questions, llm="anthropic/claude-opus-4-8")
+
+# 3. Decide — locally, on CPU, $0 per call.
+model(tickets[0])
+# {"predicates": {...}, "scores": {...}, "choices": {...}}  probabilities + calibrated confidence
+
+# 4. Ship one self-contained file; reload anywhere.
+model.save("ticket-triage")
+strot.load_model("ticket-triage")
 ```
 
-The LLM runs once, when the artifact is first compiled. After that, production
-is a self-contained Python file: a small local model arbitrates every record,
-nothing is generated at runtime, and every output is bounded and carries a
-calibrated confidence. By default it dispatches every record and lets you decide
-what to do with the low-confidence tail; set an accuracy or risk target and it
-abstains on records below the bar instead of guessing.
+The LLM runs only at compile time. After that, production is a self-contained
+model file: the local model answers every record, **nothing is generated at
+runtime**, and every output is bounded typed JSON with a calibrated confidence.
 
-To compile with a subscription CLI, use
-`llm="claude-cli/claude-opus-4-8"` or `llm="codex-cli/gpt-6-luna"`.
-Sign in through `claude` or `codex login` first. Omit `/<model>` to use the
-CLI default. Model access and usage limits depend on your account.
-The CLI only runs at compile time. See [the example](examples/end_to_end.py).
-For a CLI outside PATH, pass a client such as
-`llm=strot.codex_cli_llm_client(cli="/path/to/codex", model="gpt-6-luna")`.
-For Claude, use `llm=strot.claude_cli_llm_client(cli="/path/to/claude")`.
+## Typed questions
+
+A decision config maps a name to a typed question — `predicate`, `choice`, or
+`score`:
+
+```python
+questions = {
+    "is_bug_report":      {"type": "predicate", "instructions": "mentions crashes or errors?"},
+    "customer_sentiment": {"type": "score", "instructions": "how upset is the customer?",
+                           "levels": [{"label": "angry"}, {"label": "neutral"}, {"label": "happy"}]},
+    "routing_bucket":     {"type": "choice", "choices": [
+                              {"value": "billing",     "description": "charges, invoices, refunds"},
+                              {"value": "engineering", "description": "crashes, bugs, defects"}]},
+}
+```
+
+Pass that to `strot.decide(data, questions)`, or hand `decide` a **bare intent
+string** and it designs the schema for you first (`result.questions` shows what
+it chose). Each answer carries probabilities and a calibrated confidence.
+
+## Three tiers
+
+`strot.decide(data, questions, mode=...)` picks how hard it works:
+
+| mode | what it is | needs | when |
+|---|---|---|---|
+| **`lite`** | zero-shot prototype heads (embed each option's description, cosine-match) | no labels, instant | try a decision immediately, $0, bring no data |
+| **`head`** *(default)* | a calibrated logistic head per question, distilled from teacher labels | the teacher labels your sample | the accuracy of training on your records |
+| **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | the `[finetune]` extra + more records | representation-bound tasks a frozen head can't crack |
+
+`warm=True` serves `lite` instantly while `head` trains in the background, then
+hot-swaps it in — "zero-shot that grows up."
 
 ## How it works
 
-Two phases. The expensive, nondeterministic one happens once; the cheap one runs
-on every record forever.
+Two phases: the expensive, non-deterministic one happens **once**; the cheap one
+runs on every record forever.
 
-```mermaid
-flowchart TB
-    subgraph compile["COMPILE — once per intent + schema"]
-        direction LR
-        A["intent + data sample"] --> B["synthesize<br/>labels · projection · handlers"]
-        B --> C["golden gate<br/>(must pass your known answers)"]
-        C --> D["PII-mask the sample →<br/>teacher labels it (once)"]
-        D --> E["fit calibration"]
-        E -.->|optimize + target,<br/>frozen misses the bar| J["fine-tune once<br/>top-N LoRA + ensemble"]
-        E --> F[["frozen .py artifact"]]
-        J --> F
-    end
-    subgraph runtime["RUNTIME — every record"]
-        direction LR
-        F --> G["project record"]
-        G --> H["decision model<br/>local · CPU · ~60ms"]
-        H --> I["typed JSON decision<br/>+ calibrated confidence"]
-        I -.->|target set:<br/>below the bar| K["abstain → fallbacks"]
-    end
-    compile --> runtime
-```
+- **Compile once.** The LLM designs the question schema (optional) and writes the
+  record→text projection; the teacher labels a PII-masked sample; a calibrated
+  head per question is trained on the frozen encoder's embeddings and baked into
+  a standalone `.py` artifact. Content-addressed: a schema change triggers exactly
+  one recompile, nothing else does.
+- **Decide forever.** The local model projects a record, embeds it once, and
+  every question head answers — typed JSON, bounded, with calibrated confidence.
+  No LLM, no network, ~tens of ms on CPU.
+- **Refuses what it hasn't seen.** A drift gate (per-class centroids + a distance
+  threshold, fit at compile time) returns a refusal for records unlike anything
+  in training rather than guessing on them.
+- **Recompile, don't increment.** Every compile is a *fresh fit* from the frozen
+  base on the current data — never a warm-start from prior weights. A model's
+  weights are a pure function of its own `(data, questions, mode)`, so retraining
+  on accumulated data can only gain quality; it is immune to catastrophic
+  forgetting by construction.
 
-The compiler doesn't trust its first guess at the labels. It scores candidate
-labelings against a teacher-labeled sample and keeps whichever one actually
-measures best, and refuses to promote an artifact that fails your golden
-records. By default the battery dispatches every record with a calibrated
-confidence; give it an accuracy or risk target and it also fits the threshold
-that decides which records to abstain on.
+## Data & privacy
 
-## Two ways to use it
+The teacher LLM is used as a **labeler of your real records**, never as a bulk
+synthetic generator. Before any record reaches the teacher it is **PII-masked at
+that boundary**: a regex pre-pass guards format-defined tokens (email, SSN, card,
+API keys, IBAN, IP/MAC/phone), and GLiNER (the `[pii]` extra) masks names,
+addresses, and orgs. Masking is compile-time only.
 
-`run()` routes each record to an action and executes the compiled handler:
-
-```python
-result = strot.run(records, query=..., action_registry={...}, llm=...)
-```
-
-`decide()` answers typed questions per record (choice / score / boolean):
-
-```python
-result = strot.decide(records, questions={
-    "is_bug_report":      {"type": "boolean", "instructions": "mentions crashes/errors?"},
-    "customer_sentiment": {"type": "score", "min": 1, "max": 5, "instructions": "1 angry, 5 happy"},
-    "routing_bucket":     {"type": "choice", "options": ["billing", "engineering", "spam"]},
-})
-# {"booleans": {...}, "scores": {...}, "choices": {...}}  with probabilities + confidence
-```
-
-## Where it fits
-
-STROT is built for record-level decisions on messy real text — the kind cyber,
-financial, and insurance triage actually run on. Easy tasks (routing,
-tool-selection) stay on the frozen tier and never need more. Harder,
-representation-bound tasks — where the right call hinges on a distinction a small
-frozen encoder can't see on its own — are what the opt-in fine-tune tier is for.
-
-The product metric isn't blanket accuracy; it's reliability on the slice the
-model is confident about (coverage at your target). Calibration and the
-fine-tune ensemble are what move that slice. For production-grade accuracy on a
-specific domain, drop a task-trained specialist into the `nlu=` slot — the
-compiler, calibration, and gate don't change.
-
-Runtime cost is the point: every decision runs locally on CPU, in tens of
-milliseconds, at $0 and zero LLM calls.
-
-## Batteries
-
-A battery is the compiled, frozen decision unit — the thing a compile produces.
-Each `run()` / `decide()` writes one to disk as `battery_<task>_<hash>.py`: the
-slug comes from a `name=` you pass, or is derived from the query, and the hash
-is the content address that keys the cache. A battery is self-contained — it
-carries its task-specific parameters inline (routing labels, calibration, the
-distilled head or LoRA weights) and loads only the shared base checkpoint at
-runtime.
-
-The same decision can also be distributed as a portable **bundle** — the
-decision path only, as data rather than code — so a battery can live on a hub as
-weights plus config while the runtime stays in the installed package. A battery
-in this form is a **data-only classifier**: it maps a projected record context
-to a calibrated label, confidence, full distribution, and an abstention flag.
-The synthesized action handlers are app-side glue, so they stay on your side —
-a loaded battery reproduces the decision, not handler dispatch.
-
-### Using a pre-built battery from the hub
-
-```python
-strot.list_batteries()               # catalog from the hub (default strot-ai/batteries)
-strot.battery_info("cyber-intent")   # its spec sheet, no weights loaded
-pipe = strot.load("cyber-intent")    # downloads the bundle, builds the runtime
-pipe.decide(context)                 # calibrated label + confidence + abstention
-```
-
-`decide()` takes the already-projected context the decision model sees;
-projection is compiled code, not bundle data, so you supply it. `load()` needs
-the base model present — install the `[local]` extra and run `prefetch_nlu`, or
-set `STROT_NLU_CHECKPOINT` — and errors clearly if it is missing rather than
-failing deep in an import. A **local path** loads a bundle off disk; a **bare
-name** resolves from the hub. The repo is pinned by default and overridable with
-`repo=` or `STROT_BATTERY_REPO`.
-
-The catalog is fine-tuned batteries — the ones worth distributing. A zero-shot
-battery is just the no-`optimize` route; its "weights" are the shared base model,
-so there is nothing data-only to ship. Distilled and fine-tuned batteries are
-the exportable ones.
-
-### Exporting a battery as a portable bundle
-
-```python
-strot.export_bundle(asset_or_source_or_path, out_dir)
-```
-
-This writes `battery.json` (task metadata, labels, calibration, schema
-fingerprint — pure JSON) plus `weights.safetensors` (the distilled head or the
-adapter tensors — data only, no code) into `out_dir`. The argument is a compiled
-asset, its source string, or a path to a compiled `.py`. The data is read
-straight out of the asset's module-level literals, so a bundle cannot drift from
-the baked artifact. The self-contained `.py` is the alternative standalone
-format when you would rather ship the whole thing.
-
-## What's actually going on under the hood
-
-- The optimizer compiles once; the battery decides forever. The compiled
-  artifact is content-addressed; a schema change triggers exactly one recompile,
-  nothing else does. There is no runtime loop: compile is a single pass, and the
-  battery never retrains itself. Each battery lands on disk as
-  `battery_<task>_<hash>.py` and carries all its task-specific parameters inline
-  — routing labels, calibration, the distilled head, and (the fine-tune tier)
-  the LoRA weights — so the only external dependency is the shared base-model
-  checkpoint it loads at runtime. Pass `name=` to label the file; otherwise the
-  slug is derived from your query.
-- Cheapest tier that clears your bar. The optimizer keeps the cheapest rung that
-  meets your target on held-out real records: a zero-shot route, then a logistic
-  head distilled onto the frozen encoder. Both are frozen tiers and cover most
-  tasks — routing and tool-selection rarely leave them.
-- Fine-tune once, opt-in. For representation-bound tasks the frozen tiers can't
-  crack, pass `optimize=True` together with a target (`target_accuracy` or
-  `target_risk`). Only when the frozen tier misses that target on the real
-  measurement fold does the compiler fine-tune — once — a light cached-lower +
-  top-N LoRA on ModernBERT (the `[finetune]` extra). It trains a small K=3
-  ensemble of diverse adapters and averages them at inference; the measured
-  winner is kept. Without a target, `optimize=True` is a no-op. Already built an
-  adapter? Pass it as `reuse_adapter=` to adopt it after a quick validation on
-  this task's fold and skip training entirely.
-- No abstention by default; abstention is opt-in. With no target set the battery
-  never hard-abstains: it dispatches every record and publishes the confidence
-  (calibrated if a threshold was fitted), and the caller decides what to do with
-  the low-confidence tail. Set `target_risk` (split conformal) or
-  `target_accuracy` (an empirical dispatch cutoff) and the battery starts
-  abstaining on records below the bar. Abstained records come back in
-  `result.fallbacks` for you to re-run however you like — STROT does not loop.
-- Golden records are a promotion gate, not a hint. A battery that fails your
-  known answers never serves.
-- Calibration is temperature scaling plus split conformal prediction, fitted at
-  compile time. When a target is set, dispatched decisions are wrong at most α of
-  all records (marginal), and the confident slice — coverage at your target — is
-  the product metric, not blanket accuracy.
-- Nothing is generated at runtime. Output is selection and computation over your
-  registry, so there's no structural hallucination to guard against.
-- The decision model is a slot (`nlu=`): local Julia-1 zero-shot by default,
-  ModernBERT for the fine-tune tier, a hosted API, or any specialist you drop in.
-
-### Data
-
-The teacher LLM is used as a labeler of real records (distillation), never as a
-bulk synthetic generator. Before any record reaches the teacher it is PII-
-masked at that boundary. GLiNER is the default masker for names, addresses, and
-orgs (it needs the `[pii]` extra); a thin regex pre-pass runs ahead of it to
-guard format-defined tokens (email, SSN, Luhn card, API keys, IBAN, IP/MAC/
-phone). Without the `[pii]` extra it falls back to regex-only with a warning.
-Masking is compile-time only.
-
-Synthetic data is a last resort, not a default. We measured it, and LLM-generated
-synthetic records hurt both accuracy and the confident slice — they come out too
-clean and tend to leak the label. So the policy is real-first: label real data,
-and handle class imbalance by pulling and
-labeling more real minority-class records (or oversampling / weighting the real
-minority). Reach for synthetic only to seed a near-empty class, never to "scale
-up."
+We measured synthetic data and it hurt both accuracy and the confident slice — it
+comes out too clean and leaks the label. The policy is **real-first**: label real
+data; handle class imbalance by labeling more real minority-class records.
 
 ## Install
 
 ```bash
-pip install strot-ai             # core: pure stdlib
-pip install "strot-ai[local]"     # + local model dependencies (torch/transformers)
-pip install "strot-ai[finetune]"  # + torch/transformers, for the opt-in fine-tune tier
-pip install "strot-ai[pii]"       # + GLiNER NER masking at the teacher boundary
-pip install "strot-ai[hosted]"    # + openai, for API synthesis or runtime routing
-pip install "strot-ai[anthropic]" # + anthropic, for Anthropic API synthesis
+pip install strot-ai                # core (pure stdlib)
+pip install "strot-ai[local]"       # + torch/transformers (compile + serve a model)
+pip install "strot-ai[finetune]"    # + torch/transformers, for mode="deep"
+pip install "strot-ai[pii]"         # + GLiNER masking at the teacher boundary
+pip install "strot-ai[openai]"      # + openai, teacher via llm="openai/<model>"
+pip install "strot-ai[anthropic]"   # + anthropic, teacher via llm="anthropic/<model>"
 ```
 
-Extras install optional Python packages. They do not select a provider or sign you in.
-For OpenAI API synthesis, install `[hosted]`, set `OPENAI_API_KEY`, and pass
-`llm="openai/gpt-4o"`. For Anthropic API synthesis, install `[anthropic]`, set
-`ANTHROPIC_API_KEY`, and pass `llm="anthropic/claude-opus-4-8"`.
-Subscription CLI synthesis needs the CLI and its subscription login. It needs
-neither the `[hosted]` nor the `[anthropic]` extra. Check which login the CLI uses.
-Other credentials can override a saved subscription login.
+Extras install optional packages; they do not sign you in. Set the matching API
+key and pass `llm="<provider>/<model>"`. Compile-time only — serving needs no key.
 
-Bake the local model into your image for offline production:
+Bake the encoder into your image for offline production:
 
 ```dockerfile
-RUN pip install strot-ai[local] \
- && python -c "import strot; strot.prefetch_nlu(local_dir='/opt/julia-1', install=True)"
-ENV STROT_NLU_CHECKPOINT=/opt/julia-1
+RUN pip install "strot-ai[local]" \
+ && python -c "import strot; strot.prefetch_nlu(local_dir='/opt/encoder')"
+ENV STROT_NLU_CHECKPOINT=/opt/encoder
 ```
-
-(`julia` on PyPI is an unrelated package — don't install it. The decision
-model's inference code is pulled from its Hugging Face repo by `prefetch_nlu`.)
-
-## Docs
-
-[DEVELOPERS.md](DEVELOPERS.md) covers the architecture, the compile lifecycle,
-calibration semantics and their caveats, deployment, model swapping, and the
-full API.
 
 ## Contributing & contact
 
-Contributions are welcome — keep pull requests focused on one change, branch off
-the latest `main`, and run the test suite first. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Pull requests welcome — keep them focused, branch off the latest `main`, and run
+the suite first. See [CONTRIBUTING.md](CONTRIBUTING.md). Questions or ideas: open
+an issue or email **lee@strot-ai.xyz**.
 
-Questions, ideas, or problems: open an issue or email **lee@strot-ai.xyz**.
-
-Built by Amit Rath. Follow me on [LinkedIn](https://www.linkedin.com/in/amirath/).
+Built by Amit Rath — [LinkedIn](https://www.linkedin.com/in/amirath/).
 
 ## License
 
-MIT. The default decision model is Apache-2.0
-([SupersonicLabs/Julia-1](https://huggingface.co/SupersonicLabs/Julia-1)).
-Implements ideas from STROT (arXiv:2505.01636).
+MIT. The base encoder
+([Alibaba-NLP/gte-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-modernbert-base))
+is Apache-2.0. Implements ideas from STROT (arXiv:2505.01636).

@@ -116,3 +116,48 @@ Honest findings:
 Same model, same records, same question — only state/option formatting varies.
 This isolates how much of routing accuracy is integration rather than model
 capability. Runs the decision model directly; no LLM required.
+
+## High-cardinality decision models: `banking77_*.py`
+
+[Banking77](https://huggingface.co/datasets/PolyAI/banking77) — 77 fine-grained
+banking intents, 10k train / 3080 test — a deliberately high-cardinality
+decision far past a flat 2–20 option scorer. The question these three scripts
+answer: does a *trained head on a frozen encoder* (a compiled decision model)
+clear a 77-way space, and where does its training data have to come from?
+
+```bash
+pip install torch transformers scikit-learn datasets anthropic
+# probe needs no key; synthetic/mix call an LLM teacher:
+export ANTHROPIC_API_KEY=...
+python banking77_probe.py        # no key: representation ceiling
+python banking77_synthetic.py    # cold start from label names only
+python banking77_mix.py          # synthetic + a few real/class
+```
+
+- **`banking77_probe.py`** — linear probe: freeze an encoder, mean-pool, train a
+  head on the *true* train labels, evaluate on the *true* test labels. The
+  ceiling of what a frozen representation can separate with a head. Sweeps
+  `gte-modernbert` vs bare `ModernBERT-base` and a 5/10/20/all-per-class data
+  curve. No LLM.
+- **`banking77_synthetic.py`** — cold start: the LLM invents the *entire* train
+  set from the 77 intent **names only** (zero real records), a head trains on it,
+  evaluated on the real test set. Set `GEN_MODEL` to vary the teacher.
+- **`banking77_mix.py`** — the onboarding curve: synthetic base + *k* real
+  examples/class, to see whether synthetic helps, goes neutral, or drags as real
+  data arrives.
+
+Honest findings (run them for the numbers — the point is the shape):
+
+1. **A trained head handles the full 77-way space.** Cardinality is a property of
+   a flat option scorer, not of a softmax head — the 2–20 limit disappears once
+   the model is compiled with its own head.
+2. **Encoder choice dominates the low-data floor.** An embedding-pretrained
+   encoder separates the classes with far less data than a general-MLM encoder;
+   the gap shrinks as data grows (more data overcomes a weaker representation).
+3. **Synthetic cold start works but plateaus below real data**, and is roughly
+   *teacher-agnostic* — a far stronger generator barely moves it. The wall is the
+   diversity of one model's distribution, not its quality: synthetic populates
+   class centers, not the boundaries that real usage supplies.
+4. **Synthetic helps most at near-zero real data and fades to neutral** as real
+   examples arrive; on a frozen head it does not drag (it never falls below
+   real-only). Centers from synthetic, boundaries from a handful of real.

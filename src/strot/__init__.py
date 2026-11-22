@@ -1,10 +1,14 @@
-"""strot-ai: compile-time LLM code synthesis with deterministic,
-self-routing NLU runtimes.
+"""strot-ai: a decision compiler.
 
-Implements the STROT framework (Structured Task Reasoning and Output
-Transformation, arXiv:2505.01636) with an NLU strategy-pattern runtime:
-a local CPU transformer (default ``SupersonicLabs/Julia-1``) or a hosted
-cloud API, baked into a standalone compiled production asset.
+STROT (Structured Task Reasoning and Output Transformation, arXiv:2505.01636)
+compiles a specialized decision model per task: an LLM teacher labels your real
+data, a calibrated head is distilled onto a frozen encoder, and the result is a
+self-contained model that runs locally on CPU and emits typed decision JSON.
+
+    questions = strot.questions(data, "triage support tickets")  # design the schema
+    model = strot.decide(data, questions)                        # compile a model
+    model(record)                                                # decide, locally
+    model.save("triage"); strot.load_model("triage")             # ship + reuse
 """
 
 from .compiler import (
@@ -15,6 +19,7 @@ from .compiler import (
     codex_cli_llm_client,
     openai_llm_client,
 )
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .exceptions import (
     CompilationError,
     FallbackException,
@@ -22,47 +27,20 @@ from .exceptions import (
     SchemaIntrospectionError,
     StrotError,
 )
-from .router import (
-    CONFIDENCE_THRESHOLD,
-    DEFAULT_NLU_MODEL,
-    MAX_FLAT_OPTIONS,
-    FineTunedAdapterStrategy,
-    HostedApiStrategy,
-    LocalEncoderStrategy,
-    RouteDecision,
-    Router,
-    RuntimeStrategy,
-    create_router,
-    create_strategy,
-)
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
 __version__ = "0.12.0"
 
-from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
+from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
 
-# Battery distribution: a compiled catalog classifier as data (bundle on disk)
-# served by a data-parameterized runtime in the package. Imported after
-# __version__ so export can stamp the bundle. Local filesystem only for now.
-from .battery import (  # noqa: E402
-    Battery,
-    battery_info,
-    export_bundle,
-    list_batteries,
-    load,
-)
-
 __all__ = [
-    "run",
     "decide",
+    "questions",
+    "load_model",
+    "DecisionModel",
     "RunResult",
     "prefetch_nlu",
-    "Battery",
-    "load",
-    "list_batteries",
-    "battery_info",
-    "export_bundle",
     "CompiledAsset",
     "StrotCompiler",
     "openai_llm_client",
@@ -74,17 +52,7 @@ __all__ = [
     "FallbackException",
     "RouterConfigurationError",
     "SchemaIntrospectionError",
-    "CONFIDENCE_THRESHOLD",
     "DEFAULT_NLU_MODEL",
-    "MAX_FLAT_OPTIONS",
-    "RuntimeStrategy",
-    "LocalEncoderStrategy",
-    "HostedApiStrategy",
-    "FineTunedAdapterStrategy",
-    "RouteDecision",
-    "Router",
-    "create_router",
-    "create_strategy",
     "DatasetSchema",
     "FieldProfile",
     "SchemaProfiler",

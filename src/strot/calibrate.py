@@ -73,6 +73,39 @@ def fit_temperature(
     return round(best_t, 4)
 
 
+def softmax_logits(logits: Sequence[float], temperature: float = 1.0) -> List[float]:
+    """Numerically-stable softmax of ``logits / temperature``."""
+    scaled = [z / temperature for z in logits]
+    peak = max(scaled)
+    exps = [math.exp(z - peak) for z in scaled]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def fit_temperature_logits(
+    logits: Sequence[Sequence[float]], true_indices: Sequence[int]
+) -> float:
+    """Temperature scaling in logit space: the NLL-minimizing ``T`` for
+    ``softmax(logits / T)``.
+
+    Unlike :func:`fit_temperature` (which rescales already-softmaxed
+    probabilities and so cannot recover a saturated 0/1 vector), this fits on
+    the raw pre-softmax logits, where a sharp head still carries the magnitude
+    the temperature acts on.
+    """
+    if len(logits) != len(true_indices) or not logits:
+        raise ValueError("need equal, non-empty logits and labels")
+    best_t, best_nll = 1.0, float("inf")
+    for step in range(_T_STEPS + 1):
+        t = _T_MIN * (_T_MAX / _T_MIN) ** (step / _T_STEPS)
+        nll = 0.0
+        for row, true_index in zip(logits, true_indices):
+            nll -= math.log(max(softmax_logits(row, t)[true_index], 1e-12))
+        if nll < best_nll:
+            best_t, best_nll = t, nll
+    return round(best_t, 4)
+
+
 def conformal_quantile(
     distributions: Sequence[Sequence[float]],
     true_indices: Sequence[int],

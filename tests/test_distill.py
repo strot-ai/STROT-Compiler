@@ -14,11 +14,7 @@ from strot.distill import (
     train_head,
     make_encoder_embedder,
 )
-from strot.router import RouteDecision
-from strot.templates import DISTILLED_RUNTIME_TEMPLATE
-
-
-def test_encoder_and_distilled_vectors(monkeypatch, tmp_path):
+def test_encoder_embedder_mean_pools(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     safetensors = pytest.importorskip("safetensors.torch")
@@ -42,12 +38,6 @@ def test_encoder_and_distilled_vectors(monkeypatch, tmp_path):
     monkeypatch.setattr(safetensors, "load_file", lambda _: {"encoder.x": torch.zeros(1)})
     monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
     assert make_encoder_embedder(str(tmp_path))(["one", "two"]) == [[2.0, 0.0]] * 2
-    ns = dict(Any=object, Sequence=list, RouteDecision=RouteDecision, math=math, os=os,
-              HEAD_WEIGHTS=[[1.0, 0.0], [0.0, 1.0]], HEAD_BIAS=[0.0, 0.0])
-    exec(DISTILLED_RUNTIME_TEMPLATE.format(nlu_model="test"), ns)
-    decision = ns["_RuntimeRouter"]().select("one", "which?", ["first", "second"])
-    assert decision.option == "first"
-    assert decision.confidence == pytest.approx(1 / (1 + math.exp(-2)))
 
 
 class TestTrainer:

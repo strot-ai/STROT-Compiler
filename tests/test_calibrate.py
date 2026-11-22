@@ -9,7 +9,9 @@ from strot.calibrate import (
     conformal_quantile,
     fit_split_calibration,
     fit_temperature,
+    fit_temperature_logits,
     prediction_set,
+    softmax_logits,
 )
 
 
@@ -25,6 +27,21 @@ class TestTemperature:
         assert flat[0] < probs[0] < sharp[0]
         assert sum(flat) == pytest.approx(1.0)
         assert sum(sharp) == pytest.approx(1.0)
+
+    def test_logit_temperature_softens_wrong_sharpens_right(self):
+        # Logit-space temperature (used by decide's per-question heads): a head
+        # that is confidently WRONG half the time softens (T>1); a head that is
+        # confidently RIGHT may sharpen (T<1). Saturated 0/1 probs cannot be
+        # recovered by prob-space scaling, so decide fits on raw logits.
+        sharp_mixed = [[6.0, -6.0], [6.0, -6.0], [-6.0, 6.0], [-6.0, 6.0]]
+        assert fit_temperature_logits(sharp_mixed, [0, 1, 0, 1]) > 1.0  # half wrong
+        assert fit_temperature_logits([[6.0, -6.0]] * 4, [0, 0, 0, 0]) < 1.0  # all right
+        # Softening a sharp, wrong-leaning logit pair lifts the minority mass.
+        assert softmax_logits([6.0, -6.0], 4.0)[1] > softmax_logits([6.0, -6.0], 1.0)[1]
+
+    def test_logit_temperature_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            fit_temperature_logits([[1.0, 2.0]], [0, 1])
 
     def test_fit_softens_overconfident_model(self):
         # Model says 0.9 but is right only ~half the time -> T should be > 1.

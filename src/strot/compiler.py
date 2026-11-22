@@ -1,19 +1,16 @@
 """Compile time: the STROT Synthesizer Engine.
 
-:class:`StrotCompiler` implements the paper's three phases at compile time:
+:class:`StrotCompiler.compile_decide` compiles a specialized decision model:
 
-1. **Schema-aware context construction** — introspect the dataset sample
-   into a verified structural schema (:mod:`strot.schema`).
-2. **Prompt scaffolding** — build a strict, sectioned prompt for a large
-   generative LLM containing the schema, the functional goal, and the
-   requested ``nlu_model``.
-3. **Feedback-driven synthesis** — ask the LLM for the execution-path code,
-   validate its syntax and output contract, and loop error traces back for
-   self-correction within a bounded retry budget.
-
-The validated paths are then woven together with a deterministic runtime
-router template (:mod:`strot.templates`) matched to the ``nlu_model``,
-producing a completely standalone production asset.
+1. **Schema-aware context construction** — introspect the dataset sample into a
+   verified structural schema (:mod:`strot.schema`).
+2. **Synthesis** — the LLM designs the typed question set (optional) and writes
+   the state projection (``route_context``), validated with a bounded
+   self-correction retry loop.
+3. **Distillation** — the LLM teacher labels the sample; a calibrated head per
+   question is trained on the frozen encoder's embeddings (``lite`` skips the
+   teacher; ``deep`` adds a shared LoRA adapter) and baked into a standalone
+   artifact that emits typed decision JSON.
 """
 
 from __future__ import annotations
@@ -24,19 +21,18 @@ import re
 import types as _types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import templates
 from .exceptions import CompilationError, RouterConfigurationError
-from .router import (
-    CONFIDENCE_THRESHOLD,
-    DEFAULT_NLU_MODEL,
-    HOSTED_PROVIDER_PREFIXES,
-)
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .schema import DatasetSchema, introspect_schema
 
 #: A generative LLM client is any callable mapping a prompt to raw model text.
 LLMClient = Callable[[str], str]
+
+#: Below this many labeled records for a class, its head under-learns; warn.
+MIN_CLASS_RECORDS = 3
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
@@ -47,8 +43,8 @@ def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMCli
         from openai import OpenAI
     except ImportError as exc:
         raise RouterConfigurationError(
-            "openai_llm_client requires the 'hosted' extra: "
-            "pip install strot-ai[hosted]"
+            "openai_llm_client requires the 'openai' extra: "
+            "pip install strot-ai[openai]"
         ) from exc
     client = OpenAI()
 
@@ -202,7 +198,7 @@ def handler_name(action_key: str) -> str:
 
 @dataclass(frozen=True)
 class CompiledAsset:
-    """A self-contained, self-routing production artifact."""
+    """A self-contained compiled decision model artifact."""
 
     source: str
     nlu_model: str
@@ -242,74 +238,12 @@ class StrotCompiler:
 
     @property
     def runtime_kind(self) -> str:
-        if self.nlu_model.lower().startswith(HOSTED_PROVIDER_PREFIXES):
-            return "hosted"
+        # Decide compiles only local encoders now (hosted runtime removed).
         return "local"
 
     # ------------------------------------------------------------------ #
     # Phase 2: prompt scaffolding                                         #
     # ------------------------------------------------------------------ #
-
-    def build_synthesis_prompt(
-        self,
-        schema: DatasetSchema,
-        goal: str,
-        action_registry: Mapping[str, str],
-    ) -> str:
-        """Construct the strict, sectioned synthesizer prompt."""
-        contract_lines = [
-            f"- `def {handler_name(key)}(record: dict) -> dict:` handles action "
-            f"{key!r} ({desc})"
-            for key, desc in action_registry.items()
-        ]
-        contract_lines += [
-            "- `ROUTING_LABELS: Dict[str, str]` module-level literal dict mapping "
-            f"EVERY action key ({', '.join(map(repr, action_registry))}) to a "
-            "short routing label: 1-4 lowercase words, mutually distinct, using "
-            "vocabulary that appears in the records themselves. The runtime "
-            "decision model sees ONLY these labels as its options - short, "
-            "discriminative labels dramatically outperform long descriptions.",
-            "- `def route_context(record: dict) -> str:` projects ONLY the "
-            "fields relevant to choosing an action into a compact string for "
-            "the decision model; drop irrelevant or noisy fields.",
-        ]
-        return "\n".join(
-            [
-                "You are the STROT synthesizer. Generate production Python code.",
-                "",
-                "## VERIFIED DATASET SCHEMA",
-                schema.to_json(),
-                "",
-                "## FUNCTIONAL GOAL",
-                goal,
-                "",
-                "## RUNTIME NLU MODEL",
-                f"The routing decision at runtime is made by {self.nlu_model!r} "
-                f"({self.runtime_kind} runtime). Do NOT generate routing code; "
-                "it is compiled in separately.",
-                "",
-                "## OUTPUT CONTRACT",
-                "Emit exactly one ```python code block containing ONLY these "
-                "top-level functions, fully implemented against the schema above:",
-                *contract_lines,
-                "",
-                "Rules: pure standard library only; comprehensive exception "
-                "handling inside each function; full type hints; no I/O, no "
-                "network calls, no imports of torch/transformers/openai/julia; "
-                "return a JSON-serializable dict.",
-            ]
-        )
-
-    def _synthesize_paths(
-        self,
-        prompt: str,
-        expected_functions: List[str],
-        label_keys: Optional[List[str]] = None,
-    ) -> "tuple[str, int]":
-        return self._synthesize_with(
-            prompt,
-            lambda code: self._validate_candidate(code, expected_functions, label_keys),
-        )
 
     def _synthesize_with(
         self, prompt: str, validate: Callable[[str], Optional[str]]
@@ -455,228 +389,6 @@ class StrotCompiler:
     # Assembly of the standalone asset                                    #
     # ------------------------------------------------------------------ #
 
-    # ------------------------------------------------------------------ #
-    # Golden-record promotion gate                                        #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _load_candidate_module(source: str) -> Any:
-        """Exec a candidate asset in-memory for the golden gate.
-
-        A load failure here is an environment problem (missing decision
-        runtime on the compile box), never the synthesizer's fault - raise
-        instead of burning repair-loop retries.
-        """
-        import sys
-
-        module = _types.ModuleType("strot_golden_gate")
-        # Registered so stdlib machinery (e.g. dataclasses) can resolve the
-        # module during exec; dropped again by the gate methods when done.
-        sys.modules["strot_golden_gate"] = module
-        try:
-            exec(compile(source, "<strot-golden-gate>", "exec"), module.__dict__)
-        except Exception as exc:
-            sys.modules.pop("strot_golden_gate", None)
-            raise RouterConfigurationError(
-                "Golden-record gate could not load the candidate asset; the "
-                f"decision runtime must be installed on the compile box: {exc}"
-            ) from exc
-        return module
-
-    @staticmethod
-    def validate_golden_run(golden: Any, action_registry: Mapping[str, str]) -> None:
-        if not isinstance(golden, list) or not golden:
-            raise RouterConfigurationError("golden must be a non-empty list.")
-        for i, case in enumerate(golden):
-            if (
-                not isinstance(case, Mapping)
-                or not isinstance(case.get("record"), Mapping)
-                or case.get("expect") not in action_registry
-            ):
-                raise RouterConfigurationError(
-                    f"golden[{i}] must be {{'record': {{...}}, 'expect': <action key>}} "
-                    f"with expect one of {list(action_registry)}."
-                )
-
-    def _test_golden_pipeline(self, source: str, golden: List[Mapping[str, Any]]) -> Optional[str]:
-        import sys
-
-        module = self._load_candidate_module(source)
-        try:
-            pipeline = module.CompiledPipeline()
-        except Exception as exc:
-            raise RouterConfigurationError(
-                f"Golden-record gate: decision runtime failed to initialize: {exc}"
-            ) from exc
-        failures = []
-        for i, case in enumerate(golden):
-            expect = case["expect"]
-            try:
-                outcome = pipeline.process(dict(case["record"]))
-            except module.FallbackException as exc:
-                failures.append(
-                    f"golden[{i}] fell to fallback (confidence {exc.confidence:.2f}) "
-                    f"but expected action {expect!r}"
-                )
-                continue
-            if outcome["action"] != expect:
-                failures.append(
-                    f"golden[{i}] decided {outcome['action']!r} (confidence "
-                    f"{outcome['confidence']:.2f}) but expected {expect!r}"
-                )
-        sys.modules.pop("strot_golden_gate", None)
-        if failures:
-            return (
-                "Golden-record promotion gate failed - adjust ROUTING_LABELS and "
-                "route_context so these known answers hold:\n" + "\n".join(failures)
-            )
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Compile-time calibration (teacher labels -> fitted temperature + q)  #
-    # ------------------------------------------------------------------ #
-
-    def build_teacher_prompt(
-        self,
-        goal: str,
-        action_registry: Mapping[str, str],
-        records: List[Dict[str, Any]],
-    ) -> str:
-        """Ask the synthesizer LLM to act as a labeling teacher, once."""
-        lines = [
-            "You are the STROT teacher. Label each record with the single "
-            "best action for the goal.",
-            "",
-            "## GOAL",
-            goal,
-            "",
-            "## ACTIONS",
-        ]
-        lines += [f"- {key}: {desc}" for key, desc in action_registry.items()]
-        lines += ["", "## RECORDS (one JSON object per line, in order)"]
-        lines += [
-            f"{i}: {json.dumps(record, default=str, sort_keys=True)}"
-            for i, record in enumerate(records)
-        ]
-        lines += [
-            "",
-            "## OUTPUT CONTRACT",
-            "Emit exactly one ```python code block containing ONLY one "
-            "module-level literal assignment:",
-            f"- `LABELS: List[str]` with exactly {len(records)} entries; the "
-            "i-th entry is the action key for record i, drawn only from: "
-            + ", ".join(map(repr, action_registry)) + ".",
-            "",
-            "No other statements, functions, or imports.",
-        ]
-        return "\n".join(lines)
-
-    @staticmethod
-    def _validate_teacher_labels(
-        code: str, n_records: int, action_registry: Mapping[str, str]
-    ) -> Optional[str]:
-        if not code:
-            return "The response contained no code."
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as exc:
-            return f"SyntaxError at line {exc.lineno}: {exc.msg}"
-        value_node = None
-        for node in tree.body:
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if any(isinstance(x, ast.Name) and x.id == "LABELS" for x in targets):
-                    value_node = node.value
-                    continue
-            return "Emit ONLY the LABELS literal assignment."
-        if value_node is None:
-            return "Missing required module-level literal LABELS."
-        try:
-            labels = ast.literal_eval(value_node)
-        except (ValueError, SyntaxError):
-            return "LABELS must be a literal list of action-key strings."
-        if not isinstance(labels, list) or len(labels) != n_records:
-            return f"LABELS must contain exactly {n_records} entries."
-        bad = [x for x in labels if x not in action_registry]
-        if bad:
-            return f"LABELS contains unknown action keys: {bad[:5]}"
-        return None
-
-    def _collect_distributions(
-        self,
-        source: str,
-        records: List[Dict[str, Any]],
-        action_registry: Mapping[str, str],
-        question: Optional[str],
-        goal: str,
-    ) -> List[List[float]]:
-        import sys
-
-        module = self._load_candidate_module(source)
-        try:
-            router = module._RuntimeRouter()
-            routing_question = question or (
-                f"Which execution path best achieves the goal: {goal}?"
-            )
-            distributions = []
-            for record in records:
-                decision = router.select(
-                    module.route_context(dict(record)),
-                    routing_question,
-                    module._ROUTING_OPTIONS,
-                )
-                distributions.append(
-                    [
-                        max(decision.distribution.get(opt, 0.0), 1e-12)
-                        for opt in module._ROUTING_OPTIONS
-                    ]
-                )
-        finally:
-            sys.modules.pop("strot_golden_gate", None)
-        return distributions
-
-    def _fit_calibration(
-        self,
-        source: str,
-        records: List[Dict[str, Any]],
-        labels: List[str],
-        action_registry: Mapping[str, str],
-        question: Optional[str],
-        goal: str,
-        target_risk: float,
-    ) -> Dict[str, Any]:
-        """Run the promoted artifact over teacher-labeled records; fit T and q."""
-        import sys
-
-        from . import calibrate
-
-        module = self._load_candidate_module(source)
-        try:
-            router = module._RuntimeRouter()
-            action_keys = list(action_registry)
-            routing_question = question or (
-                f"Which execution path best achieves the goal: {goal}?"
-            )
-            distributions: List[List[float]] = []
-            true_indices: List[int] = []
-            for record, label in zip(records, labels):
-                context = module.route_context(dict(record))
-                decision = router.select(
-                    context, routing_question, module._ROUTING_OPTIONS
-                )
-                distributions.append(
-                    [
-                        max(decision.distribution.get(opt, 0.0), 1e-12)
-                        for opt in module._ROUTING_OPTIONS
-                    ]
-                )
-                true_indices.append(action_keys.index(label))
-        finally:
-            sys.modules.pop("strot_golden_gate", None)
-        return calibrate.fit_split_calibration(
-            distributions, true_indices, alpha=target_risk
-        )
-
     def _resolve_compile_checkpoint(self) -> str:
         import os
 
@@ -689,659 +401,6 @@ class StrotCompiler:
 
         return snapshot_download(self.nlu_model)
 
-    def _measure_labelings(
-        self,
-        source: str,
-        records: List[Dict[str, Any]],
-        true_indices: List[int],
-        action_registry: Mapping[str, str],
-        question: Optional[str],
-        goal: str,
-    ) -> "tuple[str, Dict[str, str], Dict[str, float]]":
-        """Score candidate labelings on the teacher-labeled sample; keep the best.
-
-        Candidates: the synthesized ROUTING_LABELS and the bare registry keys.
-        Measurement replaces guessing - benchmarks showed synthesis wins when
-        integration is the bottleneck and loses when the keys are already
-        optimal; scoring both captures both cases. Ties keep the synthesized
-        labeling (listed first).
-        """
-        import sys
-
-        module = self._load_candidate_module(source)
-        try:
-            router = module._RuntimeRouter()
-            routing_question = question or (
-                f"Which execution path best achieves the goal: {goal}?"
-            )
-            candidates: Dict[str, Dict[str, str]] = {
-                "synthesized": {k: module.ROUTING_LABELS[k] for k in action_registry},
-                "registry_keys": {
-                    k: k.replace("_", " ").strip() for k in action_registry
-                },
-            }
-            if candidates["registry_keys"] == candidates["synthesized"]:
-                return "synthesized", candidates["synthesized"], {"synthesized": -1.0}
-            scores: Dict[str, float] = {}
-            for name, labels in candidates.items():
-                options = [labels[key] for key in action_registry]
-                correct = 0
-                for record, true_index in zip(records, true_indices):
-                    decision = router.select(
-                        module.route_context(dict(record)), routing_question, options
-                    )
-                    if decision.index == true_index:
-                        correct += 1
-                scores[name] = round(correct / len(records), 4)
-        finally:
-            sys.modules.pop("strot_golden_gate", None)
-        winner = max(scores, key=lambda k: (scores[k], k == "synthesized"))
-        return winner, candidates[winner], scores
-
-    def compile(
-        self,
-        sample: Any,
-        goal: str,
-        action_registry: Mapping[str, str],
-        question: Optional[str] = None,
-        golden: Optional[List[Mapping[str, Any]]] = None,
-        target_risk: Optional[float] = None,
-        measure_labels: bool = False,
-        distill: bool = False,
-        target_accuracy: Optional[float] = None,
-        optimize: bool = False,
-        reuse_adapter: Optional[Dict[str, Any]] = None,
-    ) -> CompiledAsset:
-        """Run the full compile-time pipeline and return the production asset.
-
-        Args:
-            sample: A representative dataset sample (records, columns, or a
-                DataFrame-like object) used for schema introspection.
-            goal: The user's functional goal in natural language.
-            action_registry: Ordered mapping of action key -> description;
-                list position defines the routing option index at runtime.
-            question: Optional override for the dynamic selection question
-                baked into the asset.
-            golden: Optional known-answer records
-                (``[{"record": {...}, "expect": "<action key>"}, ...]``). A
-                candidate asset is executed against them inside the repair
-                loop and only promoted if every expectation holds. Requires
-                the decision runtime on the compile box.
-            target_risk: Optional miscoverage level ``alpha`` (e.g. 0.05).
-                When set, the LLM teacher-labels the sample once, a
-                temperature and split-conformal quantile are fitted on the
-                promoted artifact's own distributions, and the artifact
-                dispatches only on singleton prediction sets. Guarantee is
-                MARGINAL: the rate of wrong dispatches over all records is
-                <= alpha under exchangeability (the error rate conditional
-                on dispatching is bounded by alpha / dispatch_rate, reported
-                in the calibration metadata). Requires the decision runtime
-                on the compile box.
-            measure_labels: Score candidate labelings (the synthesized labels
-                vs the bare registry keys) on the teacher-labeled sample and
-                bake the winner - measurement instead of guessing. Needs the
-                teacher labels, so it shares the one teacher call with
-                target_risk (free when calibrating; otherwise triggers it).
-            optimize: Permit the fine-tune tier (:mod:`strot.finetune`) above
-                frozen distillation. Only escalates when the frozen tier
-                (zero-shot / distilled head) misses the target on the real
-                measurement fold; the fine-tune tier is then trained on the same
-                three-way folds and the measured winner is kept (recorded in
-                ``CompiledAsset.model_search``). A no-op when the frozen tier
-                already clears the bar. Opt-in and heavy: needs the [finetune]
-                extra on the compile box - a missing extra degrades gracefully
-                to the frozen tier (recorded, never fatal).
-            reuse_adapter: Optional pre-built adapter battery to adopt before
-                training, shaped ``{"adapters": [ ... ], "config": { ... }}`` (a
-                prior :class:`strot.finetune.EnsembleResult`'s adapters + config,
-                or the equivalent from a stored battery). When ``optimize`` is on
-                and the frozen tier misses the bar, the battery is validated on
-                this task's real measure fold (no training); if it clears the bar
-                and beats the frozen baseline (and passes the golden gate), it is
-                adopted and training is skipped (recorded as
-                ``model_search["optimize"] == "reused"``). Otherwise the compiler
-                falls through to training. Calibration is always re-fit on this
-                task's calibrate fold, never reused from the old battery. Ignored
-                when ``optimize`` is off. A missing [finetune] extra degrades
-                gracefully.
-        """
-        if target_risk is not None and not 0 < target_risk < 1:
-            raise RouterConfigurationError("target_risk must be in (0, 1).")
-        if target_accuracy is not None and target_risk is not None:
-            raise RouterConfigurationError(
-                "Set either target_risk (conformal guarantee) or "
-                "target_accuracy (empirical dispatch policy), not both."
-            )
-        if target_accuracy is not None and not 0 < target_accuracy <= 1:
-            raise RouterConfigurationError("target_accuracy must be in (0, 1].")
-        if distill and self.runtime_kind != "local":
-            raise RouterConfigurationError(
-                "distill requires a local decision model (the encoder supplies "
-                f"the embeddings); got {self.nlu_model!r}."
-            )
-        if optimize and self.runtime_kind != "local":
-            raise RouterConfigurationError(
-                "optimize requires a local decision model (the fine-tune tier "
-                f"serves a local adapter); got {self.nlu_model!r}."
-            )
-        if not action_registry:
-            raise CompilationError("action_registry must contain at least one action.", attempts=0)
-        if golden is not None:
-            self.validate_golden_run(golden, action_registry)
-        schema = introspect_schema(sample)
-        expected = [handler_name(key) for key in action_registry]
-        if len(set(expected)) != len(expected):
-            raise CompilationError(
-                "Action keys collide after sanitization; use distinct keys.", attempts=0
-            )
-        expected = expected + ["route_context"]
-        prompt = self.build_synthesis_prompt(schema, goal, action_registry)
-        promoted: Dict[str, str] = {}
-
-        def validate(code: str) -> Optional[str]:
-            error = self._validate_candidate(code, expected, list(action_registry))
-            if error:
-                return error
-            source = self._assemble(schema, goal, dict(action_registry), code, question)
-            try:
-                ast.parse(source)
-            except SyntaxError as exc:  # template regression guard
-                return f"Assembled asset failed syntax validation: {exc}"
-            if golden:
-                error = self._test_golden_pipeline(source, golden)
-                if error:
-                    return error
-            promoted["source"] = source
-            promoted["code"] = code
-            return None
-
-        _, attempts = self._synthesize_with(prompt, validate)
-        source = promoted["source"]
-        final_code = promoted["code"]
-
-        calibration: Optional[Dict[str, Any]] = None
-        label_search: Optional[Dict[str, Any]] = None
-        model_search: Optional[Dict[str, Any]] = None
-        runtime_override: Optional[str] = None
-        # Drift/OOD artifact (per-class centroids + threshold on the frozen
-        # encoder embeddings), fitted only when an encoder runtime wins.
-        ood_artifact: Optional[Dict[str, Any]] = None
-        if (
-            target_risk is not None or measure_labels or distill
-            or target_accuracy is not None or optimize
-        ):
-            records = _sample_records(sample)
-            if distill or optimize:
-                from . import distill as distill_mod
-
-                if len(records) < distill_mod.MIN_DISTILL_RECORDS:
-                    raise RouterConfigurationError(
-                        f"{'optimize' if optimize else 'distill'} needs at least "
-                        f"{distill_mod.MIN_DISTILL_RECORDS} sample records "
-                        f"(got {len(records)}); raise sample_size."
-                    )
-            # Chunked teacher labeling: one call per batch keeps the exact-
-            # count contract reliable at any sample size.
-            from . import pii
-
-            labels: List[str] = []
-            _CHUNK = 50
-            for _start in range(0, len(records), _CHUNK):
-                _chunk = records[_start:_start + _CHUNK]
-                # PII masking at the teacher boundary: real sample records are
-                # scrubbed before they reach the cloud teacher. Uses GLiNER
-                # (names/addresses) + regex (structured ids/secrets) when the
-                # [pii] extra is installed, else the regex baseline alone
-                # (pii.default_maskers caches the NER model). Masking affects
-                # only the teacher's view - the label indices it returns apply
-                # to the original records.
-                _masked_chunk = pii.mask_records(_chunk, maskers=pii.default_maskers())
-                teacher_prompt = self.build_teacher_prompt(
-                    goal, action_registry, _masked_chunk
-                )
-                labels_code, _ = self._synthesize_with(
-                    teacher_prompt,
-                    lambda code, _n=len(_chunk): self._validate_teacher_labels(
-                        code, _n, action_registry
-                    ),
-                )
-                labels += ast.literal_eval(
-                    next(
-                        node.value
-                        for node in ast.parse(labels_code).body
-                        if isinstance(node, (ast.Assign, ast.AnnAssign))
-                    )
-                )
-            action_keys = list(action_registry)
-            true_indices = [action_keys.index(label) for label in labels]
-
-            # Fold hygiene: with distill/optimize, teacher-labeled records are
-            # split so training, judging (model/label search), and calibration
-            # never share data. Without them, judging and calibration use all
-            # records (back-compatible).
-            if distill or optimize:
-                from . import distill as distill_mod
-
-                train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
-                    range(len(records))
-                )
-            else:
-                train_ix, measure_ix, calib_ix = [], list(range(len(records))), list(
-                    range(len(records))
-                )
-            records_measure = [records[i] for i in measure_ix]
-            true_measure = [true_indices[i] for i in measure_ix]
-            records_calib = [records[i] for i in calib_ix]
-            labels_calib = [labels[i] for i in calib_ix]
-            # Set when the fine-tune tier wins: its calibrate-fold softmax rows
-            # (aligned to calib_ix) feed the conformal/policy fit directly, so
-            # calibration never has to re-run a torch-only adapter at compile.
-            _ft_calibrate_dist: Optional[List[List[float]]] = None
-
-            if measure_labels:
-                winner, winner_labels, scores = self._measure_labelings(
-                    source, records_measure, true_measure, action_registry, question, goal
-                )
-                label_search = {"scores": scores, "winner": winner}
-                if winner != "synthesized":
-                    override = (
-                        "\n\n# Measured label search winner "
-                        "(overrides synthesized labels)\n"
-                        f"ROUTING_LABELS = {winner_labels!r}"
-                    )
-                    candidate_code = final_code + override
-                    candidate_source = self._assemble(
-                        schema, goal, dict(action_registry), candidate_code, question
-                    )
-                    golden_error = (
-                        self._test_golden_pipeline(candidate_source, golden)
-                        if golden
-                        else None
-                    )
-                    if golden_error:
-                        # Goldens are a regression gate: a measured winner that
-                        # breaks them is rejected, keeping the synthesized labels.
-                        label_search["winner_rejected_by_golden"] = True
-                        label_search["winner"] = "synthesized"
-                    else:
-                        final_code = candidate_code
-                        source = candidate_source
-
-            if distill or optimize:
-                from . import distill as distill_mod
-
-                module = self._load_candidate_module(source)
-                try:
-                    contexts = [
-                        module.route_context(dict(record)) for record in records
-                    ]
-                    routing_question = question or (
-                        f"Which execution path best achieves the goal: {goal}?"
-                    )
-                    router = module._RuntimeRouter()
-                    zero_shot_correct = 0
-                    for i in measure_ix:
-                        decision = router.select(
-                            contexts[i], routing_question, module._ROUTING_OPTIONS
-                        )
-                        if decision.index == true_indices[i]:
-                            zero_shot_correct += 1
-                finally:
-                    import sys as _sys
-
-                    _sys.modules.pop("strot_golden_gate", None)
-                zero_shot_acc = round(zero_shot_correct / len(measure_ix), 4)
-
-                model_search = {
-                    "zero_shot": zero_shot_acc,
-                    "n_train": len(train_ix),
-                    "n_measure": len(measure_ix),
-                    "winner": "zero_shot",
-                }
-                # The frozen tier's best measure accuracy and the code/runtime
-                # that realizes it. The distilled head (if trained) competes
-                # against zero-shot; whichever wins is the frozen baseline the
-                # fine-tune tier must then beat to escalate.
-                frozen_acc = zero_shot_acc
-
-                if distill:
-                    checkpoint = self._resolve_compile_checkpoint()
-                    embed = distill_mod.make_encoder_embedder(checkpoint)
-                    vectors = embed([contexts[i] for i in train_ix + measure_ix])
-                    train_vectors = vectors[: len(train_ix)]
-                    measure_vectors = vectors[len(train_ix):]
-                    head_w, head_b = distill_mod.train_head(
-                        train_vectors,
-                        [true_indices[i] for i in train_ix],
-                        n_classes=len(action_keys),
-                    )
-                    distilled_acc = distill_mod.head_accuracy(
-                        measure_vectors, true_measure, head_w, head_b
-                    )
-                    model_search["distilled"] = distilled_acc
-                    if distilled_acc > zero_shot_acc:
-                        model_search["winner"] = "distilled"
-                        # Drift/OOD guard: per-class centroids + a high
-                        # percentile of in-distribution nearest-centroid
-                        # distances, fit on the train-fold frozen embeddings
-                        # (same encoder the distilled runtime serves with). Only
-                        # fitted/baked when optimize=True, so a plain
-                        # optimize=False distilled compile keeps its old runtime
-                        # abstention behaviour (no OOD gate; the baked OOD literal
-                        # is empty, which the template treats as a no-op).
-                        candidate_ood: Optional[Dict[str, Any]] = None
-                        if optimize:
-                            from . import router as router_mod
-
-                            centroids = router_mod.class_centroids(
-                                train_vectors,
-                                [true_indices[i] for i in train_ix],
-                                n_classes=len(action_keys),
-                            )
-                            threshold = router_mod.ood_threshold(
-                                train_vectors, centroids, percentile=0.95
-                            )
-                            candidate_ood = {
-                                "centroids": centroids, "threshold": threshold,
-                                "percentile": 0.95, "basis": "distilled_frozen_encoder",
-                            }
-                        head_code = (
-                            "\n\n# Compile-time-distilled head (train fold only)\n"
-                            f"HEAD_WEIGHTS = {head_w!r}\n"
-                            f"HEAD_BIAS = {head_b!r}"
-                        )
-                        candidate_code = final_code + head_code
-                        candidate_source = self._assemble(
-                            schema, goal, dict(action_registry), candidate_code,
-                            question, runtime="distilled", ood=candidate_ood,
-                        )
-                        golden_error = (
-                            self._test_golden_pipeline(candidate_source, golden)
-                            if golden
-                            else None
-                        )
-                        if golden_error:
-                            model_search["winner_rejected_by_golden"] = True
-                            model_search["winner"] = "zero_shot"
-                        else:
-                            final_code = candidate_code
-                            source = candidate_source
-                            runtime_override = "distilled"
-                            frozen_acc = distilled_acc
-                            ood_artifact = candidate_ood
-                            if candidate_ood is not None:
-                                model_search["ood_threshold"] = candidate_ood["threshold"]
-
-                # --- Fine-tune escalation: only on a measured gap to a target ---
-                # Adaptive, not maximal: escalate only when a target_accuracy is
-                # set and the frozen tier misses it on the real measure fold. No
-                # target -> the frozen tier stays (no fine-tune); a target the
-                # frozen tier already clears -> no fine-tune either.
-                if optimize:
-                    frozen_bar = target_accuracy
-                    if frozen_bar is None:
-                        model_search["optimize"] = "skipped_no_target"
-                    elif frozen_acc >= frozen_bar:
-                        model_search["optimize"] = "skipped_frozen_cleared_bar"
-                    else:
-                        from . import finetune as finetune_mod
-
-                        # Shared adoption: bake a battery's adapters, golden-gate
-                        # it, and (on promotion) mutate the enclosing state. Both
-                        # the reuse and train paths use the same promotion so an
-                        # adopted battery is served like a trained one.
-                        def _adopt_battery(battery_result: Any) -> bool:
-                            nonlocal final_code, source, runtime_override
-                            nonlocal frozen_acc, _ft_calibrate_dist
-                            adapter_code = (
-                                "\n\n# Compile-time fine-tuned adapter battery "
-                                "(cached-lower + top-N LoRA; train fold only; "
-                                "softmax-averaged ensemble)\n"
-                                f"ADAPTER = {battery_result.adapters!r}\n"
-                                f"ADAPTER_CONFIG = {battery_result.config!r}"
-                            )
-                            candidate_code = final_code + adapter_code
-                            candidate_source = self._assemble(
-                                schema, goal, dict(action_registry),
-                                candidate_code, question, runtime="fine_tuned",
-                            )
-                            golden_error = (
-                                self._test_golden_pipeline(candidate_source, golden)
-                                if golden
-                                else None
-                            )
-                            if golden_error:
-                                model_search["winner_rejected_by_golden"] = True
-                                return False
-                            final_code = candidate_code
-                            source = candidate_source
-                            runtime_override = "fine_tuned"
-                            frozen_acc = battery_result.measure_accuracy
-                            model_search["winner"] = "fine_tuned"
-                            # The winner's calibrate-fold distributions feed the
-                            # conformal/policy fit downstream. They are scored on
-                            # this task's calibrate fold (never reused from an old
-                            # battery), so calibration is always re-fit on this
-                            # data.
-                            _ft_calibrate_dist = battery_result.calibrate_distributions
-                            return True
-
-                        # --- Adopt-or-train: find/reuse a pre-built battery
-                        # before training. A provided battery is validated on this
-                        # task's real measure fold only (no training); if it clears
-                        # the bar and beats the frozen baseline it is adopted and
-                        # training is skipped. A validation miss (or a missing
-                        # [finetune] extra) falls through to training, never fatal.
-                        reused = False
-                        if reuse_adapter is not None:
-                            try:
-                                reuse_result = finetune_mod.validate_adapter(
-                                    contexts,
-                                    true_indices,
-                                    n_classes=len(action_keys),
-                                    measure=measure_ix,
-                                    calibrate=calib_ix,
-                                    adapters=reuse_adapter["adapters"],
-                                    config=reuse_adapter["config"],
-                                )
-                            except RouterConfigurationError as exc:
-                                # Missing [finetune] extra: can't validate the
-                                # provided battery; record and fall through.
-                                model_search["optimize_reuse"] = "unavailable"
-                                model_search["optimize_reuse_error"] = str(exc)[:300]
-                                reuse_result = None
-                            if reuse_result is not None:
-                                reused_acc = reuse_result.measure_accuracy
-                                model_search["reused_measure_accuracy"] = reused_acc
-                                if (
-                                    reused_acc >= frozen_bar
-                                    and reused_acc > frozen_acc
-                                    and _adopt_battery(reuse_result)
-                                ):
-                                    model_search["optimize"] = "reused"
-                                    model_search["ensemble_size"] = len(
-                                        reuse_result.adapters
-                                    )
-                                    reused = True
-                                else:
-                                    # Validated but did not clear the bar / lost
-                                    # the golden gate: train normally.
-                                    model_search["optimize_reuse"] = "rejected"
-
-                        if not reused:
-                            try:
-                                # Ensemble escalation: train K diverse adapters
-                                # and judge on their member-averaged
-                                # distributions (the same average serving
-                                # computes). K is an internal knob
-                                # (FineTuneConfig.ensemble_size); the public API
-                                # exposes only `optimize`.
-                                ft_result = finetune_mod.finetune_ensemble(
-                                    contexts,
-                                    true_indices,
-                                    n_classes=len(action_keys),
-                                    measure=measure_ix,
-                                    calibrate=calib_ix,
-                                    train=train_ix,
-                                )
-                            except RouterConfigurationError as exc:
-                                # Missing [finetune] extra: degrade to the frozen
-                                # tier, record why, never crash the compile.
-                                model_search["fine_tuned"] = None
-                                model_search["optimize"] = "unavailable"
-                                model_search["optimize_error"] = str(exc)[:300]
-                                ft_result = None
-                            if ft_result is not None:
-                                finetuned_acc = ft_result.measure_accuracy
-                                model_search["fine_tuned"] = finetuned_acc
-                                model_search["ensemble_size"] = len(ft_result.adapters)
-                                model_search["member_accuracies"] = (
-                                    ft_result.member_accuracies
-                                )
-                                if finetuned_acc > frozen_acc:
-                                    _adopt_battery(ft_result)
-
-            if target_risk is not None:
-                if _ft_calibrate_dist is not None:
-                    # Fine-tune tier won: calibrate on its own calibrate-fold
-                    # distributions (no torch re-run of the adapter needed).
-                    from . import calibrate as calibrate_mod
-
-                    true_calib = [true_indices[i] for i in calib_ix]
-                    calibration = calibrate_mod.fit_split_calibration(
-                        _ft_calibrate_dist, true_calib, alpha=target_risk
-                    )
-                else:
-                    calibration = self._fit_calibration(
-                        source, records_calib, labels_calib, action_registry,
-                        question, goal, target_risk,
-                    )
-                source = self._assemble(
-                    schema,
-                    goal,
-                    dict(action_registry),
-                    final_code,
-                    question,
-                    temperature=float(calibration["temperature"]),
-                    conformal_q=float(calibration["conformal_quantile"]),
-                    calibration=calibration,
-                    runtime=runtime_override,
-                    ood=ood_artifact,
-                )
-                if golden:
-                    error = self._test_golden_pipeline(source, golden)
-                    if error:
-                        raise CompilationError(
-                            "Calibrated artifact no longer satisfies the golden "
-                            f"records at target_risk={target_risk} (the conformal "
-                            "gate abstains on them). Relax target_risk or revisit "
-                            f"the goldens:\n{error}",
-                            attempts=attempts,
-                            last_error=error,
-                        )
-
-            if target_accuracy is not None:
-                from . import calibrate as calibrate_mod
-
-                true_calib = [
-                    action_keys.index(label) for label in labels_calib
-                ]
-                if _ft_calibrate_dist is not None:
-                    dists = _ft_calibrate_dist  # fine-tune tier's own rows
-                else:
-                    dists = self._collect_distributions(
-                        source, records_calib, action_registry, question, goal
-                    )
-                # Fold hygiene inside the policy fit: corrections on half A,
-                # the dispatch cutoff on disjoint half B.
-                a_d, a_t = dists[0::2], true_calib[0::2]
-                b_d, b_t = dists[1::2], true_calib[1::2]
-                if not b_d:
-                    a_d, a_t, b_d, b_t = dists, true_calib, dists, true_calib
-                temperature = (
-                    calibrate_mod.fit_temperature(a_d, a_t) if len(a_d) >= 4 else 1.0
-                )
-                class_bias = (
-                    calibrate_mod.fit_class_bias(a_d, a_t, temperature)
-                    if len(a_d) >= 4
-                    else None
-                )
-                corrected = [
-                    calibrate_mod.apply_correction(d, temperature, class_bias)
-                    for d in b_d
-                ]
-                confidences = [max(p) for p in corrected]
-                correct_flags = [
-                    max(range(len(p)), key=p.__getitem__) == t
-                    for p, t in zip(corrected, b_t)
-                ]
-                cutoff = calibrate_mod.selective_cutoff(
-                    confidences, correct_flags, target_accuracy
-                )
-                kept = [
-                    ok for conf, ok in zip(confidences, correct_flags)
-                    if cutoff is not None and conf >= cutoff
-                ]
-                policy = {
-                    "target_accuracy": target_accuracy,
-                    "temperature": temperature,
-                    "class_bias": class_bias,
-                    "dispatch_cutoff": cutoff,
-                    "n_fit": len(a_d),
-                    "n_cutoff_fold": len(b_d),
-                    "tier1_coverage_est": (
-                        round(len(kept) / len(b_d), 4) if b_d else 0.0
-                    ),
-                    "tier1_accuracy_est": (
-                        round(sum(kept) / len(kept), 4) if kept else None
-                    ),
-                    "note": (
-                        "empirical policy fit on held-out labeled records; "
-                        "NOT a finite-sample guarantee"
-                    ),
-                }
-                source = self._assemble(
-                    schema,
-                    goal,
-                    dict(action_registry),
-                    final_code,
-                    question,
-                    temperature=temperature,
-                    class_bias=class_bias,
-                    dispatch_cutoff=cutoff if cutoff is not None else 1.1,
-                    policy=policy,
-                    runtime=runtime_override,
-                    ood=ood_artifact,
-                )
-                if golden:
-                    error = self._test_golden_pipeline(source, golden)
-                    if error:
-                        raise CompilationError(
-                            "Policy-fitted artifact no longer satisfies the "
-                            f"golden records at target_accuracy={target_accuracy}:"
-                            f"\n{error}",
-                            attempts=attempts,
-                            last_error=error,
-                        )
-            else:
-                policy = None
-
-        if target_risk is None and target_accuracy is None:
-            policy = None
-
-        return CompiledAsset(
-            source=source,
-            nlu_model=self.nlu_model,
-            runtime_kind=runtime_override or self.runtime_kind,
-            goal=goal,
-            schema=schema,
-            attempts=attempts,
-            calibration=calibration,
-            label_search=label_search,
-            model_search=model_search,
-            policy=policy,
-        )
-
     @staticmethod
     def validate_questions_config(questions: Mapping[str, Any]) -> None:
         """Validate a typed-question config before any synthesis."""
@@ -1349,42 +408,248 @@ class StrotCompiler:
             raise RouterConfigurationError("questions must be a non-empty mapping.")
         for name, spec in questions.items():
             if not isinstance(spec, Mapping) or spec.get("type") not in (
-                "boolean", "score", "choice",
+                "predicate", "boolean", "score", "choice",
             ):
                 raise RouterConfigurationError(
-                    f"question {name!r}: type must be 'boolean', 'score', or 'choice'."
+                    f"question {name!r}: type must be 'predicate', 'score', or 'choice' "
+                    "('boolean' is a deprecated alias for 'predicate')."
                 )
             if spec["type"] == "score":
-                minimum, maximum = spec.get("min"), spec.get("max")
-                if (
-                    type(minimum) is not int
-                    or type(maximum) is not int
-                    or not 2 <= (maximum - minimum + 1) <= 20
-                ):
-                    raise RouterConfigurationError(
-                        f"question {name!r}: score needs int min < max spanning "
-                        "2-20 levels (the decision model's option range)."
-                    )
+                StrotCompiler._validate_score_spec(name, spec)
                 if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
                     raise RouterConfigurationError(
                         f"question {name!r}: score requires instructions anchoring the scale."
                     )
-            elif spec["type"] == "boolean":
+            elif spec["type"] in ("predicate", "boolean"):
                 if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
                     raise RouterConfigurationError(
-                        f"question {name!r}: boolean requires instructions."
+                        f"question {name!r}: predicate requires instructions."
                     )
             else:  # choice
-                options = spec.get("options")
-                if (
-                    not isinstance(options, list)
-                    or not 2 <= len(options) <= 20
-                    or len(set(options)) != len(options)
-                    or not all(isinstance(o, str) and o for o in options)
+                StrotCompiler._validate_choice_spec(name, spec)
+
+    @staticmethod
+    def _score_levels(spec: Mapping[str, Any]) -> List["tuple[str, Optional[str]]"]:
+        """Normalize a score spec into ordered ``(label, description)`` levels.
+
+        The ``levels`` key carries ``[{"label": ..., "description": ...}, ...]``
+        (description optional), lowest to highest. The deprecated ``min``/``max``
+        alias synthesizes one level per integer in ``min..max`` (the integers
+        themselves as labels, no descriptions).
+        """
+        levels = spec.get("levels")
+        if levels is not None:
+            return [(str(level["label"]), level.get("description")) for level in levels]
+        minimum, maximum = spec["min"], spec["max"]
+        return [(str(value), None) for value in range(minimum, maximum + 1)]
+
+    @staticmethod
+    def _validate_score_spec(name: str, spec: Mapping[str, Any]) -> None:
+        """Validate a score question: ``levels`` (rich) or ``min``/``max`` (alias)."""
+        levels = spec.get("levels")
+        has_range = spec.get("min") is not None or spec.get("max") is not None
+        if levels is not None and has_range:
+            raise RouterConfigurationError(
+                f"question {name!r}: set either 'levels' or the deprecated "
+                "'min'/'max' alias, not both."
+            )
+        if levels is not None:
+            if not isinstance(levels, list) or not 2 <= len(levels) <= 10:
+                raise RouterConfigurationError(
+                    f"question {name!r}: score needs 2-10 ordered levels."
+                )
+            seen: List[str] = []
+            for level in levels:
+                if not isinstance(level, Mapping) or "label" not in level:
+                    raise RouterConfigurationError(
+                        f"question {name!r}: each level must be a mapping with a "
+                        "'label' (and an optional 'description')."
+                    )
+                label = level["label"]
+                if not isinstance(label, str) or not label.strip():
+                    raise RouterConfigurationError(
+                        f"question {name!r}: level labels must be non-empty strings."
+                    )
+                description = level.get("description")
+                if description is not None and (
+                    not isinstance(description, str) or not description.strip()
                 ):
                     raise RouterConfigurationError(
-                        f"question {name!r}: choice needs 2-20 unique non-empty options."
+                        f"question {name!r}: level 'description' must be a "
+                        "non-empty string when present."
                     )
+                seen.append(label)
+            if len(set(seen)) != len(seen):
+                raise RouterConfigurationError(
+                    f"question {name!r}: level labels must be unique."
+                )
+        else:
+            minimum, maximum = spec.get("min"), spec.get("max")
+            if (
+                type(minimum) is not int
+                or type(maximum) is not int
+                or not 2 <= (maximum - minimum + 1) <= 10
+            ):
+                raise RouterConfigurationError(
+                    f"question {name!r}: score needs 'levels' (2-10 ordered "
+                    "labeled levels) or the deprecated int min < max alias "
+                    "spanning 2-10 levels."
+                )
+
+    @staticmethod
+    def _choice_pairs(spec: Mapping[str, Any]) -> List["tuple[Any, Optional[str]]"]:
+        """Normalize a choice spec into ordered ``(value, description)`` pairs.
+
+        The ``choices`` key carries ``[{"value": ..., "description": ...}, ...]``
+        (description optional). The deprecated ``options`` alias is a bare list
+        of values with no descriptions.
+        """
+        choices = spec.get("choices")
+        if choices is not None:
+            return [(c["value"], c.get("description")) for c in choices]
+        return [(value, None) for value in spec.get("options", [])]
+
+    @staticmethod
+    def _validate_choice_spec(name: str, spec: Mapping[str, Any]) -> None:
+        """Validate a choice question: ``choices`` (rich) or ``options`` (alias)."""
+        choices, options = spec.get("choices"), spec.get("options")
+        if choices is not None and options is not None:
+            raise RouterConfigurationError(
+                f"question {name!r}: set either 'choices' or the deprecated "
+                "'options' alias, not both."
+            )
+        if choices is not None:
+            if not isinstance(choices, list) or not 2 <= len(choices) <= 255:
+                raise RouterConfigurationError(
+                    f"question {name!r}: choice needs 2-255 choices."
+                )
+            values: List[Any] = []
+            for choice in choices:
+                if not isinstance(choice, Mapping) or "value" not in choice:
+                    raise RouterConfigurationError(
+                        f"question {name!r}: each choice must be a mapping with a "
+                        "'value' (and an optional 'description')."
+                    )
+                value = choice["value"]
+                if not isinstance(value, (str, bool)) or (
+                    isinstance(value, str) and not value
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: choice values must be non-empty "
+                        "strings or booleans."
+                    )
+                description = choice.get("description")
+                if description is not None and (
+                    not isinstance(description, str) or not description.strip()
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: choice 'description' must be a "
+                        "non-empty string when present."
+                    )
+                values.append(value)
+        elif options is not None:
+            if (
+                not isinstance(options, list)
+                or not 2 <= len(options) <= 255
+                or not all(isinstance(o, (str, bool)) and o != "" for o in options)
+            ):
+                raise RouterConfigurationError(
+                    f"question {name!r}: choice needs 2-255 unique non-empty "
+                    "values (deprecated 'options' alias)."
+                )
+            values = list(options)
+        else:
+            raise RouterConfigurationError(
+                f"question {name!r}: choice needs 'choices' "
+                "(or the deprecated 'options' alias)."
+            )
+        keyed = [(type(v).__name__, v) for v in values]
+        if len(set(keyed)) != len(keyed):
+            raise RouterConfigurationError(
+                f"question {name!r}: choice values must be unique."
+            )
+
+    @staticmethod
+    def _prompt_config(questions: Mapping[str, Any]) -> Dict[str, Any]:
+        """Config as the synthesizer should see it: score levels always explicit.
+
+        The deprecated score ``min``/``max`` alias is expanded into an ordered
+        ``levels`` list so the synthesizer only ever reasons about labeled
+        levels, never a bare integer range.
+        """
+        shown: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            if spec.get("type") == "score":
+                shown[name] = {
+                    key: value
+                    for key, value in spec.items()
+                    if key not in ("min", "max", "levels")
+                }
+                shown[name]["levels"] = [
+                    {"label": label, **({"description": desc} if desc else {})}
+                    for label, desc in StrotCompiler._score_levels(spec)
+                ]
+            else:
+                shown[name] = dict(spec)
+        return shown
+
+    def build_propose_prompt(self, schema: DatasetSchema, intent: str) -> str:
+        """Intake prompt: propose a typed question set from a one-line intent."""
+        return "\n".join([
+            "You are the STROT intake designer. From a one-line decision intent "
+            "and the dataset schema, propose the SMALL set of typed questions a "
+            "decision model should answer per record. You design the schema - you "
+            "do not write programs and you do not invent data.",
+            "",
+            "## DECISION INTENT",
+            intent,
+            "",
+            "## VERIFIED DATASET SCHEMA",
+            schema.to_json(),
+            "",
+            "## OUTPUT CONTRACT",
+            "Emit exactly one ```python code block containing a single top-level "
+            "`QUESTIONS: Dict[str, Any]` literal and nothing else. Each entry maps a "
+            "short snake_case name to a spec:",
+            '- predicate: {"type": "predicate", "instructions": <one line>}',
+            '- choice:    {"type": "choice", "instructions": <one line>, '
+            '"choices": [{"value": <str|bool>, "description": <short>}...]}',
+            '- score:     {"type": "score", "instructions": <one line>, '
+            '"levels": [{"label": <str>, "description": <short>}...]} '
+            "(2-10 levels, ordered lowest to highest)",
+            "",
+            "Rules: only questions the intent actually needs (prefer few); ground "
+            "options/levels in the schema's fields and vocabulary; no other "
+            "statements.",
+        ])
+
+    def propose_questions(self, sample: Any, intent: str) -> Dict[str, Any]:
+        """Intake: synthesize a typed question set from a one-line intent.
+
+        Returns a validated ``questions`` config for the author to review and
+        edit before :meth:`compile_decide`. The LLM designs the decision schema
+        here; it does not train or invent data.
+        """
+        schema = introspect_schema(sample)
+        prompt = self.build_propose_prompt(schema, intent)
+        promoted: Dict[str, Any] = {}
+
+        def validate(code: str) -> Optional[str]:
+            try:
+                questions = self._literal_assignment(code, "QUESTIONS")
+            except Exception as exc:
+                return f"QUESTIONS must be a single top-level literal dict: {exc}"
+            if not isinstance(questions, dict) or not questions:
+                return "QUESTIONS must be a non-empty dict."
+            try:
+                self.validate_questions_config(questions)
+            except RouterConfigurationError as exc:
+                return str(exc)
+            promoted["questions"] = questions
+            return None
+
+        self._synthesize_with(prompt, validate)
+        return promoted["questions"]
 
     def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
         """Construct the decide-mode prompt: expand a typed-question config for the model."""
@@ -1398,7 +663,7 @@ class StrotCompiler:
                 schema.to_json(),
                 "",
                 "## DECISION CONFIG (typed questions)",
-                json.dumps(questions, indent=2),
+                json.dumps(self._prompt_config(questions), indent=2),
                 "",
                 "## OUTPUT CONTRACT",
                 "Emit exactly one ```python code block containing EXACTLY two "
@@ -1406,14 +671,18 @@ class StrotCompiler:
                 "- `QUESTIONS: Dict[str, Any]` literal with the SAME question "
                 "names. Per question: keep \"type\" and \"instructions\" (write "
                 "crisp instructions if the config omits them). For 'choice' add "
-                "\"criteria\": a dict mapping EVERY option (exact strings) to a "
-                "short discriminative description using vocabulary from the "
-                "records. For 'score' add \"min\" (copy the config int) and "
-                "\"rubric\": a list of exactly (max - min + 1) short level "
-                "labels, in order from min to max, grounded in the "
-                "instructions' anchors. For 'boolean' add \"criteria\": "
-                "{\"false\": <short negative-case description>, \"true\": "
-                "<short positive-case description>}.",
+                "\"criteria\": a dict mapping EVERY choice value (exact, as given "
+                "in the config - keep booleans as booleans) to a short "
+                "discriminative description using vocabulary from the records; "
+                "sharpen each config 'description' where present. For 'score' add "
+                "\"rubric\": a list of {\"label\": <config level label, exact>, "
+                "\"description\": <short discriminative description grounded in "
+                "the instructions' anchors and the records' vocabulary>} entries, "
+                "one per config level, in the SAME order the config lists them "
+                "(lowest to highest). For 'predicate' (or the deprecated "
+                "'boolean' alias) add \"criteria\": {\"false\": <short "
+                "negative-case description>, \"true\": <short positive-case "
+                "description>}.",
                 "- `def route_context(record: dict) -> str:` projecting ONLY "
                 "the fields relevant to answering the questions into a compact "
                 "string.",
@@ -1451,29 +720,40 @@ class StrotCompiler:
             if not isinstance(item.get("instructions"), str) or not item["instructions"].strip():
                 return f"question {name!r}: instructions must be a non-empty string"
             if spec["type"] == "choice":
+                values = [value for value, _ in self._choice_pairs(spec)]
                 criteria = item.get("criteria")
-                if not isinstance(criteria, dict) or set(criteria) != set(spec["options"]):
+                if not isinstance(criteria, dict) or set(criteria) != set(values):
                     return (
                         f"question {name!r}: criteria keys must exactly match "
-                        f"the options {spec['options']}"
+                        f"the choice values {values}"
                     )
                 if not all(isinstance(v, str) and v.strip() for v in criteria.values()):
                     return f"question {name!r}: criteria descriptions must be non-empty strings"
             elif spec["type"] == "score":
-                expected_len = spec["max"] - spec["min"] + 1
+                labels = [label for label, _ in self._score_levels(spec)]
                 rubric = item.get("rubric")
-                if item.get("min") != spec["min"]:
-                    return f"question {name!r}: min must equal {spec['min']}"
-                if (
-                    not isinstance(rubric, list)
-                    or len(rubric) != expected_len
-                    or not all(isinstance(v, str) and v.strip() for v in rubric)
-                ):
+                if not isinstance(rubric, list) or len(rubric) != len(labels):
                     return (
                         f"question {name!r}: rubric must be a list of exactly "
-                        f"{expected_len} non-empty level labels"
+                        f"{len(labels)} ordered levels (one per config level)"
                     )
-            else:  # boolean
+                for level, label in zip(rubric, labels):
+                    if (
+                        not isinstance(level, dict)
+                        or str(level.get("label")) != label
+                    ):
+                        return (
+                            f"question {name!r}: each rubric level must be a "
+                            "mapping whose 'label' matches the config levels, in "
+                            f"order: {labels}"
+                        )
+                    description = level.get("description")
+                    if not isinstance(description, str) or not description.strip():
+                        return (
+                            f"question {name!r}: each rubric level needs a "
+                            "non-empty 'description'"
+                        )
+            else:  # predicate (or the deprecated boolean alias)
                 criteria = item.get("criteria")
                 if not isinstance(criteria, dict) or set(criteria) != {"false", "true"}:
                     return (
@@ -1503,24 +783,22 @@ class StrotCompiler:
                     raise RouterConfigurationError(
                         f"golden[{i}]: unknown question {qname!r}."
                     )
-                if spec["type"] == "choice" and expected not in spec["options"]:
+                if spec["type"] == "choice":
+                    values = [value for value, _ in StrotCompiler._choice_pairs(spec)]
+                    if expected not in values:
+                        raise RouterConfigurationError(
+                            f"golden[{i}].{qname}: expected must be one of {values}."
+                        )
+                if spec["type"] in ("predicate", "boolean") and not isinstance(expected, bool):
                     raise RouterConfigurationError(
-                        f"golden[{i}].{qname}: expected must be one of {spec['options']}."
-                    )
-                if spec["type"] == "boolean" and not isinstance(expected, bool):
-                    raise RouterConfigurationError(
-                        f"golden[{i}].{qname}: boolean expectation must be true/false."
+                        f"golden[{i}].{qname}: predicate expectation must be true/false."
                     )
                 if spec["type"] == "score":
-                    is_range = (
-                        isinstance(expected, (list, tuple))
-                        and len(expected) == 2
-                        and all(isinstance(v, (int, float)) for v in expected)
-                    )
-                    if not is_range and not isinstance(expected, (int, float)):
+                    labels = [label for label, _ in StrotCompiler._score_levels(spec)]
+                    if expected not in labels:
                         raise RouterConfigurationError(
-                            f"golden[{i}].{qname}: score expectation must be a "
-                            "number or [low, high] range."
+                            f"golden[{i}].{qname}: score expectation must be one "
+                            f"of the level labels {labels}."
                         )
 
     def _test_golden_decider(
@@ -1544,29 +822,23 @@ class StrotCompiler:
             for qname, expected in case["expect"].items():
                 qtype = questions[qname]["type"]
                 if qtype == "choice":
-                    got = decision["choices"][qname]["selected"]
+                    got = decision["choices"][qname]["choice"]
                     if got != expected:
                         failures.append(
-                            f"golden[{i}].{qname}: selected {got!r}, expected {expected!r}"
+                            f"golden[{i}].{qname}: chose {got!r}, expected {expected!r}"
                         )
-                elif qtype == "boolean":
-                    p = decision["booleans"][qname]["probability"]
+                elif qtype in ("predicate", "boolean"):
+                    p = decision["predicates"][qname]["probability"]
                     if (p >= 0.5) != expected:
                         failures.append(
                             f"golden[{i}].{qname}: probability={p:.2f}, expected "
                             f"{'true' if expected else 'false'}"
                         )
                 else:  # score
-                    value = decision["scores"][qname]["value"]
-                    low, high = (
-                        expected
-                        if isinstance(expected, (list, tuple))
-                        else (expected - 0.5, expected + 0.5)
-                    )
-                    if not low <= value <= high:
+                    got = decision["scores"][qname]["score"]
+                    if got != expected:
                         failures.append(
-                            f"golden[{i}].{qname}: value={value}, expected "
-                            f"within [{low}, {high}]"
+                            f"golden[{i}].{qname}: scored {got!r}, expected {expected!r}"
                         )
         sys.modules.pop("strot_golden_gate", None)
         if failures:
@@ -1577,61 +849,401 @@ class StrotCompiler:
             )
         return None
 
+    @staticmethod
+    def _question_runtime(spec: Mapping[str, Any]) -> "tuple[str, List[Any]]":
+        """``(base_type, ordered classes)`` for a question's distilled head.
+
+        predicate -> ``[False, True]`` (the head reports P(true)); choice -> the
+        choice values in order; score -> the ordered level labels.
+        """
+        qtype = spec["type"]
+        if qtype in ("predicate", "boolean"):
+            return "predicate", [False, True]
+        if qtype == "choice":
+            return "choice", [value for value, _ in StrotCompiler._choice_pairs(spec)]
+        return "score", [label for label, _ in StrotCompiler._score_levels(spec)]
+
+    @staticmethod
+    def _literal_assignment(code: str, name: str) -> Any:
+        """Literal-eval the value of a top-level ``name = ...`` assignment."""
+        for node in ast.parse(code).body:
+            target = None
+            if isinstance(node, ast.Assign) and node.targets:
+                target = getattr(node.targets[0], "id", None)
+            elif isinstance(node, ast.AnnAssign):
+                target = getattr(node.target, "id", None)
+            if target == name:
+                return ast.literal_eval(node.value)
+        raise ValueError(f"no top-level {name!r} assignment")
+
+    def build_decide_teacher_prompt(
+        self, questions: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
+    ) -> str:
+        """Ask the teacher LLM to answer every question for every record - the
+        training labels each per-question head is distilled from."""
+        spec_lines = []
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            allowed = ("true or false" if base == "predicate"
+                       else "exactly one of: " + ", ".join(repr(c) for c in classes))
+            spec_lines.append(
+                f"- {name!r} ({base}): {spec.get('instructions', '')} "
+                f"Answer with {allowed}."
+            )
+        return "\n".join([
+            "You are the STROT teacher. Answer every question for every record "
+            "below - these answers train a small local model, so be accurate and "
+            "internally consistent.",
+            "",
+            "## QUESTIONS",
+            "\n".join(spec_lines),
+            "",
+            "## RECORDS",
+            json.dumps([dict(r) for r in records], indent=2, default=str),
+            "",
+            "## OUTPUT CONTRACT",
+            "Emit exactly one ```python code block with a single top-level "
+            "definition and nothing else:",
+            f"- `ANSWERS: list` of EXACTLY {len(records)} dicts, one per record "
+            "in the SAME order. Each dict maps EVERY question name to that "
+            "record's answer: predicate -> a Python bool (True/False); choice -> "
+            "exactly one allowed value (keep booleans as booleans); score -> "
+            "exactly one allowed level label (a string).",
+        ])
+
+    def _validate_decide_labels(
+        self, code: str, n: int, questions: Mapping[str, Any]
+    ) -> Optional[str]:
+        try:
+            answers = self._literal_assignment(code, "ANSWERS")
+        except Exception as exc:
+            return f"ANSWERS must be a single literal list assignment: {exc}"
+        if not isinstance(answers, list) or len(answers) != n:
+            got = len(answers) if isinstance(answers, list) else "a non-list"
+            return f"ANSWERS must have exactly {n} entries (got {got})."
+        for i, row in enumerate(answers):
+            if not isinstance(row, dict):
+                return f"ANSWERS[{i}] must be a dict."
+            for name, spec in questions.items():
+                if name not in row:
+                    return f"ANSWERS[{i}] is missing question {name!r}."
+                base, classes = self._question_runtime(spec)
+                value = row[name]
+                if base == "predicate" and not isinstance(value, bool):
+                    return f"ANSWERS[{i}][{name!r}] must be a bool."
+                if base != "predicate" and value not in classes:
+                    return (
+                        f"ANSWERS[{i}][{name!r}]={value!r} is not an allowed "
+                        f"{base} answer."
+                    )
+        return None
+
+    @staticmethod
+    def _l2norm(vec: Sequence[float]) -> List[float]:
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]
+
+    @staticmethod
+    def _lite_prototype_text(label: Any, description: Optional[str]) -> str:
+        """The text STROT embeds as a class's zero-shot prototype."""
+        if description:
+            return f"{label}: {description}"
+        return str(label)
+
+    def _lite_heads(self, questions: Mapping[str, Any]) -> Dict[str, Any]:
+        """Zero-shot ``lite`` heads: a prototype embedding per class, no training.
+
+        Each class becomes an L2-normalized prototype embedding of its
+        description; at runtime the record's embedding is scored against them
+        (the same linear ``weights @ x`` runtime as a trained head, so cosine
+        nearest-prototype). A predicate uses ``[-proto, +proto]`` so the two
+        logits are a sigmoid around the statement direction. No teacher labels,
+        no fold split - just the frozen encoder and the config's own text.
+        """
+        from . import distill as distill_mod
+
+        embedder = distill_mod.make_encoder_embedder(self._resolve_compile_checkpoint())
+        heads: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            if base == "predicate":
+                proto = self._l2norm(embedder([spec["instructions"]])[0])
+                weights = [[-x for x in proto], list(proto)]  # classes [False, True]
+                bias = [0.0, 0.0]
+            else:
+                pairs = (
+                    self._choice_pairs(spec) if base == "choice"
+                    else self._score_levels(spec)
+                )
+                texts = [self._lite_prototype_text(label, desc) for label, desc in pairs]
+                weights = [self._l2norm(v) for v in embedder(texts)]
+                bias = [0.0] * len(classes)
+            heads[name] = {
+                "type": base, "classes": classes,
+                "weights": weights, "bias": bias, "temperature": 1.0,
+            }
+        return heads
+
     def compile_decide(
         self,
         sample: Any,
         questions: Mapping[str, Any],
         golden: Optional[List[Mapping[str, Any]]] = None,
+        mode: str = "head",
     ) -> CompiledAsset:
-        """Decide mode: compile a typed-question decision config.
+        """Decide mode: compile one decision head per typed question.
 
-        The synthesis agent expands the config (criteria descriptions, score
-        rubrics, boolean case descriptions) against the verified schema and
-        writes the state projection; the local decision model answers all
-        questions per record at runtime in one batched pass. With ``golden``,
-        candidates are executed against known-answer records inside the
-        repair loop and only promoted when every expectation holds.
+        ``mode`` picks the tier:
+
+        * ``"lite"`` - zero-shot prototype heads: each class is an embedding of
+          its description, scored by cosine at runtime. No teacher labels, no
+          training; the synthesizer still writes the state projection. The local
+          $0 floor (instant, bring-no-data).
+        * ``"head"`` (default) - the teacher LLM answers every question for every
+          sampled record; a calibrated logistic head per question is trained on
+          the frozen encoder's embeddings and baked in.
+        * ``"deep"`` - a shared top-N LoRA adapter is fine-tuned over all
+          questions, then the heads are refit on the adapted embedding.
+
+        Invariant - **recompile, don't increment**: every compile trains a FRESH
+        head (and, for ``deep``, a fresh adapter) from the frozen base on the
+        current data; it NEVER warm-starts from previously trained weights. A
+        compiled model's weights are a pure function of its own
+        ``(data, questions, mode)`` - independent of what was compiled before.
+        This is what keeps continuous optimization immune to catastrophic
+        forgetting: retraining on accumulated data is a clean re-fit, not a
+        sequential update that could erode earlier quality. Do not add a
+        warm-start-from-prior-weights path without revisiting that guarantee.
+
+        With ``golden``, the baked model is run against known-answer records and
+        rejected if any expectation fails.
         """
+        if mode not in ("lite", "head", "deep"):
+            raise RouterConfigurationError(
+                f"decide mode must be 'lite', 'head', or 'deep' (got {mode!r})."
+            )
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
-                "decide mode currently requires a local decision model "
+                "decide mode requires a local encoder to embed records "
                 f"(got {self.nlu_model!r})."
             )
         self.validate_questions_config(questions)
         if golden is not None:
             self.validate_golden_decide(golden, questions)
         schema = introspect_schema(sample)
+        records = list(sample)
+        from . import distill as distill_mod
+
+        if mode == "head" and len(records) < distill_mod.MIN_DISTILL_RECORDS:
+            raise RouterConfigurationError(
+                f"decide needs at least {distill_mod.MIN_DISTILL_RECORDS} sample "
+                f"records to distill its heads (got {len(records)}); raise "
+                "sample_size."
+            )
+        if mode == "deep":
+            from . import finetune as finetune_mod
+
+            if len(records) < finetune_mod.MIN_FINETUNE_RECORDS:
+                raise RouterConfigurationError(
+                    f"decide mode='deep' needs at least "
+                    f"{finetune_mod.MIN_FINETUNE_RECORDS} records to fine-tune the "
+                    f"shared adapter (got {len(records)}); raise sample_size or use "
+                    "mode='head'."
+                )
+
+        # 1. Synthesize the state projection (route_context). The decide prompt
+        # also expands criteria/rubrics; the heads learn from labels rather than
+        # criteria, so only route_context is used - the block is kept in the
+        # baked model as a record of the synthesis.
         prompt = self.build_decide_prompt(schema, questions)
-        header = templates.DECIDE_HEADER_TEMPLATE.format(
-            nlu_model=self.nlu_model,
-            schema_literal=repr(schema.to_dict()),
-            config_literal=repr(dict(questions)),
-        )
         promoted: Dict[str, str] = {}
 
         def validate(code: str) -> Optional[str]:
             error = self._validate_decide_candidate(code, questions)
             if error:
                 return error
-            source = (
-                "\n\n".join(
-                    [header, templates.DECIDE_FOOTER_TEMPLATE.format(generated_paths=code)]
-                )
-                + "\n"
-            )
-            try:
-                ast.parse(source)
-            except SyntaxError as exc:  # template regression guard
-                return f"Assembled decision asset failed syntax validation: {exc}"
-            if golden:
-                error = self._test_golden_decider(source, golden, questions)
-                if error:
-                    return error
-            promoted["source"] = source
+            promoted["code"] = code
             return None
 
         _, attempts = self._synthesize_with(prompt, validate)
-        source = promoted["source"]
+        code = promoted["code"]
+
+        if mode == "lite":
+            # Zero-shot tier: prototype heads from the config's own text, no
+            # teacher pass and no training. The projection above is still baked.
+            question_heads = self._lite_heads(questions)
+            return self._bake_decider(
+                question_heads, code, schema, questions, golden, attempts,
+                winner="lite",
+            )
+
+        ns: Dict[str, Any] = {}
+        exec(compile(code, "<decide-projection>", "exec"), ns)
+        contexts = [ns["route_context"](dict(record)) for record in records]
+
+        # 2. Teacher labels: every question answered for every record.
+        from . import pii
+
+        masked = pii.mask_records(records, maskers=pii.default_maskers())
+        labels_code, _ = self._synthesize_with(
+            self.build_decide_teacher_prompt(questions, masked),
+            lambda c: self._validate_decide_labels(c, len(records), questions),
+        )
+        answers = self._literal_assignment(labels_code, "ANSWERS")
+
+        # Coverage guard: a head can only learn an outcome it has seen. Warn on
+        # thin classes so the author brings records covering each outcome
+        # (bring-your-own-data; a logistic head needs only a few per class).
+        import warnings
+
+        for name, spec in questions.items():
+            _, classes = self._question_runtime(spec)
+            counts: Dict[Any, int] = {}
+            for row in answers:
+                counts[row[name]] = counts.get(row[name], 0) + 1
+            thin = [c for c in classes if counts.get(c, 0) < MIN_CLASS_RECORDS]
+            if thin:
+                warnings.warn(
+                    f"decide: question {name!r} has thin coverage for {thin} "
+                    f"(<{MIN_CLASS_RECORDS} labeled records each); the head will "
+                    "under-learn these outcomes. Bring more records covering them.",
+                    stacklevel=2,
+                )
+
+        # Fold hygiene: each head trains on one fold; its temperature is fit on a
+        # disjoint fold so the baked confidence is honest, not overfit. (For deep,
+        # the shared adapter also trains on the train fold only.)
+        from . import calibrate as calibrate_mod
+
+        train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
+            list(range(len(records)))
+        )
+        fit_ix = train_ix + measure_ix
+
+        # 3. Per-record embeddings shared by every head. head/lite use the frozen
+        # encoder; deep adapts a shared top-N LoRA to the domain first and refits
+        # the heads on the adapted embedding (one forward pass per record).
+        adapter: Optional[Dict[str, Any]] = None
+        adapter_config: Optional[Dict[str, Any]] = None
+        if mode == "deep":
+            from . import finetune as finetune_mod
+
+            q_labels: Dict[str, List[int]] = {}
+            q_classes: Dict[str, int] = {}
+            for name, spec in questions.items():
+                _, classes = self._question_runtime(spec)
+                q_labels[name] = [
+                    classes.index(answers[i][name]) for i in range(len(records))
+                ]
+                q_classes[name] = len(classes)
+            adapt = finetune_mod.finetune_decide(
+                contexts, q_labels, q_classes, train=train_ix,
+            )
+            vectors = adapt.vectors
+            adapter, adapter_config = adapt.adapter, adapt.config
+        else:
+            vectors = distill_mod.make_encoder_embedder(
+                self._resolve_compile_checkpoint()
+            )(contexts)
+
+        # 4. One calibrated logistic head per question.
+        question_heads: Dict[str, Any] = {}
+        for name, spec in questions.items():
+            base, classes = self._question_runtime(spec)
+            y = [classes.index(answers[i][name]) for i in range(len(records))]
+            head_w, head_b = distill_mod.train_head(
+                [vectors[i] for i in fit_ix], [y[i] for i in fit_ix],
+                n_classes=len(classes),
+            )
+            calib_logits = [
+                [sum(w * x for w, x in zip(row, vectors[i])) + b
+                 for row, b in zip(head_w, head_b)]
+                for i in calib_ix
+            ]
+            temperature = (
+                calibrate_mod.fit_temperature_logits(
+                    calib_logits, [y[i] for i in calib_ix]
+                )
+                if len(calib_ix) >= 4 else 1.0
+            )
+            question_heads[name] = {
+                "type": base, "classes": classes,
+                "weights": head_w, "bias": head_b, "temperature": temperature,
+            }
+
+        # 4b. Drift / OOD guard (head + deep): per-class centroids + a distance
+        # threshold on the training embeddings, so the runtime refuses records
+        # unlike anything seen rather than answering them. Centroids use the
+        # finest-grained question's labels; the gate is always on (conservative
+        # 0.99 percentile). lite has no record embeddings, so it has no gate.
+        ood: Optional[Dict[str, Any]] = None
+        if vectors:
+            ood_q = max(
+                questions, key=lambda q: len(self._question_runtime(questions[q])[1])
+            )
+            _, ood_classes = self._question_runtime(questions[ood_q])
+            ood_labels = [ood_classes.index(answers[i][ood_q]) for i in range(len(records))]
+            centroids = distill_mod.class_centroids(
+                vectors, ood_labels, n_classes=len(ood_classes)
+            )
+            ood = {
+                "centroids": centroids,
+                "threshold": distill_mod.ood_threshold(vectors, centroids, percentile=0.99),
+                "percentile": 0.99, "basis": ood_q,
+            }
+
+        # 5. Bake the decision model.
+        return self._bake_decider(
+            question_heads, code, schema, questions, golden, attempts,
+            winner=("fine_tuned" if mode == "deep" else "distilled"),
+            n_records=len(records), adapter=adapter, adapter_config=adapter_config,
+            ood=ood,
+        )
+
+    def _bake_decider(
+        self,
+        question_heads: Dict[str, Any],
+        code: str,
+        schema: DatasetSchema,
+        questions: Mapping[str, Any],
+        golden: Optional[List[Mapping[str, Any]]],
+        attempts: int,
+        winner: str,
+        n_records: Optional[int] = None,
+        adapter: Optional[Dict[str, Any]] = None,
+        adapter_config: Optional[Dict[str, Any]] = None,
+        ood: Optional[Dict[str, Any]] = None,
+    ) -> CompiledAsset:
+        """Bake baked heads + projection into a self-contained decider asset.
+
+        Shared by all tiers - they differ only in how ``question_heads`` was
+        fitted. ``lite``/``head`` embed with the frozen encoder; ``deep`` passes
+        an ``adapter`` and bakes the LoRA-adapted runtime instead. ``ood`` (when
+        fitted) bakes the drift gate; an empty literal is a runtime no-op.
+        """
+        header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
+            nlu_model=self.nlu_model,
+            schema_literal=repr(schema.to_dict()),
+            config_literal=repr(dict(questions)),
+        )
+        heads_literal = "QUESTION_HEADS: Dict[str, Any] = " + repr(question_heads)
+        ood_literal = "OOD: Dict[str, Any] = " + repr(ood or {})
+        parts = [header, code, heads_literal, ood_literal]
+        if adapter is not None:
+            parts.append("ADAPTER: Dict[str, Any] = " + repr(adapter))
+            parts.append("ADAPTER_CONFIG: Dict[str, Any] = " + repr(adapter_config))
+            parts.append(templates.DECIDE_FINETUNED_RUNTIME_TEMPLATE.format())
+        else:
+            parts.append(templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format())
+        source = "\n\n".join(parts) + "\n"
+        if golden:
+            error = self._test_golden_decider(source, golden, questions)
+            if error:
+                raise CompilationError(
+                    "Decision model does not satisfy the golden "
+                    f"records:\n{error}",
+                    attempts=attempts, last_error=error,
+                )
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,
@@ -1639,57 +1251,6 @@ class StrotCompiler:
             goal=json.dumps(questions, sort_keys=True),
             schema=schema,
             attempts=attempts,
+            model_search={"winner": winner, "n_records": n_records},
         )
 
-    def _assemble(
-        self,
-        schema: DatasetSchema,
-        goal: str,
-        action_registry: Dict[str, str],
-        generated_paths: str,
-        question: Optional[str],
-        temperature: float = 1.0,
-        conformal_q: Optional[float] = None,
-        calibration: Optional[Dict[str, Any]] = None,
-        runtime: Optional[str] = None,
-        class_bias: Optional[List[float]] = None,
-        dispatch_cutoff: Optional[float] = None,
-        policy: Optional[Dict[str, Any]] = None,
-        ood: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        header = templates.ASSET_HEADER_TEMPLATE.format(
-            nlu_model=self.nlu_model,
-            runtime_kind=runtime or self.runtime_kind,
-            goal=goal,
-            threshold=self.confidence_threshold,
-            temperature=repr(temperature),
-            conformal_q=repr(conformal_q),
-            calibration_literal=repr(calibration or {}),
-            class_bias=repr(class_bias),
-            dispatch_cutoff=repr(dispatch_cutoff),
-            policy_literal=repr(policy or {}),
-            ood_literal=repr(ood or {}),
-            schema_literal=repr(schema.to_dict()),
-        )
-        if runtime == "distilled":
-            runtime_template = templates.DISTILLED_RUNTIME_TEMPLATE
-        elif runtime == "fine_tuned":
-            runtime_template = templates.FINETUNED_RUNTIME_TEMPLATE
-        elif self.runtime_kind == "hosted":
-            runtime_template = templates.HOSTED_RUNTIME_TEMPLATE
-        else:
-            runtime_template = templates.LOCAL_RUNTIME_TEMPLATE
-        runtime = runtime_template.format(nlu_model=self.nlu_model)
-        handlers_literal = (
-            "{"
-            + ", ".join(f"{key!r}: {handler_name(key)}" for key in action_registry)
-            + "}"
-        )
-        footer = templates.ASSET_FOOTER_TEMPLATE.format(
-            generated_paths=generated_paths,
-            registry_literal=repr(action_registry),
-            handlers_literal=handlers_literal,
-            default_question=question
-            or f"Which execution path best achieves the goal: {goal}?",
-        )
-        return "\n\n".join([header, runtime, footer]) + "\n"

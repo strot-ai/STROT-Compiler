@@ -130,42 +130,41 @@ class TestGlinerMasker:
 
 
 def test_compiler_masks_records_before_teacher(monkeypatch):
-    """End-to-end: the raw PII must never appear in any prompt the compiler
-    sends to the teacher LLM; the masked token must."""
+    """End-to-end: the raw PII must never appear in the teacher prompt the
+    compiler sends to label records; the masked token must. Exercised on the
+    decide head path (the LLM-labeling boundary)."""
     from strot.compiler import StrotCompiler
+    from strot import distill as distill_mod
 
-    registry = {
-        "billing": "Billing disputes, charges, and refunds",
-        "defect": "Crashes, bugs, and broken behavior",
-    }
     sample = [
         {"ticket_id": 1, "body": "double billing charge; email jane@acme.io"},
         {"ticket_id": 2, "body": "app crash defect; ssn 123-45-6789"},
-    ]
-    paths = (
+    ] * 12  # >= MIN_DISTILL_RECORDS for the head tier
+    questions = {"is_bug": {"type": "predicate", "instructions": "Is this a bug?"}}
+    projection = (
         "```python\n"
-        'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}\n\n\n'
+        'QUESTIONS = {"is_bug": {"type": "predicate", "instructions": "Is this a bug?",\n'
+        '    "criteria": {"false": "normal request", "true": "crash defect error"}}}\n\n\n'
         "def route_context(record: dict) -> str:\n"
-        '    return str(record.get("body", ""))\n\n\n'
-        "def execute_billing(record: dict) -> dict:\n    return {}\n\n\n"
-        "def execute_defect(record: dict) -> dict:\n    return {}\n```"
+        '    return str(record.get("body", ""))\n```'
     )
-    teacher = '```python\nLABELS = ["billing", "defect"]\n```'
+    answers = "```python\nANSWERS = " + repr([{"is_bug": True}] * len(sample)) + "\n```"
 
     prompts = []
 
     def llm(prompt):
         prompts.append(prompt)
-        # First call is synthesis, second is the teacher labeling.
-        return teacher if "STROT teacher" in prompt else paths
+        # Projection synthesis first, then the teacher labeling pass.
+        return answers if "STROT teacher" in prompt else projection
 
-    compiler = StrotCompiler(nlu_model="SupersonicLabs/Julia-1", llm_client=llm)
-    # measure_labels forces the teacher labeling pass without needing torch.
+    # Deterministic fake embedder so head training needs no torch/download.
+    monkeypatch.setenv("STROT_NLU_CHECKPOINT", "/tmp")
     monkeypatch.setattr(
-        StrotCompiler, "_measure_labelings",
-        lambda *a, **k: ("synthesized", {}, {"synthesized": 1.0}),
+        distill_mod, "make_encoder_embedder",
+        lambda ckpt: (lambda texts: [[1.0, 0.0, 1.0] for _ in texts]),
     )
-    compiler.compile(sample, "Triage tickets", registry, measure_labels=True)
+    compiler = StrotCompiler(nlu_model="x", llm_client=llm)
+    compiler.compile_decide(sample, questions, mode="head")
 
     teacher_prompts = [p for p in prompts if "STROT teacher" in p]
     assert teacher_prompts, "teacher was never called"
