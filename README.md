@@ -13,10 +13,10 @@ judgment into a **specialized decision model** — a calibrated head on a frozen
 encoder, trained on *your* real data — that then makes every decision **locally,
 on CPU, at $0**: no API calls, no GPU, no per-record cost.
 
-> **1.0 — the stable `decide` API.** The core (a head on a frozen
-> `gte-modernbert` encoder) is benchmark-validated on Banking77 (93% full-data,
-> 87% at 10 examples/class). Validation breadth is still growing — bring your own
-> data and tell us how it does.
+> **Stable `decide` API, plus an MCP surface to drive it from an agent.** The core
+> (a head on a frozen `gte-modernbert` encoder) is benchmark-validated on Banking77
+> (93% full-data, 87% at 10 examples/class). Validation breadth is still growing —
+> bring your own data and tell us how it does.
 
 ```bash
 pip install "strot-ai[local,anthropic]"
@@ -39,7 +39,7 @@ model(tickets[0])
 # {"predicates": {...}, "scores": {...}, "choices": {...}}  probabilities + calibrated confidence
 
 # 4. Ship one self-contained file; reload anywhere.
-model.save("ticket-triage")
+model.dispatch("ticket-triage")
 strot.load_model("ticket-triage")
 ```
 
@@ -123,10 +123,28 @@ pip install "strot-ai[finetune]"    # + torch/transformers, for mode="deep"
 pip install "strot-ai[pii]"         # + GLiNER masking at the teacher boundary
 pip install "strot-ai[openai]"      # + openai, teacher via llm="openai/<model>"
 pip install "strot-ai[anthropic]"   # + anthropic, teacher via llm="anthropic/<model>"
+pip install "strot-ai[mcp]"         # + the MCP server (drive it from an agent)
 ```
 
 Extras install optional packages; they do not sign you in. Set the matching API
 key and pass `llm="<provider>/<model>"`. Compile-time only — serving needs no key.
+
+## Drive it from an agent (MCP)
+
+`strot-ai[mcp]` exposes the compiler as an [MCP](https://modelcontextprotocol.io)
+server, so an agent (Claude, etc.) can compile, run, evaluate, and keep decision
+models healthy with tools instead of code:
+
+```bash
+pip install "strot-ai[local,mcp,openai]"
+python -m strot.mcp          # runs the MCP server over stdio
+```
+
+Tools cover the whole lifecycle — `inspect_data`, `pii_scan`, `design_questions`,
+`compile_start`/`compile_status`, `decide`, `evaluate_model`, `read_traces`,
+`drift_check`, `cluster_rejections`, `recompile`, `set_status` (circuit breaker) —
+and a `strot_compiler` prompt (the playbook) teaches the agent how to use them.
+Point your MCP client at `python -m strot.mcp`.
 
 Bake the encoder into your image for offline production:
 

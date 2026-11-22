@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "1.0.0"
+version = "1.1.0"
 description = "STROT: a decision compiler. Distill an LLM teacher into a specialized decision model that runs locally on CPU."
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"

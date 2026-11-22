@@ -135,7 +135,7 @@ def compile_model(
         _as_records(data), questions, llm=llm, mode=mode, state=state,
         execute=False, name=name, sample_size=sample_size,
     )
-    path = result.save(name) if name else result.artifact_path
+    path = result.dispatch(name) if name else result.artifact_path
     return {
         "model_path": str(path),
         "mode": mode,

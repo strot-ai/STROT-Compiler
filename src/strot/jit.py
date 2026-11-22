@@ -60,13 +60,13 @@ class DecisionModel:
     """A compiled, self-contained decision model.
 
     Returned by :func:`decide` and reloaded by :func:`load_model`. It is
-    callable - ``model(record)`` returns the typed decision for one record -
-    and saveable - ``model.save("name")`` writes the whole model to one
+    callable - ``model(record)`` returns the typed decision for one record - and
+    dispatchable - ``model.dispatch("name")`` puts it into service as one
     ``.strot`` file (heads baked in; the encoder downloads by id at runtime)::
 
         model = strot.decide(tickets, "triage support tickets")
-        model(tickets[0])            # -> {"predicates": {...}, "choices": {...}, ...}
-        model.save("ticket-triage")  # -> Path("ticket-triage.strot")
+        model(tickets[0])                # -> {"predicates": {...}, "choices": {...}, ...}
+        model.dispatch("ticket-triage")  # -> Path("ticket-triage.strot")
         same = strot.load_model("ticket-triage")
     """
 
@@ -157,8 +157,10 @@ class DecisionModel:
             thread.join(timeout)
         return self
 
-    def save(self, path: Union[str, Path]) -> Path:
-        """Write the self-contained model to ``path`` (``.strot`` if no suffix)."""
+    def dispatch(self, path: Union[str, Path]) -> Path:
+        """Put the model into service: write the self-contained model to ``path``
+        (``.strot`` if no suffix) - the one file you ship and reload with
+        :func:`strot.load_model`."""
         dest = Path(path)
         if dest.suffix == "":
             dest = dest.with_suffix(".strot")
@@ -167,9 +169,12 @@ class DecisionModel:
         dest.write_bytes(self.artifact_path.read_bytes())
         return dest
 
+    #: Back-compat alias for :meth:`dispatch`.
+    save = dispatch
+
 
 def load_model(path: Union[str, Path]) -> DecisionModel:
-    """Load a decision model saved by :meth:`DecisionModel.save`.
+    """Load a decision model saved by :meth:`DecisionModel.dispatch`.
 
     ``path`` is the ``.strot`` file (the suffix is optional). The returned model
     is callable on a record and re-saveable. Running it needs ``strot-ai[local]``
@@ -189,7 +194,7 @@ class RunResult:
     """Outcome of one :func:`run` call over a dataset.
 
     For a :func:`decide` outcome this is also the decision model: it is callable
-    (``result(record)``) and saveable (``result.save("name")``), delegating to a
+    (``result(record)``) and dispatchable (``result.dispatch("name")``), delegating to a
     :class:`DecisionModel` over the same compiled artifact.
     """
 
@@ -219,9 +224,12 @@ class RunResult:
         """Decide one further record against the compiled model."""
         return self.model(record)
 
-    def save(self, path: Union[str, Path]) -> Path:
-        """Write the compiled model to one ``.strot`` file; returns the path."""
-        return self.model.save(path)
+    def dispatch(self, path: Union[str, Path]) -> Path:
+        """Put the compiled model into service: one self-contained ``.strot`` file."""
+        return self.model.dispatch(path)
+
+    #: Back-compat alias for :meth:`dispatch`.
+    save = dispatch
 
     @property
     def tier(self) -> str:
