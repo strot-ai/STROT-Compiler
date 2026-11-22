@@ -502,6 +502,19 @@ QUESTIONS = {
         with pytest.raises(FileNotFoundError):
             strot.load_model(tmp_path / "nope")
 
+    def test_load_model_executes_a_strot_file(self, tmp_path):
+        # Regression: a saved model is `<name>.strot`; importlib cannot resolve a
+        # loader from that suffix alone, so load_model must load it explicitly.
+        # (A real decider imports torch; here a trivial one isolates the loader.)
+        art = tmp_path / "trivial.strot"
+        art.write_text(
+            "class CompiledDecider:\n"
+            "    def process(self, record):\n"
+            "        return {'ok': record.get('x')}\n"
+        )
+        model = strot.load_model(art)
+        assert model({"x": 7}) == {"ok": 7}
+
     def test_decide_warns_on_thin_class_coverage(self, tmp_path, fake_runtime, decide_encoder):
         # A head can't learn an outcome it never sees: if the teacher labels every
         # record "billing", the "engineering" class is empty and compile warns.

@@ -24,6 +24,7 @@ new reality.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import re
@@ -379,7 +380,11 @@ def _load_artifact(path: Path, key: str) -> Any:
             cached = sys.modules.get(module_name)
             if cached is not None and getattr(cached, "__strot_source_stamp__", None) == stamp:
                 return cached
-            spec = importlib.util.spec_from_file_location(module_name, path)
+            # Load with an explicit source loader so any extension works - a
+            # saved model is `<name>.strot`, which importlib would not recognize
+            # from the suffix alone (spec_from_file_location returns None).
+            loader = importlib.machinery.SourceFileLoader(module_name, str(path))
+            spec = importlib.util.spec_from_file_location(module_name, path, loader=loader)
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
             # Read source directly so a fast recompile cannot reuse stale bytecode.
