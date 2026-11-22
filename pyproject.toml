@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "0.12.0"
+version = "1.0.0"
 description = "STROT: a decision compiler. Distill an LLM teacher into a specialized decision model that runs locally on CPU."
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://github.com/strot-ai/STROT-Compiler"
 keywords = ["strot", "nlu", "decision-model", "classification", "distillation", "llm", "compiler"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Code Generators",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",

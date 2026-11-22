@@ -29,7 +29,7 @@ from .exceptions import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "0.12.0"
+__version__ = "1.0.0"
 
 from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402

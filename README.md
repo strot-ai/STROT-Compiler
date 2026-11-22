@@ -13,9 +13,10 @@ judgment into a **specialized decision model** — a calibrated head on a frozen
 encoder, trained on *your* real data — that then makes every decision **locally,
 on CPU, at $0**: no API calls, no GPU, no per-record cost.
 
-> **Status: early.** The core (a head on a frozen `gte-modernbert` encoder) is
-> benchmark-validated on Banking77 (93% full-data, 87% at 10 examples/class).
-> Bring your own data; treat this as a `v0`.
+> **1.0 — the stable `decide` API.** The core (a head on a frozen
+> `gte-modernbert` encoder) is benchmark-validated on Banking77 (93% full-data,
+> 87% at 10 examples/class). Validation breadth is still growing — bring your own
+> data and tell us how it does.
 
 ```bash
 pip install "strot-ai[local,anthropic]"
