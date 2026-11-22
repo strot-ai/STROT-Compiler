@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -99,20 +102,22 @@ def compile_model(
     data: DataArg,
     questions: Union[str, Dict[str, Any]],
     mode: str = "head",
-    llm: str = "openai/gpt-4o",
+    llm: Any = "openai/gpt-4o",
     state: str = ".strot",
     name: Optional[str] = None,
+    sample_size: int = 25,
 ) -> Dict[str, Any]:
     """Compile a decision model (needs the ``[local]`` extra). Returns its path.
 
-    ``questions`` may be a config dict or a bare intent string. When ``name`` is
-    given, the model is saved as ``<name>.strot``.
+    ``questions`` may be a config dict or a bare intent string. ``sample_size`` is
+    how many records the teacher labels. When ``name`` is given, the model is
+    saved as ``<name>.strot``.
     """
     import strot
 
     result = strot.decide(
         _as_records(data), questions, llm=llm, mode=mode, state=state,
-        execute=False, name=name,
+        execute=False, name=name, sample_size=sample_size,
     )
     path = result.save(name) if name else result.artifact_path
     return {
@@ -121,6 +126,83 @@ def compile_model(
         "questions": list(result.questions or {}),
         "cache_hit": result.cache_hit,
     }
+
+
+# --- Compile budget: a simple guardrail so an agent can't run away compiling ---
+# A per-process cap on compiles started (compiles cost LLM tokens + minutes of
+# compute). Set STROT_MCP_COMPILE_BUDGET=<int>; unset = unlimited.
+_compiles_started = 0
+_budget_lock = threading.Lock()
+
+
+def _compile_cap() -> Optional[int]:
+    raw = os.environ.get("STROT_MCP_COMPILE_BUDGET")
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def budget_status() -> Dict[str, Any]:
+    """How many compiles have run this session, and the cap (if any)."""
+    cap = _compile_cap()
+    with _budget_lock:
+        started = _compiles_started
+    return {"compiles_started": started, "cap": cap,
+            "remaining": (cap - started) if cap is not None else None}
+
+
+# --- Async compile: compiles run minutes (download + label + train), too long
+# for one tool call, so start returns a job id the agent polls with status. ---
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+
+def compile_start(
+    data: DataArg,
+    questions: Union[str, Dict[str, Any]],
+    mode: str = "head",
+    llm: Any = "openai/gpt-4o",
+    state: str = ".strot",
+    name: Optional[str] = None,
+    sample_size: int = 25,
+) -> Dict[str, Any]:
+    """Start a compile in the background; returns a ``job_id`` to poll with
+    :func:`compile_status`. Honors the compile budget. Needs the ``[local]`` extra.
+    """
+    cap = _compile_cap()
+    with _budget_lock:
+        global _compiles_started
+        if cap is not None and _compiles_started >= cap:
+            return {"status": "refused",
+                    "reason": f"compile budget exhausted ({_compiles_started}/{cap})"}
+        _compiles_started += 1
+
+    job_id = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "result": None, "error": None}
+
+    def _run() -> None:
+        try:
+            result = compile_model(data, questions, mode=mode, llm=llm, state=state,
+                                   name=name, sample_size=sample_size)
+            with _jobs_lock:
+                _jobs[job_id].update(status="done", result=result)
+        except Exception as exc:  # surface the error to the poller, never crash the thread
+            with _jobs_lock:
+                _jobs[job_id].update(status="error", error=str(exc)[:500])
+
+    threading.Thread(target=_run, name=f"strot-compile-{job_id}", daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+def compile_status(job_id: str) -> Dict[str, Any]:
+    """Poll a compile job: ``running`` | ``done`` (with ``result``) | ``error``."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        return {"job_id": job_id, "status": "unknown"}
+    return {"job_id": job_id, **job}
 
 
 def decide_record(model_path: str, record: Dict[str, Any]) -> Dict[str, Any]:

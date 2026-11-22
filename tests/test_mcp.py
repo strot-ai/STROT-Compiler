@@ -80,4 +80,55 @@ def test_as_records_accepts_inline_and_file(tmp_path):
 def test_tools_import_without_mcp_sdk():
     # Importing the capability layer must not require the mcp SDK (so the core
     # install stays tiny). If this module imported, that is already proven.
-    assert hasattr(tools, "list_models") and hasattr(tools, "compile_model")
+    assert hasattr(tools, "list_models") and hasattr(tools, "compile_start")
+
+
+def _wait(job_id, timeout=3.0):
+    import time
+
+    for _ in range(int(timeout / 0.02)):
+        s = tools.compile_status(job_id)
+        if s["status"] in ("done", "error"):
+            return s
+        time.sleep(0.02)
+    return tools.compile_status(job_id)
+
+
+def test_compile_start_runs_in_background_and_reports_done(monkeypatch):
+    monkeypatch.setattr(tools, "_compiles_started", 0)
+    monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
+    monkeypatch.setattr(
+        tools, "compile_model",
+        lambda *a, **k: {"model_path": "/x/triage.strot", "mode": "head"},
+    )
+    started = tools.compile_start([{"x": 1}], {"q": {"type": "predicate"}})
+    assert started["status"] == "running" and "job_id" in started
+    done = _wait(started["job_id"])
+    assert done["status"] == "done"
+    assert done["result"]["model_path"] == "/x/triage.strot"
+
+
+def test_compile_status_unknown_job():
+    assert tools.compile_status("nope")["status"] == "unknown"
+
+
+def test_compile_error_is_surfaced_not_raised(monkeypatch):
+    monkeypatch.setattr(tools, "_compiles_started", 0)
+    monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
+
+    def _boom(*a, **k):
+        raise RuntimeError("no torch")
+
+    monkeypatch.setattr(tools, "compile_model", _boom)
+    done = _wait(tools.compile_start([{"x": 1}], {"q": {}})["job_id"])
+    assert done["status"] == "error" and "no torch" in done["error"]
+
+
+def test_compile_budget_refuses_over_cap(monkeypatch):
+    monkeypatch.setattr(tools, "_compiles_started", 0)
+    monkeypatch.setenv("STROT_MCP_COMPILE_BUDGET", "1")
+    monkeypatch.setattr(tools, "compile_model", lambda *a, **k: {"model_path": "m"})
+    assert tools.compile_start([{"x": 1}], {"q": {}})["status"] == "running"
+    refused = tools.compile_start([{"x": 1}], {"q": {}})
+    assert refused["status"] == "refused" and "budget" in refused["reason"]
+    assert tools.budget_status() == {"compiles_started": 1, "cap": 1, "remaining": 0}

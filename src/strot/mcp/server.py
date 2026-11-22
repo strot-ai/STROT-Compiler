@@ -41,15 +41,28 @@ def design_questions(data: Union[str, list], intent: str, llm: str = "openai/gpt
 
 
 @server.tool()
-def compile_model(
+def compile_start(
     data: Union[str, list],
     questions: Union[str, dict],
     mode: str = "head",
     llm: str = "openai/gpt-4o",
     name: Optional[str] = None,
+    sample_size: int = 25,
 ) -> Dict[str, Any]:
-    """Compile a decision model from data + questions (or a bare intent). Needs [local]."""
-    return tools.compile_model(data, questions, mode=mode, llm=llm, name=name)
+    """Start compiling a decision model (runs minutes) -> returns a job_id to poll. Needs [local]."""
+    return tools.compile_start(data, questions, mode=mode, llm=llm, name=name, sample_size=sample_size)
+
+
+@server.tool()
+def compile_status(job_id: str) -> Dict[str, Any]:
+    """Poll a compile job: running | done (with result) | error."""
+    return tools.compile_status(job_id)
+
+
+@server.tool()
+def budget_status() -> Dict[str, Any]:
+    """Compiles run this session and the cap (STROT_MCP_COMPILE_BUDGET), if set."""
+    return tools.budget_status()
 
 
 @server.tool()
