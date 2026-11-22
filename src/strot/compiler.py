@@ -1,19 +1,16 @@
 """Compile time: the STROT Synthesizer Engine.
 
-:class:`StrotCompiler` implements the paper's three phases at compile time:
+:class:`StrotCompiler.compile_decide` compiles a specialized decision model:
 
-1. **Schema-aware context construction** — introspect the dataset sample
-   into a verified structural schema (:mod:`strot.schema`).
-2. **Prompt scaffolding** — build a strict, sectioned prompt for a large
-   generative LLM containing the schema, the functional goal, and the
-   requested ``nlu_model``.
-3. **Feedback-driven synthesis** — ask the LLM for the execution-path code,
-   validate its syntax and output contract, and loop error traces back for
-   self-correction within a bounded retry budget.
-
-The validated paths are then woven together with a deterministic runtime
-router template (:mod:`strot.templates`) matched to the ``nlu_model``,
-producing a completely standalone production asset.
+1. **Schema-aware context construction** — introspect the dataset sample into a
+   verified structural schema (:mod:`strot.schema`).
+2. **Synthesis** — the LLM designs the typed question set (optional) and writes
+   the state projection (``route_context``), validated with a bounded
+   self-correction retry loop.
+3. **Distillation** — the LLM teacher labels the sample; a calibrated head per
+   question is trained on the frozen encoder's embeddings (``lite`` skips the
+   teacher; ``deep`` adds a shared LoRA adapter) and baked into a standalone
+   artifact that emits typed decision JSON.
 """
 
 from __future__ import annotations
@@ -201,7 +198,7 @@ def handler_name(action_key: str) -> str:
 
 @dataclass(frozen=True)
 class CompiledAsset:
-    """A self-contained, self-routing production artifact."""
+    """A self-contained compiled decision model artifact."""
 
     source: str
     nlu_model: str

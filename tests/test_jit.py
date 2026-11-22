@@ -1,17 +1,12 @@
-"""Tests for strot.run(): the production JIT facade.
+"""Tests for the strot.decide() JIT facade and its shared helpers.
 
-The compiled local artifact imports the Julia decision package at module
-scope, so these tests install a minimal pure-Python fake of the ``julia``
-module that routes by keyword overlap between the record state and the
-option descriptions — enough to exercise the full compiled code path
-(route -> threshold -> dispatch) without the real 550MB checkpoint.
+Compiling a real decision model needs torch + an encoder, so these tests stub
+the embedder (see the ``decide_encoder`` fixture) and assert on the baked
+artifact's structure rather than live inference.
 """
 
-import importlib.util
 import json
-import math
 import sys
-import types
 
 import pytest
 
@@ -33,33 +28,6 @@ REGISTRY = {
 
 QUERY = "Triage incoming tickets into the correct workflow."
 
-def make_paths(keys):
-    """Contract-compliant synthesizer output for the given action keys.
-
-    Labels are the bare keys so the fake keyword router matches them against
-    the record body (e.g. body "double billing charge" -> label "billing").
-    """
-    labels = ", ".join(f'"{k}": "{k}"' for k in keys)
-    handlers = "\n\n\n".join(
-        f'def execute_{k}(record: dict) -> dict:\n'
-        f'    try:\n'
-        f'        return {{"queue": "{k}", "ticket_id": record.get("ticket_id")}}\n'
-        f'    except Exception as exc:\n'
-        f'        return {{"queue": "{k}", "error": str(exc)}}'
-        for k in keys
-    )
-    return (
-        "```python\n"
-        f"ROUTING_LABELS = {{{labels}}}\n\n\n"
-        "def route_context(record: dict) -> str:\n"
-        '    return str(record.get("body", ""))\n\n\n'
-        f"{handlers}\n```"
-    )
-
-
-VALID_PATHS = make_paths(["billing", "defect"])
-
-
 class ScriptedLLM:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -75,75 +43,6 @@ class ExplodingLLM:
 
     def __call__(self, prompt):  # pragma: no cover - the point is it never runs
         raise AssertionError("LLM was called despite a warm cache.")
-
-
-# --------------------------------------------------------------------- #
-# Fake julia package: keyword-overlap decision engine                    #
-# --------------------------------------------------------------------- #
-
-
-def _keyword_scores(state, options):
-    """Score each option by word overlap with the serialized record state."""
-    import re
-
-    state_words = set(re.findall(r"[a-z]+", str(state).lower()))
-    return [
-        float(len(set(re.findall(r"[a-z]+", opt.lower())) & state_words))
-        for opt in options
-    ]
-
-
-def _build_fake_julia():
-    """A stand-in for supersonic-julia's `julia` module: same predict contract
-    (rows of {state, question, options} -> [{index, probabilities}])."""
-    julia_mod = types.ModuleType("julia")
-
-    def _softmax_overlap(state, labels):
-        exps = [math.exp(s * 4.0) for s in _keyword_scores(state, labels)]
-        total = sum(exps)
-        return [e / total for e in exps]
-
-    class _FakeEngine:
-        def predict(self, rows=None, questions=None, state=None):
-            if questions is not None:  # typed path, mirrors julia/typed.py output
-                answers = {}
-                for qid, q in questions.items():
-                    kind = q["type"]
-                    if kind == "choice":
-                        keys = list(q["criteria"])
-                        labels = list(q["criteria"].values())
-                    elif kind == "score":
-                        labels = list(q["criteria"])
-                        keys = [str(i) for i in range(len(labels))]
-                    else:  # noul
-                        keys = ["false", "true"]
-                        criteria = q.get("criteria")
-                        labels = [criteria["false"], criteria["true"]] if criteria else keys
-                    probs = _softmax_overlap(state, labels)
-                    answer = {"type": kind, "probabilities": dict(zip(keys, probs))}
-                    if kind == "choice":
-                        answer["choice"] = keys[max(range(len(probs)), key=probs.__getitem__)]
-                    elif kind == "score":
-                        answer["score"] = sum(i * p for i, p in enumerate(probs))
-                    else:
-                        answer["noul"] = probs[1]
-                    if kind != "noul":
-                        answer["max_probability"] = max(probs)
-                    answers[qid] = answer
-                return {"answers": answers}
-            results = []
-            for row in rows:
-                probs = _softmax_overlap(row["state"], row["options"])
-                results.append(
-                    {
-                        "index": max(range(len(probs)), key=probs.__getitem__),
-                        "probabilities": probs,
-                    }
-                )
-            return results
-
-    julia_mod.load_model = lambda checkpoint, device="cpu", **kwargs: _FakeEngine()
-    return julia_mod
 
 
 @pytest.fixture(autouse=True)

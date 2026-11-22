@@ -39,8 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .exceptions import RouterConfigurationError
 
-#: Default fine-tune base: a standard, peft-clean encoder (not the zero-shot
-#: Julia decision model, which is a self-contained predictor, not an encoder).
+#: Default fine-tune base: a standard, peft-clean encoder.
 DEFAULT_FINETUNE_BASE = "answerdotai/ModernBERT-base"
 
 #: Validated recipe defaults (see benchmarks/cyber_cached_top.py,

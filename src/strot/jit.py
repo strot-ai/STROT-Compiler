@@ -1,24 +1,24 @@
-"""The production JIT front door: :func:`strot.run`.
+"""The JIT front door: :func:`strot.questions` and :func:`strot.decide`.
 
-STROT as a *production* compiler, not a dev tool. Developers set only the
-intent (a natural-language query plus an action registry); the compile event
-happens wherever :func:`run` is first called — typically in production — and
-the resulting battery (the frozen, self-contained decision unit the compiler
-emits) is persisted to a content-addressed store. Every subsequent call (and
-every restart sharing the ``state`` directory) is a pure cache hit: no LLM,
-no API key, just deterministic execution.
+STROT as a *production* compiler, not a dev tool. You provide a one-line intent
+(or a reviewed typed-question config) plus a sample of your real data; the
+compile event happens the first time :func:`decide` is called and the resulting
+model (the frozen, self-contained decision unit the compiler emits) is persisted
+to a content-addressed store. Every subsequent call (and every restart sharing
+the ``state`` directory) is a pure cache hit: no LLM, no API key, just the local
+model.
 
-    key = hash(query + schema fingerprint + registry + nlu + version)
-    ├─ battery exists   ──▶ load compiled code, execute          (every call)
-    └─ cache miss       ──▶ LLM synthesizes, validate, persist   (once)
+    key = hash(questions + schema fingerprint + nlu + mode + version)
+    ├─ model exists   ──▶ load compiled code, decide            (every call)
+    └─ cache miss     ──▶ LLM designs/labels, train, persist    (once)
 
-On disk a battery is a pair ``battery_<slug>_<hash>.py`` / ``.json``: the slug
-is a human-readable task label (from ``name`` or auto-derived from the query)
-and is purely cosmetic — the content hash, not the slug, is the cache key.
+On disk a compiled model is a pair ``battery_<slug>_<hash>.py`` / ``.json``: the
+slug is a human-readable task label (from ``name`` or auto-derived) and is purely
+cosmetic — the content hash, not the slug, is the cache key.
 
 The schema fingerprint is part of the key, so schema drift in the live data
-automatically misses the cache and triggers exactly one recompile against
-the new reality.
+automatically misses the cache and triggers exactly one recompile against the
+new reality.
 """
 
 from __future__ import annotations

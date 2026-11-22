@@ -1,10 +1,10 @@
-"""Code templates baked into the compiled production asset.
+"""Code templates baked into the compiled decision model.
 
-The synthesizer LLM generates only the task-specific *execution paths*;
-the runtime router architecture is rendered deterministically from these
-templates so the compiled artifact's routing behavior is guaranteed, fully
-standalone (zero imports from ``strot``), and matched exactly to the
-``nlu_model`` chosen at compile time.
+The synthesizer LLM generates only the task-specific state projection
+(``route_context``); the decision runtime (frozen encoder + one head per
+question, optionally a shared LoRA adapter) is rendered deterministically from
+these templates so the compiled artifact is fully standalone - zero imports from
+``strot`` - and emits typed decision JSON, nothing generated.
 """
 
 from __future__ import annotations
