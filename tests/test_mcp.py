@@ -178,3 +178,14 @@ def test_recompile_missing_config_errors(tmp_path):
     m = tmp_path / "empty.strot"
     m.write_text("# no QUESTIONS_CONFIG here\n")
     assert tools.recompile(str(m), [{"x": 1}])["status"] == "error"
+
+
+def test_playbook_covers_the_loop_and_principles():
+    from strot.mcp.playbook import PLAYBOOK
+
+    for term in (
+        "inspect_data", "pii_scan", "design_questions", "compile_start",
+        "evaluate_model", "drift_check", "cluster_rejections", "recompile", "set_status",
+        "Distillation-only", "Recompile, don't increment", "Evaluate-safe, act-gated",
+    ):
+        assert term in PLAYBOOK, term

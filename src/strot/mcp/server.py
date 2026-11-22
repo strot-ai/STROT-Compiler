@@ -138,6 +138,17 @@ def model_status(model_path: str) -> Dict[str, Any]:
     return tools.model_status(model_path)
 
 
+@server.prompt(
+    name="strot_compiler",
+    description="The STROT compiler & gatekeeper playbook - load it to drive the tools "
+    "as a specialized decision-model compiler (plan -> compile -> monitor -> recompile).",
+)
+def strot_compiler_playbook() -> str:
+    from .playbook import PLAYBOOK
+
+    return PLAYBOOK
+
+
 def main() -> None:
     server.run()
 
