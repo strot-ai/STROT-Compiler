@@ -1,10 +1,14 @@
-"""strot-ai: compile-time LLM code synthesis with deterministic,
-self-routing NLU runtimes.
+"""strot-ai: a decision compiler.
 
-Implements the STROT framework (Structured Task Reasoning and Output
-Transformation, arXiv:2505.01636) with an NLU strategy-pattern runtime:
-a local CPU transformer (default ``SupersonicLabs/Julia-1``) or a hosted
-cloud API, baked into a standalone compiled production asset.
+STROT (Structured Task Reasoning and Output Transformation, arXiv:2505.01636)
+compiles a specialized decision model per task: an LLM teacher labels your real
+data, a calibrated head is distilled onto a frozen encoder, and the result is a
+self-contained model that runs locally on CPU and emits typed decision JSON.
+
+    questions = strot.questions(data, "triage support tickets")  # design the schema
+    model = strot.decide(data, questions)                        # compile a model
+    model(record)                                                # decide, locally
+    model.save("triage"); strot.load_model("triage")             # ship + reuse
 """
 
 from .compiler import (
@@ -15,6 +19,7 @@ from .compiler import (
     codex_cli_llm_client,
     openai_llm_client,
 )
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .exceptions import (
     CompilationError,
     FallbackException,
@@ -22,31 +27,14 @@ from .exceptions import (
     SchemaIntrospectionError,
     StrotError,
 )
-from .router import (
-    CONFIDENCE_THRESHOLD,
-    DEFAULT_NLU_MODEL,
-    DEFAULT_STROT_MODEL,
-    MAX_FLAT_OPTIONS,
-    STROT_MODELS,
-    FineTunedAdapterStrategy,
-    HostedApiStrategy,
-    LocalEncoderStrategy,
-    RouteDecision,
-    Router,
-    RuntimeStrategy,
-    create_router,
-    create_strategy,
-    resolve_model,
-)
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
 __version__ = "0.12.0"
 
-from .jit import DecisionModel, RunResult, decide, load_model, questions, run  # noqa: E402  (needs __version__ for cache keys)
+from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
-    "run",
     "decide",
     "questions",
     "load_model",
@@ -64,20 +52,7 @@ __all__ = [
     "FallbackException",
     "RouterConfigurationError",
     "SchemaIntrospectionError",
-    "CONFIDENCE_THRESHOLD",
     "DEFAULT_NLU_MODEL",
-    "DEFAULT_STROT_MODEL",
-    "STROT_MODELS",
-    "resolve_model",
-    "MAX_FLAT_OPTIONS",
-    "RuntimeStrategy",
-    "LocalEncoderStrategy",
-    "HostedApiStrategy",
-    "FineTunedAdapterStrategy",
-    "RouteDecision",
-    "Router",
-    "create_router",
-    "create_strategy",
     "DatasetSchema",
     "FieldProfile",
     "SchemaProfiler",
