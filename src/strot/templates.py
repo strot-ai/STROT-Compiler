@@ -483,6 +483,23 @@ def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
     return [e / total for e in exps]
 
 
+def _nearest_centroid_distance(vector: Sequence[float],
+                               centroids: Sequence[Sequence[float]]) -> float:
+    return min(math.sqrt(sum((x - c) * (x - c) for x, c in zip(vector, cen)))
+               for cen in centroids)
+
+
+def _is_ood(vector: Sequence[float]) -> bool:
+    """Record farther than the fitted threshold from every class centroid.
+
+    Drift guard: an empty OOD literal (lite, or an unfit gate) is a no-op."""
+    return bool(OOD) and _nearest_centroid_distance(vector, OOD["centroids"]) > OOD["threshold"]
+
+
+#: Which output group each question type lands in.
+_DECISION_GROUP = {{"predicate": "predicates", "score": "scores", "choice": "choices"}}
+
+
 class CompiledDecider:
     """Frozen-encoder embedding + one distilled head per question."""
 
@@ -526,11 +543,15 @@ class CompiledDecider:
 
     def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         vector = self._embed(route_context(dict(record)))  # synthesized projection
+        ood = _is_ood(vector)  # drift guard: refuse records unlike the training set
         output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
         for name, head in QUESTION_HEADS.items():
+            classes = head["classes"]
+            if ood:
+                output[_DECISION_GROUP[head["type"]]][name] = {{"refusal": True, "reason": "ood"}}
+                continue
             probs = _head_softmax(vector, head["weights"], head["bias"],
                                   head.get("temperature", 1.0))
-            classes = head["classes"]
             if head["type"] == "predicate":
                 p_true = probs[classes.index(True)]
                 output["predicates"][name] = {{
@@ -606,6 +627,21 @@ def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
     return [e / total for e in exps]
 
 
+def _nearest_centroid_distance(vector: Sequence[float],
+                               centroids: Sequence[Sequence[float]]) -> float:
+    return min(math.sqrt(sum((x - c) * (x - c) for x, c in zip(vector, cen)))
+               for cen in centroids)
+
+
+def _is_ood(vector: Sequence[float]) -> bool:
+    """Record farther than the fitted threshold from every class centroid."""
+    return bool(OOD) and _nearest_centroid_distance(vector, OOD["centroids"]) > OOD["threshold"]
+
+
+#: Which output group each question type lands in.
+_DECISION_GROUP = {{"predicate": "predicates", "score": "scores", "choice": "choices"}}
+
+
 class CompiledDecider:
     """Shared LoRA-adapted encoder embedding + one head per question."""
 
@@ -653,11 +689,15 @@ class CompiledDecider:
 
     def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         vector = self._embed(route_context(dict(record)))  # synthesized projection
+        ood = _is_ood(vector)  # drift guard: refuse records unlike the training set
         output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
         for name, head in QUESTION_HEADS.items():
+            classes = head["classes"]
+            if ood:
+                output[_DECISION_GROUP[head["type"]]][name] = {{"refusal": True, "reason": "ood"}}
+                continue
             probs = _head_softmax(vector, head["weights"], head["bias"],
                                   head.get("temperature", 1.0))
-            classes = head["classes"]
             if head["type"] == "predicate":
                 p_true = probs[classes.index(True)]
                 output["predicates"][name] = {{

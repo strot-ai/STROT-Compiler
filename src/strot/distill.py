@@ -194,3 +194,65 @@ def head_accuracy(
         if max(range(len(probs)), key=probs.__getitem__) == true_class:
             correct += 1
     return round(correct / len(labels), 4) if labels else 0.0
+
+
+# --- Drift / out-of-distribution guard (pure Python, baked as float literals) ---
+# A decision model should refuse records unlike anything it was trained on rather
+# than answer them confidently. These fit per-class centroids + a distance
+# threshold on the training embeddings; the runtime refuses records farther than
+# the threshold from every centroid. (Lives here, not in the router, so the
+# decide path owns it independently of the routing stack.)
+
+
+def class_centroids(
+    vectors: Sequence[Sequence[float]],
+    labels: Sequence[int],
+    n_classes: int,
+) -> List[List[float]]:
+    """Mean embedding per class. A class with no vectors gets a zero centroid."""
+    if not vectors:
+        raise ValueError("need at least one vector to form centroids")
+    dim = len(vectors[0])
+    sums = [[0.0] * dim for _ in range(n_classes)]
+    counts = [0] * n_classes
+    for vector, label in zip(vectors, labels):
+        row = sums[label]
+        for d, x in enumerate(vector):
+            row[d] += x
+        counts[label] += 1
+    return [
+        [round(s / counts[c], 6) for s in sums[c]] if counts[c] else [0.0] * dim
+        for c in range(n_classes)
+    ]
+
+
+def nearest_centroid_distance(
+    vector: Sequence[float], centroids: Sequence[Sequence[float]]
+) -> float:
+    """Euclidean distance from ``vector`` to its closest class centroid."""
+    if not centroids:
+        raise ValueError("need at least one centroid")
+    return min(
+        math.sqrt(sum((x - c) * (x - c) for x, c in zip(vector, cen)))
+        for cen in centroids
+    )
+
+
+def ood_threshold(
+    vectors: Sequence[Sequence[float]],
+    centroids: Sequence[Sequence[float]],
+    percentile: float = 0.99,
+) -> float:
+    """A high percentile of in-distribution nearest-centroid distances.
+
+    Records farther than this at runtime are flagged out-of-distribution. The
+    default is conservative (0.99) so the always-on decide gate rarely flags an
+    in-distribution record while still catching records beyond the envelope.
+    """
+    if not vectors:
+        raise ValueError("need vectors to fit an OOD threshold")
+    if not 0.0 < percentile <= 1.0:
+        raise ValueError("percentile must be in (0, 1]")
+    distances = sorted(nearest_centroid_distance(v, centroids) for v in vectors)
+    rank = min(len(distances) - 1, max(0, math.ceil(percentile * len(distances)) - 1))
+    return round(distances[rank], 6)

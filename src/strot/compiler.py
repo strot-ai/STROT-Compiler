@@ -2180,11 +2180,33 @@ class StrotCompiler:
                 "weights": head_w, "bias": head_b, "temperature": temperature,
             }
 
+        # 4b. Drift / OOD guard (head + deep): per-class centroids + a distance
+        # threshold on the training embeddings, so the runtime refuses records
+        # unlike anything seen rather than answering them. Centroids use the
+        # finest-grained question's labels; the gate is always on (conservative
+        # 0.99 percentile). lite has no record embeddings, so it has no gate.
+        ood: Optional[Dict[str, Any]] = None
+        if vectors:
+            ood_q = max(
+                questions, key=lambda q: len(self._question_runtime(questions[q])[1])
+            )
+            _, ood_classes = self._question_runtime(questions[ood_q])
+            ood_labels = [ood_classes.index(answers[i][ood_q]) for i in range(len(records))]
+            centroids = distill_mod.class_centroids(
+                vectors, ood_labels, n_classes=len(ood_classes)
+            )
+            ood = {
+                "centroids": centroids,
+                "threshold": distill_mod.ood_threshold(vectors, centroids, percentile=0.99),
+                "percentile": 0.99, "basis": ood_q,
+            }
+
         # 5. Bake the decision model.
         return self._bake_decider(
             question_heads, code, schema, questions, golden, attempts,
             winner=("fine_tuned" if mode == "deep" else "distilled"),
             n_records=len(records), adapter=adapter, adapter_config=adapter_config,
+            ood=ood,
         )
 
     def _bake_decider(
@@ -2199,12 +2221,14 @@ class StrotCompiler:
         n_records: Optional[int] = None,
         adapter: Optional[Dict[str, Any]] = None,
         adapter_config: Optional[Dict[str, Any]] = None,
+        ood: Optional[Dict[str, Any]] = None,
     ) -> CompiledAsset:
         """Bake baked heads + projection into a self-contained decider asset.
 
         Shared by all tiers - they differ only in how ``question_heads`` was
         fitted. ``lite``/``head`` embed with the frozen encoder; ``deep`` passes
-        an ``adapter`` and bakes the LoRA-adapted runtime instead.
+        an ``adapter`` and bakes the LoRA-adapted runtime instead. ``ood`` (when
+        fitted) bakes the drift gate; an empty literal is a runtime no-op.
         """
         header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
@@ -2212,7 +2236,8 @@ class StrotCompiler:
             config_literal=repr(dict(questions)),
         )
         heads_literal = "QUESTION_HEADS: Dict[str, Any] = " + repr(question_heads)
-        parts = [header, code, heads_literal]
+        ood_literal = "OOD: Dict[str, Any] = " + repr(ood or {})
+        parts = [header, code, heads_literal, ood_literal]
         if adapter is not None:
             parts.append("ADAPTER: Dict[str, Any] = " + repr(adapter))
             parts.append("ADAPTER_CONFIG: Dict[str, Any] = " + repr(adapter_config))

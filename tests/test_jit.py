@@ -1184,14 +1184,19 @@ def _decide_teacher(config, n=28):
     return "```python\nANSWERS = " + repr(rows) + "\n```"
 
 
-def _baked_heads(source):
-    """Literal-eval the QUESTION_HEADS baked into a compiled decide model."""
+def _baked_literal(source, name):
+    """Literal-eval a baked top-level annotated assignment (e.g. QUESTION_HEADS, OOD)."""
     import ast as _ast
 
     for node in _ast.parse(source).body:
-        if isinstance(node, _ast.AnnAssign) and getattr(node.target, "id", None) == "QUESTION_HEADS":
+        if isinstance(node, _ast.AnnAssign) and getattr(node.target, "id", None) == name:
             return _ast.literal_eval(node.value)
     return {}
+
+
+def _baked_heads(source):
+    """Literal-eval the QUESTION_HEADS baked into a compiled decide model."""
+    return _baked_literal(source, "QUESTION_HEADS")
 
 
 @pytest.fixture
@@ -1308,6 +1313,27 @@ class TestDecide:
         assert result.model.artifact_path != lite_path  # swapped to the trained head
         heads = _baked_heads(result.model.artifact_path.read_text())
         assert set(heads) == {"is_bug", "sentiment", "team"}
+
+    def test_decide_head_bakes_an_ood_drift_gate(self, tmp_path, fake_runtime, decide_encoder):
+        # head/deep fit a drift gate: per-class centroids (finest-grained question)
+        # + a distance threshold, baked as OOD; the runtime refuses records unlike
+        # the training set. Centroids use the richest question (sentiment, 3 levels).
+        llm = ScriptedLLM([VALID_DECIDE, _decide_teacher(DECIDE_CONFIG)])
+        result = strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path,
+                              sample_size=28, execute=False, mode="head")
+        source = result.artifact_path.read_text()
+        ood = _baked_literal(source, "OOD")
+        assert set(ood) == {"centroids", "threshold", "percentile", "basis"}
+        assert ood["basis"] == "sentiment"  # the 3-level question, finest partition
+        assert ood["percentile"] == 0.99 and ood["threshold"] >= 0.0
+        assert len(ood["centroids"]) == 3  # one centroid per sentiment level
+        assert "def _is_ood" in source  # the runtime gate is present
+
+    def test_decide_lite_has_no_drift_gate(self, tmp_path, fake_runtime, decide_encoder):
+        # lite has no record embeddings, so no centroids -> an empty OOD no-op.
+        result = strot.decide(DECIDE_SAMPLE, DECIDE_CONFIG, llm=ScriptedLLM([VALID_DECIDE]),
+                              state=tmp_path, sample_size=28, execute=False, mode="lite")
+        assert _baked_literal(result.artifact_path.read_text(), "OOD") == {}
 
     def test_decide_recompile_is_history_independent(self, tmp_path, fake_runtime, decide_encoder):
         # Invariant "recompile, don't increment": a model's weights are a pure
