@@ -89,6 +89,22 @@ def model_info(path: Union[str, Path]) -> Dict[str, Any]:
     return read_model_meta(path)
 
 
+def inspect_data(data: DataArg, sample_size: int = 25) -> Dict[str, Any]:
+    """Profile raw input - fields, types, cardinality, sample values (torch-free).
+    The agent's view of the data before it plans a compilation."""
+    import strot
+
+    return strot.inspect_data(_as_records(data), sample_size=sample_size)
+
+
+def pii_scan(data: DataArg, sample_size: int = 25) -> Dict[str, Any]:
+    """Detect what PII the teacher-boundary masker would redact over a sample
+    (torch-free) - the PII-enablement 'detect' step before any compile."""
+    import strot
+
+    return strot.pii_scan(_as_records(data), sample_size=sample_size)
+
+
 def design_questions(
     data: DataArg, intent: str, llm: str = "openai/gpt-4o", sample_size: int = 25
 ) -> Dict[str, Any]:

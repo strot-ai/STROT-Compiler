@@ -35,6 +35,18 @@ def model_info(path: str) -> Dict[str, Any]:
 
 
 @server.tool()
+def inspect_data(data: Union[str, list], sample_size: int = 25) -> Dict[str, Any]:
+    """Profile raw input - fields, types, cardinality, sample values (torch-free). Plan from this."""
+    return tools.inspect_data(data, sample_size=sample_size)
+
+
+@server.tool()
+def pii_scan(data: Union[str, list], sample_size: int = 25) -> Dict[str, Any]:
+    """Detect what PII the teacher-boundary masker would redact over a sample (torch-free)."""
+    return tools.pii_scan(data, sample_size=sample_size)
+
+
+@server.tool()
 def design_questions(data: Union[str, list], intent: str, llm: str = "openai/gpt-4o") -> Dict[str, Any]:
     """Design a typed question config from a one-line intent and a data sample."""
     return tools.design_questions(data, intent, llm=llm)

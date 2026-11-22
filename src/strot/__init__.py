@@ -34,6 +34,7 @@ __version__ = "1.0.0"
 from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
 from .evaluate import evaluate, score_decisions  # noqa: E402
 from .trace import cluster_rejections, drift_check, read_traces, summarize_traces  # noqa: E402
+from .inspect import inspect_data, pii_scan  # noqa: E402
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
@@ -45,6 +46,8 @@ __all__ = [
     "summarize_traces",
     "cluster_rejections",
     "drift_check",
+    "inspect_data",
+    "pii_scan",
     "load_model",
     "DecisionModel",
     "RunResult",
