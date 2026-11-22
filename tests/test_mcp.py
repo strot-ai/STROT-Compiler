@@ -132,3 +132,49 @@ def test_compile_budget_refuses_over_cap(monkeypatch):
     refused = tools.compile_start([{"x": 1}], {"q": {}})
     assert refused["status"] == "refused" and "budget" in refused["reason"]
     assert tools.budget_status() == {"compiles_started": 1, "cap": 1, "remaining": 0}
+
+
+def test_set_and_read_model_status(tmp_path):
+    m = str(tmp_path / "triage.strot")
+    assert tools.model_status(m)["status"] == "active"  # default when never set
+    tools.set_status(m, "paused", reason="drift")
+    st = tools.model_status(m)
+    assert st["status"] == "paused" and st["reason"] == "drift"
+    tools.set_status(m, "active")
+    assert tools.model_status(m)["status"] == "active"
+
+
+def test_set_status_rejects_bad_value(tmp_path):
+    assert "error" in tools.set_status(str(tmp_path / "m.strot"), "bogus")
+
+
+def test_decide_record_honors_paused_circuit_breaker(tmp_path):
+    m = str(tmp_path / "m.strot")
+    tools.set_status(m, "paused", reason="broken")
+    # paused short-circuits before any model load, so no torch is needed
+    assert tools.decide_record(m, {"x": 1}) == {"paused": True, "reason": "broken"}
+
+
+def test_recompile_reuses_question_config(tmp_path, monkeypatch):
+    m = tmp_path / "triage.strot"
+    m.write_text('QUESTIONS_CONFIG: Dict[str, Any] = {"is_bug": {"type": "predicate"}}\n')
+    monkeypatch.setattr(tools, "_compiles_started", 0)
+    monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
+    captured = {}
+
+    def _fake(data, questions, **k):
+        captured["questions"] = questions
+        captured["name"] = k.get("name")
+        return {"model_path": "x"}
+
+    monkeypatch.setattr(tools, "compile_model", _fake)
+    started = tools.recompile(str(m), [{"x": 1}])
+    _wait(started["job_id"])
+    assert captured["questions"] == {"is_bug": {"type": "predicate"}}
+    assert captured["name"].endswith("triage-recompiled")  # same dir as the original
+
+
+def test_recompile_missing_config_errors(tmp_path):
+    m = tmp_path / "empty.strot"
+    m.write_text("# no QUESTIONS_CONFIG here\n")
+    assert tools.recompile(str(m), [{"x": 1}])["status"] == "error"

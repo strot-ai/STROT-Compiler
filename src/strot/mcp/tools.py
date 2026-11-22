@@ -206,10 +206,97 @@ def compile_status(job_id: str) -> Dict[str, Any]:
 
 
 def decide_record(model_path: str, record: Dict[str, Any]) -> Dict[str, Any]:
-    """Run a compiled model on one record -> typed decision JSON (needs ``[local]``)."""
+    """Run a compiled model on one record -> typed decision JSON (needs ``[local]``).
+
+    Honors the circuit breaker: a paused model returns ``{"paused": true, ...}``
+    instead of deciding (for calls routed through this tool).
+    """
+    status = model_status(model_path)
+    if status.get("status") == "paused":
+        return {"paused": True, "reason": status.get("reason")}
     import strot
 
     return strot.load_model(model_path)(record)
+
+
+# --- Serving state: a model's status flag (the gatekeeper's circuit breaker) ---
+# STROT is a compiler + inference function, not a runtime, so the status is a
+# sidecar flag. decide_record (the MCP inference path) honors it; direct
+# model(record) calls in your own serving code should check model_status too.
+
+
+def _status_path(model_path: str) -> Path:
+    return Path(str(model_path) + ".status.json")
+
+
+def set_status(model_path: str, status: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Set a model's serving status: ``active`` or ``paused`` (circuit breaker).
+
+    Pausing a drifting/broken model stops decide_record from serving it; ``active``
+    resumes. Also the promote/rollback primitive - activate the version you trust.
+    """
+    from datetime import datetime, timezone
+
+    if status not in ("active", "paused"):
+        return {"error": "status must be 'active' or 'paused'"}
+    payload = {"status": status, "reason": reason,
+               "ts": datetime.now(timezone.utc).isoformat()}
+    _status_path(model_path).write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def model_status(model_path: str) -> Dict[str, Any]:
+    """Read a model's serving status (defaults to ``active`` if never set)."""
+    sp = _status_path(model_path)
+    if sp.exists():
+        try:
+            return json.loads(sp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"status": "active", "reason": None}
+
+
+def _questions_config(model_path: str) -> Any:
+    """Read a compiled model's full question config (the baked clean config)."""
+    source = Path(model_path).read_text(encoding="utf-8", errors="ignore")
+    return _module_literal(source, "QUESTIONS_CONFIG")
+
+
+def recompile(
+    model_path: str,
+    data: DataArg,
+    llm: Any = "openai/gpt-4o",
+    mode: str = "head",
+    name: Optional[str] = None,
+    sample_size: int = 25,
+) -> Dict[str, Any]:
+    """Recompile a model on fresh/accumulated data, reusing its question config.
+
+    A fresh distillation (recompile-don't-increment), started async. Defaults to a
+    new ``<name>-recompiled`` artifact so the agent can evaluate it before
+    promoting with :func:`set_status`. Needs the ``[local]`` extra.
+    """
+    cfg = _questions_config(model_path)
+    if not isinstance(cfg, dict) or not cfg:
+        return {"status": "error",
+                "error": f"could not read a question config from {model_path!r}"}
+    orig = Path(model_path)
+    target = name or str(orig.with_name(orig.stem + "-recompiled"))  # same dir as the original
+    return compile_start(data, cfg, mode=mode, llm=llm, name=target, sample_size=sample_size)
+
+
+def cluster_rejections(traces_path: str, top_terms: int = 10, max_samples: int = 20) -> Dict[str, Any]:
+    """Cluster a model's refused records to surface the gap to close (torch-free)."""
+    import strot
+
+    return strot.cluster_rejections(traces_path, top_terms=top_terms, max_samples=max_samples)
+
+
+def drift_check(traces_path: str, refusal_threshold: float = 0.2, confidence_floor: float = 0.5) -> Dict[str, Any]:
+    """Drift signal from a model's traces + a recompile recommendation (torch-free)."""
+    import strot
+
+    return strot.drift_check(traces_path, refusal_threshold=refusal_threshold, confidence_floor=confidence_floor)
 
 
 def evaluate_model(

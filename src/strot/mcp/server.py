@@ -93,6 +93,39 @@ def read_traces(path: str, limit: Optional[int] = None) -> Dict[str, Any]:
     return tools.read_traces(path, limit=limit)
 
 
+@server.tool()
+def cluster_rejections(traces_path: str, top_terms: int = 10, max_samples: int = 20) -> Dict[str, Any]:
+    """Cluster the refused records to surface the gap to close - the diagnostic signal (torch-free)."""
+    return tools.cluster_rejections(traces_path, top_terms=top_terms, max_samples=max_samples)
+
+
+@server.tool()
+def drift_check(traces_path: str, refusal_threshold: float = 0.2, confidence_floor: float = 0.5) -> Dict[str, Any]:
+    """Drift signal from traces + a recompile recommendation (torch-free)."""
+    return tools.drift_check(traces_path, refusal_threshold=refusal_threshold, confidence_floor=confidence_floor)
+
+
+@server.tool()
+def recompile(
+    model_path: str, data: Union[str, list], llm: str = "openai/gpt-4o",
+    mode: str = "head", name: Optional[str] = None, sample_size: int = 25,
+) -> Dict[str, Any]:
+    """Recompile a model on fresh data (reusing its questions), async -> job_id. Needs [local]."""
+    return tools.recompile(model_path, data, llm=llm, mode=mode, name=name, sample_size=sample_size)
+
+
+@server.tool()
+def set_status(model_path: str, status: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Set a model's serving status: active | paused (the circuit breaker / promote)."""
+    return tools.set_status(model_path, status, reason=reason)
+
+
+@server.tool()
+def model_status(model_path: str) -> Dict[str, Any]:
+    """Read a model's serving status (active | paused)."""
+    return tools.model_status(model_path)
+
+
 def main() -> None:
     server.run()
 

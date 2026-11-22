@@ -4,7 +4,13 @@ opt-in DecisionModel logging (all torch-free via a fake pipeline)."""
 import json
 
 import strot
-from strot.trace import read_traces, summarize_decision, summarize_traces
+from strot.trace import (
+    cluster_rejections,
+    drift_check,
+    read_traces,
+    summarize_decision,
+    summarize_traces,
+)
 
 
 def test_summarize_decision_all_types():
@@ -67,3 +73,36 @@ def test_decision_model_trace_include_record(tmp_path):
     model({"t": "billing"})
     entry = read_traces(tmp_path / "t.jsonl")[0]
     assert entry["record"] == {"t": "billing"}
+
+
+def test_cluster_rejections_surfaces_terms():
+    entries = [
+        {"answers": {"team": {"refused": True, "reason": "ood"}}, "record": {"body": "crypto wallet refund dispute"}},
+        {"answers": {"team": {"refused": True}}, "record": {"body": "crypto token refund weird"}},
+        {"answers": {"team": {"value": "billing", "confidence": 0.9, "refused": False}}, "record": {"body": "normal billing"}},
+    ]
+    r = cluster_rejections(entries)
+    assert r["n_rejected"] == 2 and r["n_total"] == 3
+    assert r["rejection_rate"] == round(2 / 3, 4)
+    terms = [t["term"] for t in r["top_terms"]]
+    assert "crypto" in terms and "refund" in terms
+    assert len(r["samples"]) == 2
+
+
+def test_cluster_rejections_without_records_notes_it():
+    r = cluster_rejections([{"answers": {"q": {"refused": True}}}])  # no record logged
+    assert r["n_rejected"] == 1 and r["top_terms"] == [] and "note" in r
+
+
+def test_drift_check_recommends_on_rising_refusal():
+    good = {"answers": {"q": {"value": "x", "confidence": 0.9, "refused": False}}}
+    bad = {"answers": {"q": {"refused": True}}}
+    r = drift_check([good] * 4 + [bad] * 4)  # healthy baseline, recent all refused
+    assert r["recommend_recompile"] is True
+    assert r["recent"]["refusal_rate"] == 1.0
+    assert any("refusal" in reason for reason in r["reasons"])
+
+
+def test_drift_check_healthy_recommends_nothing():
+    good = {"answers": {"q": {"value": "x", "confidence": 0.9, "refused": False}}}
+    assert drift_check([good] * 8)["recommend_recompile"] is False
