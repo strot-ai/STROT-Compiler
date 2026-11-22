@@ -87,6 +87,8 @@ class DecisionModel:
         self._pipeline = pipeline
         self._lock = RLock()
         self._thread: Optional[Thread] = None  #: warm-start background upgrade
+        self._trace_path: Optional[Path] = None
+        self._trace_record = False
 
     def _ensure_pipeline(self) -> Any:
         if self._pipeline is None:
@@ -94,13 +96,46 @@ class DecisionModel:
             self._pipeline = module.CompiledDecider()
         return self._pipeline
 
+    def trace(self, path: Union[str, Path], include_record: bool = False) -> "DecisionModel":
+        """Log every decision to a JSONL file (the teacher's eyes); returns self.
+
+        Each call appends ``{ts, answers: {q: {value, confidence, refused}}}``.
+        ``include_record=True`` also logs the input record - off by default
+        (privacy). Read it back with :func:`strot.read_traces` /
+        :func:`strot.summarize_traces`.
+        """
+        self._trace_path = Path(path)
+        self._trace_record = include_record
+        return self
+
     def __call__(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         """Decide one record: returns typed decision JSON (locally, on CPU)."""
         with self._lock:
             decision = self._ensure_pipeline().process(record)
         if self.confidence_threshold is not None:
             decision = _apply_refusals(decision, self.confidence_threshold)
+        if self._trace_path is not None:
+            self._log_trace(record, decision)
         return decision
+
+    def _log_trace(self, record: Mapping[str, Any], decision: Dict[str, Any]) -> None:
+        # Best-effort; a trace write never breaks a decision.
+        try:
+            from datetime import datetime, timezone
+
+            from .trace import summarize_decision
+
+            entry: Dict[str, Any] = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "answers": summarize_decision(decision),
+            }
+            if self._trace_record:
+                entry["record"] = dict(record)
+            self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._trace_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        except OSError:
+            pass
 
     def _swap_to(
         self, artifact_path: Union[str, Path], key: str,

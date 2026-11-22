@@ -74,6 +74,12 @@ def score(
     return tools.score(decisions, expected, confidence_threshold=confidence_threshold)
 
 
+@server.tool()
+def read_traces(path: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    """Summarize a model's decision traces: volume, refusal rate, confidence, value mix (torch-free)."""
+    return tools.read_traces(path, limit=limit)
+
+
 def main() -> None:
     server.run()
 

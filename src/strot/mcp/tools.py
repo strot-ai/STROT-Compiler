@@ -154,3 +154,11 @@ def score(
     import strot
 
     return strot.score_decisions(decisions, expected, confidence_threshold=confidence_threshold)
+
+
+def read_traces(path: str, limit: Optional[int] = None) -> Dict[str, Any]:
+    """Summarize a model's decision traces - volume, refusal rate, confidence,
+    value mix per question (torch-free; the teacher's monitoring signal)."""
+    import strot
+
+    return strot.summarize_traces(strot.read_traces(path, limit=limit))
