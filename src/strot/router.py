@@ -29,6 +29,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL  # re-exported for back-compat
 from .exceptions import FallbackException, RouterConfigurationError
 
 #: The internal base encoders. These identifiers never surface on the public
@@ -51,10 +52,8 @@ STROT_MODELS: Dict[str, str] = {
 #: The default STROT model the public API advertises (never the base id).
 DEFAULT_STROT_MODEL = "zero-shot"
 
-#: Internal default encoder (still the keying/runtime default when no branded
-#: model is given). Kept for back-compat with code/tests that import it.
-DEFAULT_NLU_MODEL = _DEFAULT_BASE_MODEL
-CONFIDENCE_THRESHOLD = 0.40
+#: DEFAULT_NLU_MODEL / CONFIDENCE_THRESHOLD now live in constants.py (imported
+#: above and re-exported here for back-compat until this module is removed).
 MAX_FLAT_OPTIONS = 20
 
 

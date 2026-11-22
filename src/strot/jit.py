@@ -43,7 +43,8 @@ from .compiler import (
     openai_llm_client,
 )
 from .exceptions import RouterConfigurationError, SchemaIntrospectionError
-from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL, resolve_model
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
+from .router import resolve_model
 from .schema import DatasetSchema, introspect_schema
 
 #: ``llm`` parameter: a client callable, or a lazy spec string resolved only

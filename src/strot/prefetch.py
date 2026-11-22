@@ -20,8 +20,8 @@ import subprocess
 import sys
 from typing import Optional
 
+from .constants import DEFAULT_NLU_MODEL
 from .exceptions import RouterConfigurationError
-from .router import DEFAULT_NLU_MODEL
 
 
 def prefetch_nlu(
