@@ -158,14 +158,8 @@ def _fresh_compiled_modules():
 
 @pytest.fixture
 def fake_runtime(monkeypatch, tmp_path):
-    import strot.router
-
-    monkeypatch.setitem(sys.modules, "julia", _build_fake_julia())
-    # Pin the base to Julia so these back-compat tests exercise the zero-shot
-    # decision runtime; production defaults to a head-first encoder.
-    monkeypatch.setitem(strot.router.STROT_MODELS, "zero-shot", "SupersonicLabs/Julia-1")
-    # Point checkpoint resolution at a local dir so the artifact never tries
-    # a Hugging Face download during tests.
+    # Point checkpoint resolution at a local dir so the compiled artifact never
+    # tries a Hugging Face download during tests.
     monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
 
 
