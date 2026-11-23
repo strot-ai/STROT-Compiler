@@ -1,16 +1,16 @@
-"""Compile time: the STROT Synthesizer Engine.
+"""Compile time: the STROT deterministic compiler.
 
-:class:`StrotCompiler.compile_decide` compiles a specialized decision model:
+:meth:`StrotCompiler.compile_model` builds a specialized decision model with no
+LLM and no network - the agent (or a human) brings the labels:
 
 1. **Schema-aware context construction** — introspect the dataset sample into a
    verified structural schema (:mod:`strot.schema`).
-2. **Synthesis** — the LLM designs the typed question set (optional) and writes
-   the state projection (``route_context``), validated with a bounded
-   self-correction retry loop.
-3. **Distillation** — the LLM teacher labels the sample; a calibrated head per
-   question is trained on the frozen encoder's embeddings (``lite`` skips the
-   teacher; ``deep`` adds a shared LoRA adapter) and baked into a standalone
-   artifact that emits typed decision JSON.
+2. **Projection** — a ``route_context`` that selects the text to embed (a default
+   concatenates text fields; the caller may supply one).
+3. **Distillation** — a calibrated head per question is fit on the frozen
+   encoder's embeddings of the caller's labels (``lite`` skips labels with
+   zero-shot prototype heads; ``deep`` adds a shared LoRA adapter) and baked into
+   a standalone artifact that emits typed decision JSON.
 """
 
 from __future__ import annotations
@@ -21,179 +21,48 @@ import re
 import types as _types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import templates
 from .exceptions import CompilationError, RouterConfigurationError
 from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .schema import DatasetSchema, introspect_schema
 
-#: A generative LLM client is any callable mapping a prompt to raw model text.
-LLMClient = Callable[[str], str]
-
 #: Below this many labeled records for a class, its head under-learns; warn.
 MIN_CLASS_RECORDS = 3
+
+#: Default state projection for the LLM-free ``train`` path: concatenate the
+#: record's text fields (then numeric fields if there is no text). No LLM
+#: designs this - the caller can pass a custom ``route_context`` for a better
+#: one. Only ``route_context`` is used at runtime, so this is all a trained
+#: model needs baked in.
+DEFAULT_DECIDE_PROJECTION = '''\
+def route_context(record: dict) -> str:
+    """Default projection: the record's text fields, concatenated."""
+    parts = []
+    for key in sorted(record):
+        value = record[key]
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}: {value.strip()}")
+    if not parts:
+        for key in sorted(record):
+            value = record[key]
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(f"{key}: {value}")
+    return "\\n".join(parts)
+'''
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
-def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMClient:
-    """Convenience factory: a synthesizer client backed by the OpenAI API."""
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RouterConfigurationError(
-            "openai_llm_client requires the 'openai' extra: "
-            "pip install strot-ai[openai]"
-        ) from exc
-    client = OpenAI()
-
-    def _call(prompt: str) -> str:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content or ""
-
-    return _call
 
 
-def anthropic_llm_client(
-    model: str = "claude-opus-4-8",
-    max_tokens: int = 16000,
-) -> LLMClient:
-    """Convenience factory: a synthesizer client backed by the Anthropic API.
-
-    Requires the ``anthropic`` package (``pip install strot-ai[anthropic]``)
-    and ``ANTHROPIC_API_KEY`` in the environment.
-    """
-    try:
-        from anthropic import Anthropic
-    except ImportError as exc:
-        raise RouterConfigurationError(
-            "anthropic_llm_client requires the 'anthropic' extra: "
-            "pip install strot-ai[anthropic]"
-        ) from exc
-    client = Anthropic()
-
-    def _call(prompt: str) -> str:
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if response.stop_reason == "refusal":
-            raise CompilationError(
-                "Anthropic synthesizer refused the request.", attempts=0
-            )
-        return "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-
-    return _call
 
 
-def claude_cli_llm_client(
-    model: Optional[str] = None,
-    cli: str = "claude",
-    timeout: float = 600.0,
-) -> LLMClient:
-    """Use Claude Code for synthesis.
-
-    Requires ``--safe-mode`` support. This skips user customizations and
-    keeps CLI authentication. Built-in tools and session persistence are
-    disabled. No SDK is required.
-    """
-    return _cli_llm_client("claude", cli, model, timeout)
 
 
-def codex_cli_llm_client(
-    model: Optional[str] = None,
-    cli: str = "codex",
-    timeout: float = 600.0,
-) -> LLMClient:
-    """Use ``codex exec`` for synthesis.
-
-    Run ``codex login`` for ChatGPT subscription access. The CLI must support
-    ``--ignore-user-config`` and ``--ephemeral``. No SDK is required.
-    Shell commands, web search, and project instructions are disabled.
-    """
-    return _cli_llm_client("codex", cli, model, timeout)
 
 
-def _cli_llm_client(backend: str, cli: str, model: Optional[str], timeout: float) -> LLMClient:
-    import shutil
-    import subprocess
-    import tempfile
-
-    cli_path = shutil.which(cli)
-    if cli_path is None:
-        raise RouterConfigurationError(
-            f"Cannot find the {cli!r} CLI on PATH. Install {backend} and sign in."
-        )
-    cli_path = str(Path(cli_path).absolute())
-
-    def _call(prompt: str) -> str:
-        # Use stdin for context and skip project instructions.
-        with tempfile.TemporaryDirectory(prefix="strot-synthesis-") as cwd:
-            output = Path(cwd) / "response.txt"
-            if backend == "codex":
-                command = [
-                    cli_path, "exec", "--ignore-user-config", "--ephemeral",
-                    "-c", "project_doc_max_bytes=0", "-c", "features.shell_tool=false",
-                    "-c", 'web_search="disabled"',
-                    "--sandbox", "read-only", "--skip-git-repo-check",
-                    "--color", "never", "--output-last-message", str(output),
-                ]
-            else:
-                command = [
-                    cli_path, "--safe-mode", "-p", "--output-format", "text", "--tools", "",
-                    "--no-session-persistence",
-                ]
-            if model:
-                command += ["--model", model]
-            try:
-                proc = subprocess.run(
-                    command, input=prompt, capture_output=True, text=True,
-                    encoding="utf-8", timeout=timeout, cwd=cwd,
-                )
-                if proc.returncode != 0:
-                    detail = (proc.stdout.strip() + "\n" + proc.stderr.strip()).strip()[:500]
-                    raise CompilationError(
-                        f"{backend} CLI synthesizer exited {proc.returncode}: "
-                        f"{detail}", attempts=0,
-                    )
-                response = output.read_text(encoding="utf-8") if backend == "codex" else proc.stdout
-            except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
-                raise CompilationError(
-                    f"{backend} CLI synthesizer failed: {exc}", attempts=0,
-                ) from exc
-            if not response.strip():
-                raise CompilationError(f"{backend} CLI synthesizer returned no text.", attempts=0)
-            return response
-
-    return _call
-
-
-def _sample_records(sample: Any) -> List[Dict[str, Any]]:
-    """Normalize any supported sample shape into a list of dict records."""
-    from .schema import SchemaProfiler
-
-    columns = SchemaProfiler()._normalize(sample)
-    length = max(len(values) for values in columns.values())
-    return [
-        {name: (values[i] if i < len(values) else None) for name, values in columns.items()}
-        for i in range(length)
-    ]
-
-
-def handler_name(action_key: str) -> str:
-    """Map an action-registry key to its compiled function name."""
-    sanitized = re.sub(r"\W+", "_", action_key).strip("_").lower()
-    if not sanitized:
-        raise CompilationError(f"Action key {action_key!r} cannot form a function name.", attempts=0)
-    return f"execute_{sanitized}"
 
 
 @dataclass(frozen=True)
@@ -202,14 +71,12 @@ class CompiledAsset:
 
     source: str
     nlu_model: str
-    runtime_kind: str  # "local" | "hosted"
+    runtime_kind: str  # "local"
     goal: str
     schema: DatasetSchema
     attempts: int
     calibration: Optional[Dict[str, Any]] = None  #: fitted stats (None = uncalibrated)
-    label_search: Optional[Dict[str, Any]] = None  #: measured-labeling scores (None = not measured)
-    model_search: Optional[Dict[str, Any]] = None  #: zero-shot vs distilled scores (None = no distill)
-    policy: Optional[Dict[str, Any]] = None  #: fitted target-accuracy dispatch policy
+    model_search: Optional[Dict[str, Any]] = None  #: winner/n_records metadata
 
     def save(self, path: Union[str, Path] = "compiled_pipeline.py") -> Path:
         """Persist the asset as an independent Python file."""
@@ -225,15 +92,9 @@ class StrotCompiler:
     def __init__(
         self,
         nlu_model: str = DEFAULT_NLU_MODEL,
-        llm_client: Optional[LLMClient] = None,
-        max_retries: int = 3,
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
     ) -> None:
-        if max_retries < 1:
-            raise ValueError("max_retries must be at least 1.")
         self.nlu_model = nlu_model
-        self.llm_client = llm_client
-        self.max_retries = max_retries
         self.confidence_threshold = confidence_threshold
 
     @property
@@ -245,32 +106,6 @@ class StrotCompiler:
     # Phase 2: prompt scaffolding                                         #
     # ------------------------------------------------------------------ #
 
-    def _synthesize_with(
-        self, prompt: str, validate: Callable[[str], Optional[str]]
-    ) -> "tuple[str, int]":
-        if self.llm_client is None:
-            raise CompilationError(
-                "No llm_client configured. Pass a callable (e.g. "
-                "strot.compiler.openai_llm_client()) to StrotCompiler.",
-                attempts=0,
-            )
-        current_prompt = prompt
-        last_error: Optional[str] = None
-        candidate = ""
-        for attempt in range(1, self.max_retries + 1):
-            raw = self.llm_client(current_prompt)
-            candidate = self._extract_code(raw)
-            error = validate(candidate)
-            if error is None:
-                return candidate, attempt
-            last_error = error
-            current_prompt = self._build_repair_prompt(prompt, candidate, error)
-        raise CompilationError(
-            f"Synthesizer failed after {self.max_retries} attempts; "
-            f"last validation error: {last_error}",
-            attempts=self.max_retries,
-            last_error=last_error,
-        )
 
     @staticmethod
     def _extract_code(raw: str) -> str:
@@ -623,144 +458,8 @@ class StrotCompiler:
             "statements.",
         ])
 
-    def propose_questions(self, sample: Any, intent: str) -> Dict[str, Any]:
-        """Intake: synthesize a typed question set from a one-line intent.
 
-        Returns a validated ``questions`` config for the author to review and
-        edit before :meth:`compile_decide`. The LLM designs the decision schema
-        here; it does not train or invent data.
-        """
-        schema = introspect_schema(sample)
-        prompt = self.build_propose_prompt(schema, intent)
-        promoted: Dict[str, Any] = {}
 
-        def validate(code: str) -> Optional[str]:
-            try:
-                questions = self._literal_assignment(code, "QUESTIONS")
-            except Exception as exc:
-                return f"QUESTIONS must be a single top-level literal dict: {exc}"
-            if not isinstance(questions, dict) or not questions:
-                return "QUESTIONS must be a non-empty dict."
-            try:
-                self.validate_questions_config(questions)
-            except RouterConfigurationError as exc:
-                return str(exc)
-            promoted["questions"] = questions
-            return None
-
-        self._synthesize_with(prompt, validate)
-        return promoted["questions"]
-
-    def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
-        """Construct the decide-mode prompt: expand a typed-question config for the model."""
-        return "\n".join(
-            [
-                "You are the STROT synthesizer. Expand a typed-question config "
-                "for a small local decision model - you configure, you do not "
-                "write programs.",
-                "",
-                "## VERIFIED DATASET SCHEMA",
-                schema.to_json(),
-                "",
-                "## DECISION CONFIG (typed questions)",
-                json.dumps(self._prompt_config(questions), indent=2),
-                "",
-                "## OUTPUT CONTRACT",
-                "Emit exactly one ```python code block containing EXACTLY two "
-                "top-level definitions and nothing else:",
-                "- `QUESTIONS: Dict[str, Any]` literal with the SAME question "
-                "names. Per question: keep \"type\" and \"instructions\" (write "
-                "crisp instructions if the config omits them). For 'choice' add "
-                "\"criteria\": a dict mapping EVERY choice value (exact, as given "
-                "in the config - keep booleans as booleans) to a short "
-                "discriminative description using vocabulary from the records; "
-                "sharpen each config 'description' where present. For 'score' add "
-                "\"rubric\": a list of {\"label\": <config level label, exact>, "
-                "\"description\": <short discriminative description grounded in "
-                "the instructions' anchors and the records' vocabulary>} entries, "
-                "one per config level, in the SAME order the config lists them "
-                "(lowest to highest). For 'predicate' (or the deprecated "
-                "'boolean' alias) add \"criteria\": {\"false\": <short "
-                "negative-case description>, \"true\": <short positive-case "
-                "description>}.",
-                "- `def route_context(record: dict) -> str:` projecting ONLY "
-                "the fields relevant to answering the questions into a compact "
-                "string.",
-                "",
-                "Rules: short, mutually distinct labels dramatically outperform "
-                "long ones; no imports, no other statements.",
-            ]
-        )
-
-    def _validate_decide_candidate(
-        self, code: str, questions: Mapping[str, Any]
-    ) -> Optional[str]:
-        error = self._validate_candidate(code, ["route_context"])
-        if error:
-            return error
-        tree = ast.parse(code)
-        value_node = None
-        for node in tree.body:
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if any(isinstance(t, ast.Name) and t.id == "QUESTIONS" for t in targets):
-                    value_node = node.value
-        if value_node is None:
-            return "Missing required module-level literal QUESTIONS."
-        try:
-            expanded = ast.literal_eval(value_node)
-        except (ValueError, SyntaxError):
-            return "QUESTIONS must be a literal dict."
-        if set(expanded) != set(questions):
-            return f"QUESTIONS keys must exactly match the config: {sorted(questions)}"
-        for name, spec in questions.items():
-            item = expanded[name]
-            if not isinstance(item, dict) or item.get("type") != spec["type"]:
-                return f"question {name!r}: type must stay {spec['type']!r}"
-            if not isinstance(item.get("instructions"), str) or not item["instructions"].strip():
-                return f"question {name!r}: instructions must be a non-empty string"
-            if spec["type"] == "choice":
-                values = [value for value, _ in self._choice_pairs(spec)]
-                criteria = item.get("criteria")
-                if not isinstance(criteria, dict) or set(criteria) != set(values):
-                    return (
-                        f"question {name!r}: criteria keys must exactly match "
-                        f"the choice values {values}"
-                    )
-                if not all(isinstance(v, str) and v.strip() for v in criteria.values()):
-                    return f"question {name!r}: criteria descriptions must be non-empty strings"
-            elif spec["type"] == "score":
-                labels = [label for label, _ in self._score_levels(spec)]
-                rubric = item.get("rubric")
-                if not isinstance(rubric, list) or len(rubric) != len(labels):
-                    return (
-                        f"question {name!r}: rubric must be a list of exactly "
-                        f"{len(labels)} ordered levels (one per config level)"
-                    )
-                for level, label in zip(rubric, labels):
-                    if (
-                        not isinstance(level, dict)
-                        or str(level.get("label")) != label
-                    ):
-                        return (
-                            f"question {name!r}: each rubric level must be a "
-                            "mapping whose 'label' matches the config levels, in "
-                            f"order: {labels}"
-                        )
-                    description = level.get("description")
-                    if not isinstance(description, str) or not description.strip():
-                        return (
-                            f"question {name!r}: each rubric level needs a "
-                            "non-empty 'description'"
-                        )
-            else:  # predicate (or the deprecated boolean alias)
-                criteria = item.get("criteria")
-                if not isinstance(criteria, dict) or set(criteria) != {"false", "true"}:
-                    return (
-                        f"question {name!r}: criteria must map exactly "
-                        "'false' and 'true' to descriptions"
-                    )
-        return None
 
     @staticmethod
     def validate_golden_decide(golden: Any, questions: Mapping[str, Any]) -> None:
@@ -876,64 +575,30 @@ class StrotCompiler:
                 return ast.literal_eval(node.value)
         raise ValueError(f"no top-level {name!r} assignment")
 
-    def build_decide_teacher_prompt(
-        self, questions: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
-    ) -> str:
-        """Ask the teacher LLM to answer every question for every record - the
-        training labels each per-question head is distilled from."""
-        spec_lines = []
-        for name, spec in questions.items():
-            base, classes = self._question_runtime(spec)
-            allowed = ("true or false" if base == "predicate"
-                       else "exactly one of: " + ", ".join(repr(c) for c in classes))
-            spec_lines.append(
-                f"- {name!r} ({base}): {spec.get('instructions', '')} "
-                f"Answer with {allowed}."
-            )
-        return "\n".join([
-            "You are the STROT teacher. Answer every question for every record "
-            "below - these answers train a small local model, so be accurate and "
-            "internally consistent.",
-            "",
-            "## QUESTIONS",
-            "\n".join(spec_lines),
-            "",
-            "## RECORDS",
-            json.dumps([dict(r) for r in records], indent=2, default=str),
-            "",
-            "## OUTPUT CONTRACT",
-            "Emit exactly one ```python code block with a single top-level "
-            "definition and nothing else:",
-            f"- `ANSWERS: list` of EXACTLY {len(records)} dicts, one per record "
-            "in the SAME order. Each dict maps EVERY question name to that "
-            "record's answer: predicate -> a Python bool (True/False); choice -> "
-            "exactly one allowed value (keep booleans as booleans); score -> "
-            "exactly one allowed level label (a string).",
-        ])
 
-    def _validate_decide_labels(
-        self, code: str, n: int, questions: Mapping[str, Any]
+
+    @staticmethod
+    def _check_decide_answers(
+        answers: Any, n: int, questions: Mapping[str, Any]
     ) -> Optional[str]:
-        try:
-            answers = self._literal_assignment(code, "ANSWERS")
-        except Exception as exc:
-            return f"ANSWERS must be a single literal list assignment: {exc}"
+        """Validate a labels list (``[{question: answer}, ...]``) against the
+        config: ``n`` rows, every question present, each value a valid answer."""
         if not isinstance(answers, list) or len(answers) != n:
             got = len(answers) if isinstance(answers, list) else "a non-list"
-            return f"ANSWERS must have exactly {n} entries (got {got})."
+            return f"labels must have exactly {n} entries (got {got})."
         for i, row in enumerate(answers):
             if not isinstance(row, dict):
-                return f"ANSWERS[{i}] must be a dict."
+                return f"labels[{i}] must be a dict."
             for name, spec in questions.items():
                 if name not in row:
-                    return f"ANSWERS[{i}] is missing question {name!r}."
-                base, classes = self._question_runtime(spec)
+                    return f"labels[{i}] is missing question {name!r}."
+                base, classes = StrotCompiler._question_runtime(spec)
                 value = row[name]
                 if base == "predicate" and not isinstance(value, bool):
-                    return f"ANSWERS[{i}][{name!r}] must be a bool."
+                    return f"labels[{i}][{name!r}] must be a bool."
                 if base != "predicate" and value not in classes:
                     return (
-                        f"ANSWERS[{i}][{name!r}]={value!r} is not an allowed "
+                        f"labels[{i}][{name!r}]={value!r} is not an allowed "
                         f"{base} answer."
                     )
         return None
@@ -984,112 +649,24 @@ class StrotCompiler:
             }
         return heads
 
-    def compile_decide(
+
+    def _distill_and_bake(
         self,
-        sample: Any,
+        records: List[Mapping[str, Any]],
+        contexts: List[str],
+        answers: List[Mapping[str, Any]],
         questions: Mapping[str, Any],
-        golden: Optional[List[Mapping[str, Any]]] = None,
-        mode: str = "head",
+        code: str,
+        schema: DatasetSchema,
+        golden: Optional[List[Mapping[str, Any]]],
+        attempts: int,
+        mode: str,
     ) -> CompiledAsset:
-        """Decide mode: compile one decision head per typed question.
-
-        ``mode`` picks the tier:
-
-        * ``"lite"`` - zero-shot prototype heads: each class is an embedding of
-          its description, scored by cosine at runtime. No teacher labels, no
-          training; the synthesizer still writes the state projection. The local
-          $0 floor (instant, bring-no-data).
-        * ``"head"`` (default) - the teacher LLM answers every question for every
-          sampled record; a calibrated logistic head per question is trained on
-          the frozen encoder's embeddings and baked in.
-        * ``"deep"`` - a shared top-N LoRA adapter is fine-tuned over all
-          questions, then the heads are refit on the adapted embedding.
-
-        Invariant - **recompile, don't increment**: every compile trains a FRESH
-        head (and, for ``deep``, a fresh adapter) from the frozen base on the
-        current data; it NEVER warm-starts from previously trained weights. A
-        compiled model's weights are a pure function of its own
-        ``(data, questions, mode)`` - independent of what was compiled before.
-        This is what keeps continuous optimization immune to catastrophic
-        forgetting: retraining on accumulated data is a clean re-fit, not a
-        sequential update that could erode earlier quality. Do not add a
-        warm-start-from-prior-weights path without revisiting that guarantee.
-
-        With ``golden``, the baked model is run against known-answer records and
-        rejected if any expectation fails.
-        """
-        if mode not in ("lite", "head", "deep"):
-            raise RouterConfigurationError(
-                f"decide mode must be 'lite', 'head', or 'deep' (got {mode!r})."
-            )
-        if self.runtime_kind != "local":
-            raise RouterConfigurationError(
-                "decide mode requires a local encoder to embed records "
-                f"(got {self.nlu_model!r})."
-            )
-        self.validate_questions_config(questions)
-        if golden is not None:
-            self.validate_golden_decide(golden, questions)
-        schema = introspect_schema(sample)
-        records = list(sample)
+        """The deterministic distill core: given the projected ``contexts`` and
+        the ``answers`` that label them, embed, fit one calibrated head per
+        question plus the OOD gate, and bake. No LLM, no network - only the frozen
+        encoder (and, for ``deep``, a shared LoRA adapter)."""
         from . import distill as distill_mod
-
-        if mode == "head" and len(records) < distill_mod.MIN_DISTILL_RECORDS:
-            raise RouterConfigurationError(
-                f"decide needs at least {distill_mod.MIN_DISTILL_RECORDS} sample "
-                f"records to distill its heads (got {len(records)}); raise "
-                "sample_size."
-            )
-        if mode == "deep":
-            from . import finetune as finetune_mod
-
-            if len(records) < finetune_mod.MIN_FINETUNE_RECORDS:
-                raise RouterConfigurationError(
-                    f"decide mode='deep' needs at least "
-                    f"{finetune_mod.MIN_FINETUNE_RECORDS} records to fine-tune the "
-                    f"shared adapter (got {len(records)}); raise sample_size or use "
-                    "mode='head'."
-                )
-
-        # 1. Synthesize the state projection (route_context). The decide prompt
-        # also expands criteria/rubrics; the heads learn from labels rather than
-        # criteria, so only route_context is used - the block is kept in the
-        # baked model as a record of the synthesis.
-        prompt = self.build_decide_prompt(schema, questions)
-        promoted: Dict[str, str] = {}
-
-        def validate(code: str) -> Optional[str]:
-            error = self._validate_decide_candidate(code, questions)
-            if error:
-                return error
-            promoted["code"] = code
-            return None
-
-        _, attempts = self._synthesize_with(prompt, validate)
-        code = promoted["code"]
-
-        if mode == "lite":
-            # Zero-shot tier: prototype heads from the config's own text, no
-            # teacher pass and no training. The projection above is still baked.
-            question_heads = self._lite_heads(questions)
-            return self._bake_decider(
-                question_heads, code, schema, questions, golden, attempts,
-                winner="lite",
-            )
-
-        ns: Dict[str, Any] = {}
-        exec(compile(code, "<decide-projection>", "exec"), ns)
-        contexts = [ns["route_context"](dict(record)) for record in records]
-
-        # 2. Teacher labels: every question answered for every record.
-        from . import pii
-
-        masked = pii.mask_records(records, maskers=pii.default_maskers())
-        labels_code, _ = self._synthesize_with(
-            self.build_decide_teacher_prompt(questions, masked),
-            lambda c: self._validate_decide_labels(c, len(records), questions),
-        )
-        answers = self._literal_assignment(labels_code, "ANSWERS")
 
         # Coverage guard: a head can only learn an outcome it has seen. Warn on
         # thin classes so the author brings records covering each outcome
@@ -1104,7 +681,7 @@ class StrotCompiler:
             thin = [c for c in classes if counts.get(c, 0) < MIN_CLASS_RECORDS]
             if thin:
                 warnings.warn(
-                    f"decide: question {name!r} has thin coverage for {thin} "
+                    f"question {name!r} has thin coverage for {thin} "
                     f"(<{MIN_CLASS_RECORDS} labeled records each); the head will "
                     "under-learn these outcomes. Bring more records covering them.",
                     stacklevel=2,
@@ -1198,6 +775,96 @@ class StrotCompiler:
             winner=("fine_tuned" if mode == "deep" else "distilled"),
             n_records=len(records), adapter=adapter, adapter_config=adapter_config,
             ood=ood,
+        )
+
+    def compile_model(
+        self,
+        sample: Any,
+        questions: Mapping[str, Any],
+        labels: Optional[Sequence[Mapping[str, Any]]] = None,
+        projection: Optional[str] = None,
+        golden: Optional[List[Mapping[str, Any]]] = None,
+        mode: str = "head",
+    ) -> CompiledAsset:
+        """Compile a decision model - the deterministic, LLM-free door.
+
+        STROT runs no LLM and holds no key: the agent (or a human) brings the
+        labels, STROT embeds, fits the calibrated heads + OOD gate, and bakes.
+
+        * ``lite`` - zero-shot prototype heads from each option's description;
+          needs **no labels**. The local $0 floor.
+        * ``head`` (default) / ``deep`` - distilled from ``labels``, one
+          ``{question: answer}`` dict per record in ``sample`` order (an agent's
+          decisions, or human ground truth). ``deep`` adds a shared LoRA adapter.
+
+        ``projection`` is optional ``route_context(record) -> str`` source; the
+        default concatenates the record's text fields.
+        """
+        if mode not in ("lite", "head", "deep"):
+            raise RouterConfigurationError(
+                f"mode must be 'lite', 'head', or 'deep' (got {mode!r})."
+            )
+        if self.runtime_kind != "local":
+            raise RouterConfigurationError(
+                "compile requires a local encoder to embed records "
+                f"(got {self.nlu_model!r})."
+            )
+        self.validate_questions_config(questions)
+        if golden is not None:
+            self.validate_golden_decide(golden, questions)
+        schema = introspect_schema(sample)
+        records = list(sample)
+
+        # Projection: a caller-supplied route_context, or the default concat.
+        if projection is None:
+            code = DEFAULT_DECIDE_PROJECTION
+        else:
+            perr = self._validate_candidate(projection, ["route_context"])
+            if perr:
+                raise RouterConfigurationError(f"projection is invalid: {perr}")
+            code = projection
+
+        if mode == "lite":
+            # Zero-shot: prototype heads from the config's own text, no labels,
+            # no training. The projection is still baked so the runtime embeds.
+            return self._bake_decider(
+                self._lite_heads(questions), code, schema, questions, golden,
+                attempts=0, winner="lite",
+            )
+
+        from . import distill as distill_mod
+
+        if labels is None:
+            raise RouterConfigurationError(
+                f"mode={mode!r} needs labels (one {{question: answer}} dict per "
+                "record, in sample order); bring them, or use mode='lite'."
+            )
+        answers = [dict(row) for row in labels]
+        if len(records) < distill_mod.MIN_DISTILL_RECORDS:
+            raise RouterConfigurationError(
+                f"compile needs at least {distill_mod.MIN_DISTILL_RECORDS} labeled "
+                f"records to distill its heads (got {len(records)})."
+            )
+        if mode == "deep":
+            from . import finetune as finetune_mod
+
+            if len(records) < finetune_mod.MIN_FINETUNE_RECORDS:
+                raise RouterConfigurationError(
+                    f"mode='deep' needs at least {finetune_mod.MIN_FINETUNE_RECORDS} "
+                    f"records to fine-tune the shared adapter (got {len(records)}); "
+                    "use mode='head'."
+                )
+        error = self._check_decide_answers(answers, len(records), questions)
+        if error:
+            raise RouterConfigurationError(f"labels are invalid: {error}")
+
+        ns: Dict[str, Any] = {}
+        exec(compile(code, "<compile-projection>", "exec"), ns)
+        contexts = [ns["route_context"](dict(record)) for record in records]
+
+        return self._distill_and_bake(
+            records, contexts, answers, questions, code, schema, golden,
+            attempts=0, mode=mode,
         )
 
     def _bake_decider(

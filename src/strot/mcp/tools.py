@@ -105,35 +105,28 @@ def pii_scan(data: DataArg, sample_size: int = 25) -> Dict[str, Any]:
     return strot.pii_scan(_as_records(data), sample_size=sample_size)
 
 
-def design_questions(
-    data: DataArg, intent: str, llm: str = "openai/gpt-4o", sample_size: int = 25
-) -> Dict[str, Any]:
-    """Design a typed question config from a one-line intent + a data sample."""
-    import strot
-
-    return strot.questions(_as_records(data), intent, llm=llm, sample_size=sample_size)
-
-
 def compile_model(
     data: DataArg,
     questions: Union[str, Dict[str, Any]],
+    labels: Optional[List[Dict[str, Any]]] = None,
     mode: str = "head",
-    llm: Any = "openai/gpt-4o",
+    projection: Optional[str] = None,
     state: str = ".strot",
     name: Optional[str] = None,
-    sample_size: int = 25,
 ) -> Dict[str, Any]:
-    """Compile a decision model (needs the ``[local]`` extra). Returns its path.
+    """Compile a decision model - the LLM-free door (needs the ``[local]`` extra).
 
-    ``questions`` may be a config dict or a bare intent string. ``sample_size`` is
-    how many records the teacher labels. When ``name`` is given, the model is
-    saved as ``<name>.strot``.
+    STROT holds no key and calls no LLM: YOU (the agent) design the questions and
+    label the sample, then hand them here. ``labels`` is one ``{question: answer}``
+    dict per record in ``data`` order (an agent's decisions or human ground
+    truth); ``mode="lite"`` needs no labels (zero-shot). ``projection`` is optional
+    ``route_context`` source (default concatenates text fields). Returns the path.
     """
     import strot
 
-    result = strot.decide(
-        _as_records(data), questions, llm=llm, mode=mode, state=state,
-        execute=False, name=name, sample_size=sample_size,
+    result = strot.compile(
+        _as_records(data), questions, labels, projection=projection, mode=mode,
+        state=state, execute=False, name=name,
     )
     path = result.dispatch(name) if name else result.artifact_path
     return {
@@ -177,14 +170,16 @@ _jobs_lock = threading.Lock()
 def compile_start(
     data: DataArg,
     questions: Union[str, Dict[str, Any]],
+    labels: Optional[List[Dict[str, Any]]] = None,
     mode: str = "head",
-    llm: Any = "openai/gpt-4o",
+    projection: Optional[str] = None,
     state: str = ".strot",
     name: Optional[str] = None,
-    sample_size: int = 25,
 ) -> Dict[str, Any]:
     """Start a compile in the background; returns a ``job_id`` to poll with
-    :func:`compile_status`. Honors the compile budget. Needs the ``[local]`` extra.
+    :func:`compile_status`. YOU bring the labels (no LLM); ``mode="lite"`` needs
+    none. Embedding a large sample runs minutes, so it is off-thread. Honors the
+    compile cap (a compute guard). Needs the ``[local]`` extra.
     """
     cap = _compile_cap()
     with _budget_lock:
@@ -200,8 +195,8 @@ def compile_start(
 
     def _run() -> None:
         try:
-            result = compile_model(data, questions, mode=mode, llm=llm, state=state,
-                                   name=name, sample_size=sample_size)
+            result = compile_model(data, questions, labels, mode=mode,
+                                   projection=projection, state=state, name=name)
             with _jobs_lock:
                 _jobs[job_id].update(status="done", result=result)
         except Exception as exc:  # surface the error to the poller, never crash the thread
@@ -281,15 +276,15 @@ def _questions_config(model_path: str) -> Any:
 def recompile(
     model_path: str,
     data: DataArg,
-    llm: Any = "openai/gpt-4o",
+    labels: Optional[List[Dict[str, Any]]] = None,
     mode: str = "head",
     name: Optional[str] = None,
-    sample_size: int = 25,
 ) -> Dict[str, Any]:
     """Recompile a model on fresh/accumulated data, reusing its question config.
 
-    A fresh distillation (recompile-don't-increment), started async. Defaults to a
-    new ``<name>-recompiled`` artifact so the agent can evaluate it before
+    A fresh distillation (recompile-don't-increment), started async. YOU re-label
+    the new data (no LLM) and pass ``labels``; ``mode="lite"`` needs none. Defaults
+    to a new ``<name>-recompiled`` artifact so the agent can evaluate it before
     promoting with :func:`set_status`. Needs the ``[local]`` extra.
     """
     cfg = _questions_config(model_path)
@@ -298,7 +293,7 @@ def recompile(
                 "error": f"could not read a question config from {model_path!r}"}
     orig = Path(model_path)
     target = name or str(orig.with_name(orig.stem + "-recompiled"))  # same dir as the original
-    return compile_start(data, cfg, mode=mode, llm=llm, name=target, sample_size=sample_size)
+    return compile_start(data, cfg, labels, mode=mode, name=target)
 
 
 def cluster_rejections(traces_path: str, top_terms: int = 10, max_samples: int = 20) -> Dict[str, Any]:

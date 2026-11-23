@@ -1,24 +1,18 @@
 """strot-ai: a decision compiler.
 
 STROT (Structured Task Reasoning and Output Transformation, arXiv:2505.01636)
-compiles a specialized decision model per task: an LLM teacher labels your real
-data, a calibrated head is distilled onto a frozen encoder, and the result is a
-self-contained model that runs locally on CPU and emits typed decision JSON.
+compiles a specialized decision model per task. STROT runs no LLM and holds no
+key: the agent (or a human) brings the labels, a calibrated head is distilled
+onto a frozen encoder, and the result is a self-contained model that decides
+locally on CPU and emits typed decision JSON.
 
-    questions = strot.questions(data, "triage support tickets")  # design the schema
-    model = strot.decide(data, questions)                        # compile a model
-    model(record)                                                # decide, locally
-    model.dispatch("triage"); strot.load_model("triage")             # ship + reuse
+    # the agent designs the questions and labels a small sample (see `strot playbook`)
+    model = strot.compile(data, questions, labels)   # distill a model, no LLM
+    model(record)                                     # decide, locally
+    model.dispatch("triage"); strot.load_model("triage")   # ship + reuse
 """
 
-from .compiler import (
-    CompiledAsset,
-    StrotCompiler,
-    anthropic_llm_client,
-    claude_cli_llm_client,
-    codex_cli_llm_client,
-    openai_llm_client,
-)
+from .compiler import CompiledAsset, StrotCompiler
 from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .exceptions import (
     CompilationError,
@@ -29,17 +23,19 @@ from .exceptions import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
-from .jit import DecisionModel, RunResult, decide, load_model, questions  # noqa: E402  (needs __version__ for cache keys)
+# `compile` is the build verb (re.compile-style: compiled once, decides forever).
+# The agent brings the labels; STROT distills the model with no LLM.
+from .jit import DecisionModel, RunResult, load_model  # noqa: E402  (needs __version__ for cache keys)
+from .jit import train as compile  # noqa: E402,A001  (the one build door; shadows the builtin at the package surface)
 from .evaluate import evaluate, score_decisions  # noqa: E402
 from .trace import cluster_rejections, drift_check, read_traces, summarize_traces  # noqa: E402
 from .inspect import inspect_data, pii_scan  # noqa: E402
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
-    "decide",
-    "questions",
+    "compile",
     "evaluate",
     "score_decisions",
     "read_traces",
@@ -54,10 +50,6 @@ __all__ = [
     "prefetch_nlu",
     "CompiledAsset",
     "StrotCompiler",
-    "openai_llm_client",
-    "anthropic_llm_client",
-    "claude_cli_llm_client",
-    "codex_cli_llm_client",
     "StrotError",
     "CompilationError",
     "FallbackException",
