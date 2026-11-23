@@ -39,6 +39,7 @@ except ImportError as _exc:  # pragma: no cover - environment guard
     ) from _exc
 
 NLU_MODEL = {nlu_model!r}
+NLU_MAX_LENGTH = {max_length}
 
 DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
 
@@ -114,7 +115,7 @@ class CompiledDecider:
 
     def _embed(self, text: str) -> List[float]:
         inputs = self._tokenizer(
-            [text], return_tensors="pt", padding=True, truncation=True, max_length=256,
+            [text], return_tensors="pt", padding=True, truncation=True, max_length=NLU_MAX_LENGTH,
         )
         with torch.no_grad():
             hidden = self._model(**inputs).last_hidden_state

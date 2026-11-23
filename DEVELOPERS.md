@@ -40,7 +40,10 @@ labels, projection, mode)`, so retraining on accumulated data is forgetting-free
 ## Tiers — `mode=`
 
 Both tiers emit the same artifact type (a `DecisionModel`); only how the heads
-are fitted differs:
+are fitted differs. Both share one token window — `compile(..., max_length=256)`
+(the default; ModernBERT allows up to 8192). It's baked into the artifact so
+inference uses the same window, and head/deep always share it so they never
+diverge. Raise it for long records (cost scales with length; `deep` especially):
 
 | mode | heads | needs | when |
 |---|---|---|---|

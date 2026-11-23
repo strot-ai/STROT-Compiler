@@ -248,4 +248,4 @@ def decide_encoder(monkeypatch):
     """Point decide's per-question head training at a deterministic fake
     embedder, and resolve the checkpoint locally (no download)."""
     import strot.distill as distill_mod
-    monkeypatch.setattr(distill_mod, "make_encoder_embedder", lambda ckpt: _decide_embed)
+    monkeypatch.setattr(distill_mod, "make_encoder_embedder", lambda ckpt, **kw: _decide_embed)
