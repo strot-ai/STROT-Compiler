@@ -22,6 +22,7 @@ import math
 import random
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
+from .constants import NLU_MAX_LENGTH
 from .exceptions import RouterConfigurationError
 
 #: Maps texts to fixed-size float vectors.
@@ -84,7 +85,7 @@ def make_encoder_embedder(checkpoint: str, batch_size: int = 16) -> EmbedFn:
             batch = texts[start:start + batch_size]
             inputs = tokenizer(
                 batch, return_tensors="pt", padding=True,
-                truncation=True, max_length=256,
+                truncation=True, max_length=NLU_MAX_LENGTH,
             )
             with torch.no_grad():
                 hidden = model(**inputs).last_hidden_state

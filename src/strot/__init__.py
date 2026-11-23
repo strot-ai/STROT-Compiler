@@ -23,7 +23,7 @@ from .exceptions import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 # `compile` is the build verb (re.compile-style: compiled once, decides forever).
 # The agent brings the labels; STROT distills the model with no LLM.

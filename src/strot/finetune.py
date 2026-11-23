@@ -37,7 +37,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
-from .constants import DEFAULT_NLU_MODEL
+from .constants import DEFAULT_NLU_MODEL, NLU_MAX_LENGTH
 from .exceptions import RouterConfigurationError
 
 #: Default fine-tune base: the SAME encoder `head` uses, so `deep` is a true
@@ -55,7 +55,7 @@ DEFAULT_LORA_RANK = 16
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_EPOCHS = 6
 DEFAULT_LR = 1e-3
-DEFAULT_MAX_LEN = 128
+DEFAULT_MAX_LEN = NLU_MAX_LENGTH  # match head's token window exactly (no truncation gap)
 
 MIN_FINETUNE_RECORDS = 48  #: below this the folds cannot train a top-N adapter
 
