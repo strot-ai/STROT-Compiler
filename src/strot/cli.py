@@ -40,15 +40,17 @@ def _init(agent: str, dest_root: Path) -> int:
     target.write_text(_read(_SOURCE[agent]), encoding="utf-8")
     written = [target]
 
-    # Claude/Codex load PLAYBOOK.md + the compile script as bundled resources;
-    # copy them next to the instruction file so the agent can run them.
+    # Claude/Codex load PLAYBOOK.md + WATCHER.md + the compile script as bundled
+    # resources; copy them next to the instruction file so the agent can use them.
     if agent in ("claude", "codex"):
-        (target.parent / "PLAYBOOK.md").write_text(_read("PLAYBOOK.md"), encoding="utf-8")
+        for doc in ("PLAYBOOK.md", "WATCHER.md"):
+            (target.parent / doc).write_text(_read(doc), encoding="utf-8")
+            written.append(target.parent / doc)
         scripts_dst = target.parent / "scripts"
         scripts_dst.mkdir(exist_ok=True)
         with resources.as_file(_skill_dir() / "scripts" / "compile_model.py") as src:
             shutil.copy(src, scripts_dst / "compile_model.py")
-        written += [target.parent / "PLAYBOOK.md", scripts_dst / "compile_model.py"]
+        written.append(scripts_dst / "compile_model.py")
 
     for p in written:
         print(f"wrote {p}")

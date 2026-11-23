@@ -3,8 +3,7 @@
 Deliberately import-light: the discovery tools (:func:`list_models`,
 :func:`model_info`) read a compiled model's baked literals with ``ast`` - no
 torch, no LLM, no model load - so an agent can survey the whole roster for free.
-The compile/inference tools import ``strot`` lazily and need the ``[local]``
-extra; schema design needs an LLM but not torch.
+The compile/inference tools import ``strot`` lazily and need the ``[local]`` extra.
 """
 
 from __future__ import annotations
@@ -98,8 +97,8 @@ def inspect_data(data: DataArg, sample_size: int = 25) -> Dict[str, Any]:
 
 
 def pii_scan(data: DataArg, sample_size: int = 25) -> Dict[str, Any]:
-    """Detect what PII the teacher-boundary masker would redact over a sample
-    (torch-free) - the PII-enablement 'detect' step before any compile."""
+    """Detect structured PII in a sample (torch-free regex, advisory) - what a
+    record carries before you feed it to your own LLM."""
     import strot
 
     return strot.pii_scan(_as_records(data), sample_size=sample_size)
@@ -119,7 +118,7 @@ def compile_model(
     STROT holds no key and calls no LLM: YOU (the agent) design the questions and
     label the sample, then hand them here. ``labels`` is one ``{question: answer}``
     dict per record in ``data`` order (an agent's decisions or human ground
-    truth); ``mode="lite"`` needs no labels (zero-shot). ``projection`` is optional
+    truth); ``projection`` is optional
     ``route_context`` source (default concatenates text fields). Returns the path.
     """
     import strot
@@ -138,8 +137,8 @@ def compile_model(
 
 
 # --- Compile budget: a simple guardrail so an agent can't run away compiling ---
-# A per-process cap on compiles started (compiles cost LLM tokens + minutes of
-# compute). Set STROT_MCP_COMPILE_BUDGET=<int>; unset = unlimited.
+# A per-process cap on compiles started (compiles cost minutes of compute).
+# Set STROT_MCP_COMPILE_BUDGET=<int>; unset = unlimited.
 _compiles_started = 0
 _budget_lock = threading.Lock()
 
@@ -177,8 +176,7 @@ def compile_start(
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Start a compile in the background; returns a ``job_id`` to poll with
-    :func:`compile_status`. YOU bring the labels (no LLM); ``mode="lite"`` needs
-    none. Embedding a large sample runs minutes, so it is off-thread. Honors the
+    :func:`compile_status`. YOU bring the labels (no LLM). Embedding a large sample runs minutes, so it is off-thread. Honors the
     compile cap (a compute guard). Needs the ``[local]`` extra.
     """
     cap = _compile_cap()
@@ -283,7 +281,7 @@ def recompile(
     """Recompile a model on fresh/accumulated data, reusing its question config.
 
     A fresh distillation (recompile-don't-increment), started async. YOU re-label
-    the new data (no LLM) and pass ``labels``; ``mode="lite"`` needs none. Defaults
+    the new data (no LLM) and pass ``labels``; Defaults
     to a new ``<name>-recompiled`` artifact so the agent can evaluate it before
     promoting with :func:`set_status`. Needs the ``[local]`` extra.
     """

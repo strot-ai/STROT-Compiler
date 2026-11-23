@@ -432,11 +432,11 @@ def train(
 ) -> RunResult:
     """Compile a decision model - the deterministic, LLM-free door (``strot.compile``).
 
-    STROT runs no LLM and holds no key. ``mode="lite"`` needs no labels (zero-shot
-    prototype heads from the option descriptions). ``mode="head"`` (default) and
-    ``mode="deep"`` distill from ``labels`` you bring: a list of
-    ``{question: answer}`` dicts, one per record in ``data`` order - an agent's
-    own decisions, or human ground truth (the strongest signal).
+    STROT runs no LLM and holds no key. ``mode="head"`` (default) distills a
+    calibrated head per question; ``mode="deep"`` adds a shared LoRA adapter. Both
+    distill from ``labels`` you bring: a list of ``{question: answer}`` dicts, one
+    per record in ``data`` order - an agent's own decisions, or human ground truth
+    (the strongest signal).
 
     ``questions`` is a typed-question config (a dict, or a JSON string). Designing
     one from a bare intent is the agent's job (see the STROT skill), so a bare
@@ -463,26 +463,23 @@ def train(
     StrotCompiler.validate_questions_config(questions)
     if golden is not None:
         StrotCompiler.validate_golden_decide(golden, questions)
-    if mode not in ("lite", "head", "deep"):
+    if mode not in ("head", "deep"):
         raise RouterConfigurationError(
-            f"mode must be 'lite', 'head', or 'deep' (got {mode!r})."
+            f"mode must be 'head' or 'deep' (got {mode!r})."
         )
 
     records = as_records(data)
-    if mode == "lite":
-        labels = None  # zero-shot: no labels consumed
-    else:
-        if labels is None:
-            raise RouterConfigurationError(
-                f"mode={mode!r} needs labels (one {{question: answer}} dict per "
-                "record, in data order); bring them, or use mode='lite'."
-            )
-        labels = [dict(row) for row in labels]
-        if len(labels) != len(records):
-            raise RouterConfigurationError(
-                f"compile needs one label dict per record: got {len(labels)} labels "
-                f"for {len(records)} records."
-            )
+    if labels is None:
+        raise RouterConfigurationError(
+            f"mode={mode!r} needs labels: one {{question: answer}} dict per record, "
+            "in data order."
+        )
+    labels = [dict(row) for row in labels]
+    if len(labels) != len(records):
+        raise RouterConfigurationError(
+            f"compile needs one label dict per record: got {len(labels)} labels "
+            f"for {len(records)} records."
+        )
     schema = introspect_schema(records)
     canonical_config = json.dumps(questions, sort_keys=True)
     nlu = DEFAULT_NLU_MODEL

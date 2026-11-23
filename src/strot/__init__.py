@@ -32,6 +32,7 @@ from .jit import train as compile  # noqa: E402,A001  (the one build door; shado
 from .evaluate import evaluate, score_decisions  # noqa: E402
 from .trace import cluster_rejections, drift_check, read_traces, summarize_traces  # noqa: E402
 from .inspect import inspect_data, pii_scan  # noqa: E402
+from .watch import infer_questions, ingest_traces  # noqa: E402
 from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
@@ -44,6 +45,8 @@ __all__ = [
     "drift_check",
     "inspect_data",
     "pii_scan",
+    "ingest_traces",
+    "infer_questions",
     "load_model",
     "DecisionModel",
     "RunResult",

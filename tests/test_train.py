@@ -140,14 +140,11 @@ class TestTrainValidation:
                 state=tmp_path, execute=False,
             )
 
-    def test_lite_mode_compiles_without_labels(self, tmp_path, fake_runtime, decide_encoder):
-        # lite is the zero-shot tier: no labels needed; prototype heads only.
-        result = strot.compile(
-            DECIDE_SAMPLE, DECIDE_CONFIG, mode="lite", state=tmp_path, execute=False,
-        )
-        heads = _baked_heads(result.artifact_path.read_text())
-        assert set(heads) == {"is_bug", "sentiment", "team"}
-        assert all(h["temperature"] == 1.0 for h in heads.values())  # uncalibrated
+    def test_only_head_and_deep_are_valid_modes(self, tmp_path, fake_runtime, decide_encoder):
+        # lite was removed (zero-shot didn't discriminate); head/deep only.
+        with pytest.raises(RouterConfigurationError, match="'head' or 'deep'"):
+            strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(), mode="lite",
+                          state=tmp_path, execute=False)
 
     def test_head_without_labels_is_refused(self, tmp_path, fake_runtime, decide_encoder):
         with pytest.raises(RouterConfigurationError, match="needs labels"):
@@ -172,11 +169,13 @@ class TestTrainCache:
                             state=tmp_path, execute=False)
         assert other.cache_key != first.cache_key
 
-    def test_lite_and_head_cache_separately(self, tmp_path, fake_runtime, decide_encoder):
-        # Same config, different tier -> different cache slot.
-        lite = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, mode="lite",
+    def test_projection_change_recompiles(self, tmp_path, fake_runtime, decide_encoder):
+        # The projection is an input: a different route_context is a fresh model.
+        base = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(),
                              state=tmp_path, execute=False)
-        head = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(), mode="head",
-                             state=tmp_path, execute=False)
-        assert lite.cache_key != head.cache_key
-        assert lite.artifact_path != head.artifact_path
+        custom = strot.compile(
+            DECIDE_SAMPLE, DECIDE_CONFIG, _labels(),
+            projection="def route_context(record: dict) -> str:\n    return str(record.get('body',''))\n",
+            state=tmp_path, execute=False,
+        )
+        assert custom.cache_key != base.cache_key

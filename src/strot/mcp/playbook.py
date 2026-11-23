@@ -32,7 +32,6 @@ questions and label the sample; STROT distills. Every AI step is yours.
    questions, labels)` and poll `compile_status`. STROT embeds, fits the
    calibrated heads + OOD gate, and bakes - no LLM. Tiers:
    - `head` (default) - distilled calibrated head from your labels.
-   - `lite` via `compile_start(mode="lite")` - zero-shot, NO labels, instant.
    - `deep` ONLY if `head` is representation-bound (evaluate shows it ceilings).
 5. VERIFY - `evaluate_model` on held-out labeled records (accuracy / coverage /
    ECE). Human ground-truth labels beat your own - prefer them when you have them.
@@ -48,8 +47,9 @@ questions and label the sample; STROT distills. Every AI step is yours.
 - You are the teacher; STROT is deterministic. You design the questions and label
   the sample (your own decisions, or human ground truth - the strongest signal).
   STROT runs no LLM and holds no key - it only embeds, fits, and bakes.
-- Labels from any source. `lite` needs none (zero-shot); `head`/`deep` distill from
-  the labels you bring. There is no teacher inside STROT - you are the AI.
+- Labels from any source. `head`/`deep` distill from the labels you bring (your
+  own decisions, or human ground truth). There is no teacher inside STROT - you
+  are the AI.
 - Recompile, don't increment. Every compile is a fresh fit on current data - no
   warm-start. Improve by gathering more real data and recompiling.
 - Evaluate-safe, act-gated. Reading (inspect, traces, evaluate, drift) is free.

@@ -8,9 +8,8 @@ LLM and no network - the agent (or a human) brings the labels:
 2. **Projection** — a ``route_context`` that selects the text to embed (a default
    concatenates text fields; the caller may supply one).
 3. **Distillation** — a calibrated head per question is fit on the frozen
-   encoder's embeddings of the caller's labels (``lite`` skips labels with
-   zero-shot prototype heads; ``deep`` adds a shared LoRA adapter) and baked into
-   a standalone artifact that emits typed decision JSON.
+   encoder's embeddings of the caller's labels (``deep`` adds a shared LoRA
+   adapter) and baked into a standalone artifact that emits typed decision JSON.
 """
 
 from __future__ import annotations
@@ -603,51 +602,8 @@ class StrotCompiler:
                     )
         return None
 
-    @staticmethod
-    def _l2norm(vec: Sequence[float]) -> List[float]:
-        norm = sum(x * x for x in vec) ** 0.5 or 1.0
-        return [x / norm for x in vec]
 
-    @staticmethod
-    def _lite_prototype_text(label: Any, description: Optional[str]) -> str:
-        """The text STROT embeds as a class's zero-shot prototype."""
-        if description:
-            return f"{label}: {description}"
-        return str(label)
 
-    def _lite_heads(self, questions: Mapping[str, Any]) -> Dict[str, Any]:
-        """Zero-shot ``lite`` heads: a prototype embedding per class, no training.
-
-        Each class becomes an L2-normalized prototype embedding of its
-        description; at runtime the record's embedding is scored against them
-        (the same linear ``weights @ x`` runtime as a trained head, so cosine
-        nearest-prototype). A predicate uses ``[-proto, +proto]`` so the two
-        logits are a sigmoid around the statement direction. No teacher labels,
-        no fold split - just the frozen encoder and the config's own text.
-        """
-        from . import distill as distill_mod
-
-        embedder = distill_mod.make_encoder_embedder(self._resolve_compile_checkpoint())
-        heads: Dict[str, Any] = {}
-        for name, spec in questions.items():
-            base, classes = self._question_runtime(spec)
-            if base == "predicate":
-                proto = self._l2norm(embedder([spec["instructions"]])[0])
-                weights = [[-x for x in proto], list(proto)]  # classes [False, True]
-                bias = [0.0, 0.0]
-            else:
-                pairs = (
-                    self._choice_pairs(spec) if base == "choice"
-                    else self._score_levels(spec)
-                )
-                texts = [self._lite_prototype_text(label, desc) for label, desc in pairs]
-                weights = [self._l2norm(v) for v in embedder(texts)]
-                bias = [0.0] * len(classes)
-            heads[name] = {
-                "type": base, "classes": classes,
-                "weights": weights, "bias": bias, "temperature": 1.0,
-            }
-        return heads
 
 
     def _distill_and_bake(
@@ -697,7 +653,7 @@ class StrotCompiler:
         )
         fit_ix = train_ix + measure_ix
 
-        # 3. Per-record embeddings shared by every head. head/lite use the frozen
+        # 3. Per-record embeddings shared by every head. head uses the frozen
         # encoder; deep adapts a shared top-N LoRA to the domain first and refits
         # the heads on the adapted embedding (one forward pass per record).
         adapter: Optional[Dict[str, Any]] = None
@@ -752,7 +708,7 @@ class StrotCompiler:
         # threshold on the training embeddings, so the runtime refuses records
         # unlike anything seen rather than answering them. Centroids use the
         # finest-grained question's labels; the gate is always on (conservative
-        # 0.99 percentile). lite has no record embeddings, so it has no gate.
+        # 0.99 percentile).
         ood: Optional[Dict[str, Any]] = None
         if vectors:
             ood_q = max(
@@ -789,20 +745,16 @@ class StrotCompiler:
         """Compile a decision model - the deterministic, LLM-free door.
 
         STROT runs no LLM and holds no key: the agent (or a human) brings the
-        labels, STROT embeds, fits the calibrated heads + OOD gate, and bakes.
-
-        * ``lite`` - zero-shot prototype heads from each option's description;
-          needs **no labels**. The local $0 floor.
-        * ``head`` (default) / ``deep`` - distilled from ``labels``, one
-          ``{question: answer}`` dict per record in ``sample`` order (an agent's
-          decisions, or human ground truth). ``deep`` adds a shared LoRA adapter.
-
-        ``projection`` is optional ``route_context(record) -> str`` source; the
-        default concatenates the record's text fields.
+        ``labels`` (one ``{question: answer}`` dict per record in ``sample``
+        order - an agent's decisions, or human ground truth); STROT embeds, fits
+        the calibrated heads + OOD gate, and bakes. ``mode="head"`` (default)
+        distills a logistic head per question; ``mode="deep"`` adds a shared LoRA
+        adapter. ``projection`` is optional ``route_context(record) -> str``
+        source; the default concatenates the record's text fields.
         """
-        if mode not in ("lite", "head", "deep"):
+        if mode not in ("head", "deep"):
             raise RouterConfigurationError(
-                f"mode must be 'lite', 'head', or 'deep' (got {mode!r})."
+                f"mode must be 'head' or 'deep' (got {mode!r})."
             )
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
@@ -824,20 +776,12 @@ class StrotCompiler:
                 raise RouterConfigurationError(f"projection is invalid: {perr}")
             code = projection
 
-        if mode == "lite":
-            # Zero-shot: prototype heads from the config's own text, no labels,
-            # no training. The projection is still baked so the runtime embeds.
-            return self._bake_decider(
-                self._lite_heads(questions), code, schema, questions, golden,
-                attempts=0, winner="lite",
-            )
-
         from . import distill as distill_mod
 
         if labels is None:
             raise RouterConfigurationError(
-                f"mode={mode!r} needs labels (one {{question: answer}} dict per "
-                "record, in sample order); bring them, or use mode='lite'."
+                f"mode={mode!r} needs labels: one {{question: answer}} dict per "
+                "record, in sample order."
             )
         answers = [dict(row) for row in labels]
         if len(records) < distill_mod.MIN_DISTILL_RECORDS:
@@ -884,7 +828,7 @@ class StrotCompiler:
         """Bake baked heads + projection into a self-contained decider asset.
 
         Shared by all tiers - they differ only in how ``question_heads`` was
-        fitted. ``lite``/``head`` embed with the frozen encoder; ``deep`` passes
+        fitted. ``head`` embeds with the frozen encoder; ``deep`` passes
         an ``adapter`` and bakes the LoRA-adapted runtime instead. ``ood`` (when
         fitted) bakes the drift gate; an empty literal is a runtime no-op.
         """

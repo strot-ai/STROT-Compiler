@@ -23,7 +23,7 @@ mode)` and cached. **No LLM, no network:**
 2. **Projection** — a `route_context(record) -> text` selects the text to embed.
    The default concatenates the record's text fields; you may pass a custom one.
 3. **Labels** — you bring them: one `{question: answer}` dict per record (an
-   agent's own decisions, or human ground truth). `mode="lite"` needs none.
+   agent's own decisions, or human ground truth).
 4. **Distill** — a calibrated logistic head per question is trained on the frozen
    encoder's embeddings of the projected text.
 5. **Guards** — a temperature is fit per head (honest confidence) and a drift/OOD
@@ -39,12 +39,11 @@ labels, projection, mode)`, so retraining on accumulated data is forgetting-free
 
 ## Tiers — `mode=`
 
-All three tiers emit the same artifact type (a `DecisionModel`); only how the
-heads are fitted differs:
+Both tiers emit the same artifact type (a `DecisionModel`); only how the heads
+are fitted differs:
 
 | mode | heads | needs | when |
 |---|---|---|---|
-| `lite` | prototype embeddings of each option's description (cosine) | **no labels** | a rough zero-shot floor — weak for predicates (one prototype); use `head` for real accuracy |
 | `head` *(default)* | a calibrated logistic head per question, distilled from your labels | you label the sample | the accuracy of training on your records |
 | `deep` | a shared top-N LoRA adapter over all questions, then refit heads | `[local]` + more labeled records | representation-bound tasks a frozen head can't crack |
 
@@ -79,7 +78,7 @@ model.dispatch("triage")         # put into service: one self-contained triage.s
 strot.load_model("triage")       # reload a dispatched model
 ```
 
-`dispatch()` is the ship verb. `mode="lite"` compiles with no labels.
+`dispatch()` is the ship verb.
 
 ## Calibration & refusal
 
@@ -106,6 +105,29 @@ assess a model's health without loading it:
 - **`strot.inspect_data(data)`** — profile raw input before compiling.
 - **`strot.pii_scan(data)`** — advisory regex scan of structured PII in a sample.
 
+## Watcher — learn from an agent's traces
+
+An observed agent's `(input -> decision)` pairs are labels. Two torch-free
+helpers turn a trace stream into a compile, so the understudy reuses the normal
+`compile` path:
+
+- **`strot.ingest_traces(traces, input_key, decision_key)`** — `(records, labels)`
+  from a list / JSONL / JSON file of `{input, decision}`, or OpenTelemetry spans
+  whose `attributes` carry those keys (stringified JSON is decoded).
+- **`strot.infer_questions(labels)`** — recover a typed config from observed
+  decisions (all-boolean -> `predicate`, else `choice` over observed values;
+  `score` is never inferred — order can't be recovered from observation).
+
+```python
+records, labels = strot.ingest_traces("agent_traces.jsonl")
+model = strot.compile(records, strot.infer_questions(labels), labels)
+```
+
+Then shadow (`evaluate` for fidelity-to-the-agent), take over confidence-gated
+(call the understudy before the agent; defer low-confidence / OOD), and recompile
+on drift. It clones the agent's *policy*, not truth, for typed decisions only. The
+full methodology ships as the `WATCHER.md` skill (`strot init`).
+
 ## MCP — drive it from an agent
 
 The MCP server ships in the core install (`python -m strot.mcp`, SDK 2.x) — it is
@@ -127,7 +149,7 @@ labeling); the server does no LLM work of its own. For code-running agents,
 ## Data & privacy
 
 - **Labels are yours** — the agent's own decisions, or human ground truth (the
-  strongest signal). STROT never invents data; `lite` needs no labels.
+  strongest signal). STROT never invents data.
 - **STROT sends records nowhere** — it embeds them locally on the frozen encoder.
   There is no teacher boundary and no masking: raw text in a local embedder is not
   a leak. The only PII exposure is whatever *you* feed your own agent while

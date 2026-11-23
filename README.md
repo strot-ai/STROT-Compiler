@@ -46,8 +46,6 @@ strot.load_model("ticket-triage")
 No LLM runs inside STROT, at compile time or after. Production is a self-contained
 model file: the local model answers every record, **nothing is generated at
 runtime**, and every output is bounded typed JSON with a calibrated confidence.
-No labels to bring yet? `strot.compile(data, questions, mode="lite")` is a
-zero-shot tier that needs none.
 
 ## Typed questions
 
@@ -69,20 +67,15 @@ Pass that to `strot.compile(data, questions, labels)`. You design the config —
 the agent's job (see `strot playbook`). Each answer carries probabilities and a
 calibrated confidence.
 
-## Three tiers
+## Two tiers
 
-`strot.compile(data, questions, labels, mode=...)` picks how hard it works:
+`strot.compile(data, questions, labels, mode=...)` picks how hard it works. Both
+distill from the labels you bring:
 
-| mode | what it is | needs | when |
-|---|---|---|---|
-| **`lite`** | zero-shot prototype heads (embed each option's description, cosine-match) | **no labels**, instant | try a decision immediately, $0, bring no data |
-| **`head`** *(default)* | a calibrated logistic head per question, distilled from your labels | you label a small sample | the accuracy of training on your records |
-| **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | more labeled records (`[local]`) | representation-bound tasks a frozen head can't crack |
-
-The agent labels the sample for `head`/`deep`; `lite` needs nothing. `lite` is a
-rough zero-shot *floor* for a quick look — accuracy comes from `head`'s labels,
-and **predicates in particular need labels** (a single zero-shot prototype barely
-separates). Reach for `head` for anything real.
+| mode | what it is | when |
+|---|---|---|
+| **`head`** *(default)* | a calibrated logistic head per question | the accuracy of training on your records |
+| **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | representation-bound tasks a frozen head can't crack |
 
 ## How it works
 
@@ -155,6 +148,22 @@ Point any MCP client at `python -m strot.mcp`. For Claude Desktop, add to
 }
 ```
 
+## Watcher — learn from an agent's traces
+
+An observed agent's `(input → decision)` pairs **are labels** — real, free, and
+in-distribution. The watcher turns them into a local understudy that takes the
+confident cases at $0 and defers the rest back to the agent:
+
+```python
+records, labels = strot.ingest_traces("agent_traces.jsonl")   # plain dicts or OTel spans
+questions = strot.infer_questions(labels)                      # recover the schema
+model = strot.compile(records, questions, labels)              # distill — no LLM
+```
+
+No labels to collect — the decisions the agent already made are the supervision.
+It clones the agent's *policy* (not truth), for typed decisions only. `strot init`
+installs the full watcher playbook as a skill; see `WATCHER.md`.
+
 Bake the encoder into your image for offline production:
 
 ```dockerfile
@@ -166,9 +175,9 @@ ENV STROT_NLU_CHECKPOINT=/opt/encoder
 ## Docs
 
 [DEVELOPERS.md](DEVELOPERS.md) covers the architecture — the compile path, the
-`lite`/`head`/`deep` tiers, calibration & the drift gate, the lifecycle
-primitives (`evaluate`, traces, `drift_check`, `cluster_rejections`), and the MCP
-agent surface.
+`head`/`deep` tiers, calibration & the drift gate, the lifecycle primitives
+(`evaluate`, traces, `drift_check`, `cluster_rejections`), the **watcher** (learn
+from an agent's traces), and the MCP agent surface.
 
 ## Contributing & contact
 
