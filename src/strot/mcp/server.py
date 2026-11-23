@@ -30,7 +30,7 @@ def list_models(root: str = ".") -> List[Dict[str, Any]]:
 
 @server.tool()
 def model_info(path: str) -> Dict[str, Any]:
-    """Read a compiled model's metadata (questions, encoder, tier) without loading it."""
+    """Read a compiled model's metadata (questions, encoder, mode) without loading it."""
     return tools.model_info(path)
 
 
@@ -42,27 +42,24 @@ def inspect_data(data: Union[str, list], sample_size: int = 25) -> Dict[str, Any
 
 @server.tool()
 def pii_scan(data: Union[str, list], sample_size: int = 25) -> Dict[str, Any]:
-    """Detect what PII the teacher-boundary masker would redact over a sample (torch-free)."""
+    """Detect structured PII in a sample (torch-free regex, advisory)."""
     return tools.pii_scan(data, sample_size=sample_size)
-
-
-@server.tool()
-def design_questions(data: Union[str, list], intent: str, llm: str = "openai/gpt-4o") -> Dict[str, Any]:
-    """Design a typed question config from a one-line intent and a data sample."""
-    return tools.design_questions(data, intent, llm=llm)
 
 
 @server.tool()
 def compile_start(
     data: Union[str, list],
     questions: Union[str, dict],
+    labels: Optional[List[Dict[str, Any]]] = None,
     mode: str = "head",
-    llm: str = "openai/gpt-4o",
+    projection: Optional[str] = None,
     name: Optional[str] = None,
-    sample_size: int = 25,
 ) -> Dict[str, Any]:
-    """Start compiling a decision model (runs minutes) -> returns a job_id to poll. Needs [local]."""
-    return tools.compile_start(data, questions, mode=mode, llm=llm, name=name, sample_size=sample_size)
+    """Compile a decision model from labels YOU bring (no LLM) -> returns a job_id
+    to poll. The agent-labels door: design the questions and decide each record
+    yourself, pass {question: answer} per record.
+    Runs minutes; needs [local]."""
+    return tools.compile_start(data, questions, labels, mode=mode, projection=projection, name=name)
 
 
 @server.tool()
@@ -119,11 +116,13 @@ def drift_check(traces_path: str, refusal_threshold: float = 0.2, confidence_flo
 
 @server.tool()
 def recompile(
-    model_path: str, data: Union[str, list], llm: str = "openai/gpt-4o",
-    mode: str = "head", name: Optional[str] = None, sample_size: int = 25,
+    model_path: str, data: Union[str, list],
+    labels: Optional[List[Dict[str, Any]]] = None,
+    mode: str = "head", name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Recompile a model on fresh data (reusing its questions), async -> job_id. Needs [local]."""
-    return tools.recompile(model_path, data, llm=llm, mode=mode, name=name, sample_size=sample_size)
+    """Recompile a model on fresh data (reusing its questions), async -> job_id. You
+    re-label the new data (no LLM); Needs [local]."""
+    return tools.recompile(model_path, data, labels, mode=mode, name=name)
 
 
 @server.tool()

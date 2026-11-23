@@ -12,7 +12,7 @@ and cached; only the top ``N`` layers carry a trainable LoRA adapter. Training
 backprops through the top block only, so it finishes on CPU in minutes and
 sidesteps the memory blow-up of full-encoder fine-tuning. ``N`` is small by
 design (top-4 is the measured knee); depth beyond that buys noise. Unlike the
-pure-Python frozen head this needs torch + transformers (the ``[finetune]``
+pure-Python frozen head this needs torch + transformers (the ``[local]``
 extra) and trains an adapter (MB of weights). Those weights are then baked
 into the battery ``.py`` as ``ADAPTER`` / ``ADAPTER_CONFIG`` literals (next to
 the distilled head, labels, calibration, and OOD centroids), so the battery
@@ -87,8 +87,8 @@ def _import_torch():
         from transformers import AutoModel, AutoTokenizer  # noqa: F401
     except ImportError as exc:  # pragma: no cover - env guard
         raise RouterConfigurationError(
-            "The fine-tune tier needs the finetune extra: "
-            "pip install strot-ai[finetune]"
+            "The fine-tune tier needs torch + transformers: "
+            'pip install "strot-ai[local]"'
         ) from exc
 
 

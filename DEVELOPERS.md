@@ -1,28 +1,29 @@
 # STROT — developer guide
 
-STROT is a **decision compiler**. You bring a sample of your real data and a
-typed question; an LLM teacher labels the sample once, a calibrated head is
-distilled onto a frozen encoder, and the result is a self-contained model that
-decides every record after that **locally, on CPU, at $0**. Output is bounded,
-type-safe JSON with calibrated confidence — nothing is generated at runtime.
+STROT is a **decision compiler**. You (the agent) design a typed question set and
+label a small sample of your real data; a calibrated head is distilled onto a
+frozen encoder, and the result is a self-contained model that decides every record
+after that **locally, on CPU, at $0**. **STROT runs no LLM and holds no API key** —
+it only embeds, fits, and bakes. Output is bounded, type-safe JSON with calibrated
+confidence — nothing is generated at runtime.
 
-> Reason once, at compile time. Decide forever, locally.
+> You are the teacher. STROT is deterministic.
 
 This guide covers the architecture, the runtime artifact, the lifecycle
 primitives, and the MCP agent surface. For the quickstart, see the
 [README](README.md).
 
-## Compile path — `strot.decide(data, questions)`
+## Compile path — `strot.compile(data, questions, labels)`
 
-One deterministic pass, run once per `(questions, schema, mode)` and cached:
+One deterministic pass, run once per `(questions, schema, labels, projection,
+mode)` and cached. **No LLM, no network:**
 
 1. **Schema** — `introspect_schema` profiles the sample (fields, types,
    cardinality, sample values).
-2. **Synthesis** — the LLM designs the typed question set (if you passed a bare
-   intent) and writes the **state projection** `route_context(record) -> text`
-   (which fields to embed), validated with a bounded self-correction loop.
-3. **Teacher labels** — the LLM answers every question for every **PII-masked**
-   sampled record (see *Data & privacy*).
+2. **Projection** — a `route_context(record) -> text` selects the text to embed.
+   The default concatenates the record's text fields; you may pass a custom one.
+3. **Labels** — you bring them: one `{question: answer}` dict per record (an
+   agent's own decisions, or human ground truth).
 4. **Distill** — a calibrated logistic head per question is trained on the frozen
    encoder's embeddings of the projected text.
 5. **Guards** — a temperature is fit per head (honest confidence) and a drift/OOD
@@ -32,23 +33,19 @@ One deterministic pass, run once per `(questions, schema, mode)` and cached:
    the OOD gate, and (for `deep`) the LoRA adapter.
 
 **Recompile, don't increment** (invariant): every compile is a *fresh fit* from
-the frozen base on the current data — never a warm-start from prior weights. A
-model's weights are a pure function of its own `(data, questions, mode)`, so
-retraining on accumulated data is forgetting-free. There is no runtime training.
+the frozen base on the current data/labels — never a warm-start from prior
+weights. A model's weights are a pure function of its own `(data, questions,
+labels, projection, mode)`, so retraining on accumulated data is forgetting-free.
 
 ## Tiers — `mode=`
 
-All three tiers emit the same artifact type (a `DecisionModel`); only how the
-heads are fitted differs:
+Both tiers emit the same artifact type (a `DecisionModel`); only how the heads
+are fitted differs:
 
 | mode | heads | needs | when |
 |---|---|---|---|
-| `lite` | prototype embeddings of each option's description (cosine) | no labels | try instantly, $0, bring no data |
-| `head` *(default)* | a calibrated logistic head per question, distilled from teacher labels | the teacher labels your sample | the accuracy of training on your records |
-| `deep` | a shared top-N LoRA adapter over all questions, then refit heads | `[finetune]` extra + more records | representation-bound tasks a frozen head can't crack |
-
-`warm=True` serves `lite` instantly while `head` trains in a background thread,
-then hot-swaps it in.
+| `head` *(default)* | a calibrated logistic head per question, distilled from your labels | you label the sample | the accuracy of training on your records |
+| `deep` | a shared top-N LoRA adapter over all questions, then refit heads | `[local]` + more labeled records | representation-bound tasks a frozen head can't crack |
 
 ## The runtime artifact (`.strot`)
 
@@ -70,19 +67,18 @@ The **drift gate** refuses records unlike the training set up front
 
 ## The decision model
 
-`decide()` returns a `DecisionModel`:
+`compile()` returns a `DecisionModel`:
 
 ```python
-model = strot.decide(data, questions)
+model = strot.compile(data, questions, labels)
 model(record)                    # -> typed decision JSON
 model.questions                  # the config it answers
-model.tier                       # "lite" | "head"
-model.trace("traces.jsonl")      # opt-in: log every decision (the teacher's eyes)
+model.trace("traces.jsonl")      # opt-in: log every decision (the agent's eyes)
 model.dispatch("triage")         # put into service: one self-contained triage.strot
 strot.load_model("triage")       # reload a dispatched model
 ```
 
-`dispatch()` is the ship verb (`save()` is a back-compat alias).
+`dispatch()` is the ship verb.
 
 ## Calibration & refusal
 
@@ -107,38 +103,61 @@ assess a model's health without loading it:
 - **`strot.cluster_rejections(traces)`** — cluster the refused records (top terms
   + samples) to surface the gap to close.
 - **`strot.inspect_data(data)`** — profile raw input before compiling.
-- **`strot.pii_scan(data)`** — what the teacher-boundary masker would redact.
+- **`strot.pii_scan(data)`** — advisory regex scan of structured PII in a sample.
+
+## Watcher — learn from an agent's traces
+
+An observed agent's `(input -> decision)` pairs are labels. Two torch-free
+helpers turn a trace stream into a compile, so the understudy reuses the normal
+`compile` path:
+
+- **`strot.ingest_traces(traces, input_key, decision_key)`** — `(records, labels)`
+  from a list / JSONL / JSON file of `{input, decision}`, or OpenTelemetry spans
+  whose `attributes` carry those keys (stringified JSON is decoded).
+- **`strot.infer_questions(labels)`** — recover a typed config from observed
+  decisions (all-boolean -> `predicate`, else `choice` over observed values;
+  `score` is never inferred — order can't be recovered from observation).
+
+```python
+records, labels = strot.ingest_traces("agent_traces.jsonl")
+model = strot.compile(records, strot.infer_questions(labels), labels)
+```
+
+Then shadow (`evaluate` for fidelity-to-the-agent), take over confidence-gated
+(call the understudy before the agent; defer low-confidence / OOD), and recompile
+on drift. It clones the agent's *policy*, not truth, for typed decisions only. The
+full methodology ships as the `WATCHER.md` skill (`strot init`).
 
 ## MCP — drive it from an agent
 
-`strot-ai[mcp]` exposes the compiler as an MCP server (`python -m strot.mcp`,
-SDK 2.x). The capability layer (`strot.mcp.tools`) is SDK-free and torch-free for
-the read tools; `strot.mcp.server` registers them. Tools:
+The MCP server ships in the core install (`python -m strot.mcp`, SDK 2.x) — it is
+the primary interface. The capability layer (`strot.mcp.tools`) is SDK-free and
+torch-free for the read tools; `strot.mcp.server` registers them. Tools:
 
-`list_models` · `model_info` · `inspect_data` · `pii_scan` · `design_questions` ·
-`compile_start` / `compile_status` (async — a compile runs minutes) · `decide` ·
-`evaluate_model` · `score` · `read_traces` · `drift_check` · `cluster_rejections` ·
-`recompile` · `set_status` / `model_status` (circuit breaker) · `budget_status`.
+`list_models` · `model_info` · `inspect_data` · `pii_scan` ·
+`compile_start` / `compile_status` (you pass the labels; async — a compile runs
+minutes) · `decide` · `evaluate_model` · `score` · `read_traces` · `drift_check` ·
+`cluster_rejections` · `recompile` · `set_status` / `model_status` (circuit
+breaker) · `budget_status`.
 
 A **`strot_compiler` prompt** (the playbook) teaches the agent the methodology:
-inspect → pii → design → compile(tier) → verify → deploy → monitor → recompile →
-gatekeep. Guardrails: an async-compile budget (`STROT_MCP_COMPILE_BUDGET`), and
-`decide` honors a paused model (the circuit breaker). The server does no LLM work
-of its own beyond what the compile tools pass through.
+inspect → pii → design questions → label → compile(tier) → verify → deploy →
+monitor → recompile → gatekeep. The agent brings the intelligence (design +
+labeling); the server does no LLM work of its own. For code-running agents,
+`strot init` installs the same playbook as a skill + a bundled compile script.
 
 ## Data & privacy
 
-- The teacher LLM is a **labeler of your real records**, never a bulk synthetic
-  generator. Synthetic data measured *worse* (too clean, leaks the label) — the
-  policy is real-first.
-- **PII is masked at the teacher boundary**: a regex pre-pass (email, SSN, card,
-  API keys, IBAN, IP/MAC/phone) plus GLiNER (`[pii]` extra) for names/addresses.
-  Compile-time only; the served model never sees raw PII.
-- **Labels from any source.** Distillation (the teacher labels for you) is the
-  default *when you have no labels*. If you already have labels — human ground
-  truth, or an existing agent's decisions — those are valid training data too
-  (human labels are the strongest signal). Distillation is the fallback, not a
-  restriction.
+- **Labels are yours** — the agent's own decisions, or human ground truth (the
+  strongest signal). STROT never invents data.
+- **STROT sends records nowhere** — it embeds them locally on the frozen encoder.
+  There is no teacher boundary and no masking: raw text in a local embedder is not
+  a leak. The only PII exposure is whatever *you* feed your own agent while
+  labeling, which STROT cannot see.
+- **`pii_scan` is advisory** — a zero-dep regex scan (email, SSN, card, IBAN,
+  IP/MAC/phone) that flags what a record carries so the agent can decide before
+  feeding it to its own LLM. The real protection is **placement**: a
+  local/open-weight agent keeps data in your infra.
 
 ## Base encoder
 
@@ -154,7 +173,7 @@ poetry install --extras all
 poetry run pytest -q          # offline; the encoder is stubbed, so no torch needed
 ```
 
-The core is pure stdlib; torch/transformers come only via `[local]`/`[finetune]`.
+The core is stdlib + the MCP SDK; torch/transformers come only via `[local]`.
 CI runs the suite on the core install across Python versions.
 
 ## Reference

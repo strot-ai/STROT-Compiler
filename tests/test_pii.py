@@ -4,16 +4,7 @@ Pure-Python: the default regex redactors catch the obvious patterns, and the
 compiler masks sample records before the teacher ever sees them.
 """
 
-import pytest
-
 from strot import pii
-from strot.exceptions import RouterConfigurationError
-
-try:
-    import gliner  # noqa: F401
-    HAS_GLINER = True
-except ImportError:
-    HAS_GLINER = False
 
 
 class TestDefaultMaskers:
@@ -101,74 +92,6 @@ class TestExpandedMaskers:
         assert "[CARD]" not in pii.mask_text("order 4111111111111112 ref")
 
 
-class TestGlinerMasker:
-    def test_default_pii_entities_cover_unstructured(self):
-        # regex can't do these; GLiNER is the reason they're listed
-        assert "person" in pii.DEFAULT_PII_ENTITIES
-        assert "address" in pii.DEFAULT_PII_ENTITIES
-
-    @pytest.mark.skipif(HAS_GLINER, reason="gliner present: extra-guard not exercised")
-    def test_gliner_masker_requires_extra(self):
-        with pytest.raises(RouterConfigurationError):
-            pii.gliner_masker()
-
-    @pytest.mark.skipif(HAS_GLINER, reason="gliner present: regex fallback not exercised")
-    def test_default_maskers_warns_and_falls_back_to_regex_without_extra(self):
-        # GLiNER is the default; without the [pii] extra the default masker list
-        # must warn loudly and degrade to the regex pre-pass alone.
-        with pytest.warns(UserWarning, match="GLiNER not installed"):
-            maskers = pii.default_maskers()
-        assert maskers == pii.DEFAULT_MASKERS
-
-    @pytest.mark.skipif(not HAS_GLINER, reason="gliner absent: GLiNER default not testable")
-    def test_default_maskers_runs_gliner_after_regex_prepass_when_installed(self):
-        # GLiNER is the DEFAULT when the extra is installed: the regex pre-pass
-        # runs FIRST (clean format-defined tokens), GLiNER LAST (names/addr/org).
-        maskers = pii.default_maskers()
-        assert len(maskers) == len(pii.DEFAULT_MASKERS) + 1
-        assert maskers[: len(pii.DEFAULT_MASKERS)] == list(pii.DEFAULT_MASKERS)
-
-
-def test_compiler_masks_records_before_teacher(monkeypatch):
-    """End-to-end: the raw PII must never appear in the teacher prompt the
-    compiler sends to label records; the masked token must. Exercised on the
-    decide head path (the LLM-labeling boundary)."""
-    from strot.compiler import StrotCompiler
-    from strot import distill as distill_mod
-
-    sample = [
-        {"ticket_id": 1, "body": "double billing charge; email jane@acme.io"},
-        {"ticket_id": 2, "body": "app crash defect; ssn 123-45-6789"},
-    ] * 12  # >= MIN_DISTILL_RECORDS for the head tier
-    questions = {"is_bug": {"type": "predicate", "instructions": "Is this a bug?"}}
-    projection = (
-        "```python\n"
-        'QUESTIONS = {"is_bug": {"type": "predicate", "instructions": "Is this a bug?",\n'
-        '    "criteria": {"false": "normal request", "true": "crash defect error"}}}\n\n\n'
-        "def route_context(record: dict) -> str:\n"
-        '    return str(record.get("body", ""))\n```'
-    )
-    answers = "```python\nANSWERS = " + repr([{"is_bug": True}] * len(sample)) + "\n```"
-
-    prompts = []
-
-    def llm(prompt):
-        prompts.append(prompt)
-        # Projection synthesis first, then the teacher labeling pass.
-        return answers if "STROT teacher" in prompt else projection
-
-    # Deterministic fake embedder so head training needs no torch/download.
-    monkeypatch.setenv("STROT_NLU_CHECKPOINT", "/tmp")
-    monkeypatch.setattr(
-        distill_mod, "make_encoder_embedder",
-        lambda ckpt: (lambda texts: [[1.0, 0.0, 1.0] for _ in texts]),
-    )
-    compiler = StrotCompiler(nlu_model="x", llm_client=llm)
-    compiler.compile_decide(sample, questions, mode="head")
-
-    teacher_prompts = [p for p in prompts if "STROT teacher" in p]
-    assert teacher_prompts, "teacher was never called"
-    joined = "\n".join(teacher_prompts)
-    assert "jane@acme.io" not in joined
-    assert "123-45-6789" not in joined
-    assert "[EMAIL]" in joined and "[SSN]" in joined
+def test_default_maskers_is_the_regex_baseline(self=None):
+    # GLiNER is gone: default_maskers() is the regex detection list, no model.
+    assert pii.default_maskers() == list(pii.DEFAULT_MASKERS)

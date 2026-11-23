@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "1.1.0"
+version = "2.0.0"
 description = "STROT: a decision compiler. Distill an LLM teacher into a specialized decision model that runs locally on CPU."
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
@@ -16,37 +16,29 @@ classifiers = [
     "Typing :: Typed",
 ]
 packages = [{ include = "strot", from = "src" }]
+# Ship the agent playbook + skill files inside the wheel (strot init installs them).
+include = [
+    { path = "src/strot/skill/**/*.md", format = ["sdist", "wheel"] },
+    { path = "src/strot/skill/scripts/*.py", format = ["sdist", "wheel"] },
+]
+
+[tool.poetry.scripts]
+strot = "strot.cli:main"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
-# The core library is pure-stdlib. Compiling and serving a decision model pulls
-# in torch/transformers only through the [local] extra, so the core install
-# stays tiny. [local] is a standard Hugging Face encoder - nothing to bake in
-# beyond the checkpoint (see strot.prefetch_nlu).
+# The MCP server is the primary interface, so the SDK ships in the core install
+# (python -m strot.mcp). Everything else stays light: the library is otherwise
+# stdlib, and compiling/serving a decision model pulls torch/transformers only
+# through the [local] extra (transformers brings safetensors + huggingface-hub
+# transitively, so we do not pin them). See strot.prefetch_nlu for the encoder.
+mcp = ">=2.0"
 transformers = { version = ">=5.0,<5.1", optional = true }
 torch = { version = ">=2.6", optional = true }
-safetensors = { version = ">=0.5", optional = true }
-huggingface-hub = { version = ">=0.26", optional = true }
-openai = { version = ">=1.30", optional = true }
-anthropic = { version = ">=0.80", optional = true }
-gliner = { version = ">=0.2", optional = true }
-sentencepiece = { version = ">=0.2", optional = true }
-# [mcp] = expose the compiler as MCP tools (python -m strot.mcp). The server
-# wraps strot's own functions; the SDK is optional so the core install stays tiny.
-mcp = { version = ">=2.0", optional = true }
 
 [tool.poetry.extras]
-local = ["transformers", "torch", "safetensors", "huggingface-hub"]
-finetune = ["transformers", "torch", "safetensors", "huggingface-hub"]
-# [pii] = NER masking for unstructured PII (names, addresses) at the teacher
-# boundary; layered on top of the zero-dep regex baseline for structured ids.
-# sentencepiece is required for GLiNER's DeBERTa-v3 tokenizer (else it routes
-# to tiktoken and fails to load).
-pii = ["gliner", "transformers", "torch", "sentencepiece"]
-openai = ["openai"]
-anthropic = ["anthropic"]
-mcp = ["mcp"]
-all = ["transformers", "torch", "safetensors", "huggingface-hub", "openai", "anthropic", "gliner", "sentencepiece", "mcp"]
+local = ["transformers", "torch"]
+all = ["transformers", "torch"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"

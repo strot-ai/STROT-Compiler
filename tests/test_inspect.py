@@ -23,7 +23,7 @@ def test_pii_scan_detects_email_and_ssn():
     out = strot.pii_scan(SAMPLE)
     assert out["n_scanned"] == 2
     assert out["detected"].get("EMAIL") == 1 and out["detected"].get("SSN") == 1
-    assert out["masker"] in ("regex", "regex+gliner")
+    assert out["masker"] == "regex"
 
 
 def test_pii_scan_clean_data_detects_nothing():

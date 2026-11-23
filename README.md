@@ -8,42 +8,42 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
 
-An LLM reasons through your task once, at compile time. STROT distills that
-judgment into a **specialized decision model** — a calibrated head on a frozen
-encoder, trained on *your* real data — that then makes every decision **locally,
-on CPU, at $0**: no API calls, no GPU, no per-record cost.
+STROT distills an agent's judgment into a **specialized decision model** — a
+calibrated head on a frozen encoder, trained on *your* real data — that then makes
+every decision **locally, on CPU, at $0**: no API calls, no GPU, no per-record
+cost. **You (the agent) are the teacher: you design the questions and label a
+small sample. STROT runs no LLM and holds no API key** — it only embeds, fits, and
+bakes.
 
-> **Stable `decide` API, plus an MCP surface to drive it from an agent.** The core
-> (a head on a frozen `gte-modernbert` encoder) is benchmark-validated on Banking77
-> (93% full-data, 87% at 10 examples/class). Validation breadth is still growing —
-> bring your own data and tell us how it does.
+> The core (a head on a frozen `gte-modernbert` encoder) is benchmark-validated on
+> Banking77 (93% full-data, 87% at 10 examples/class). Drive it from your agent
+> (Claude, Codex, ChatGPT) over MCP, or from the Python API. No keys.
 
 ```bash
-pip install "strot-ai[local,anthropic]"
-export ANTHROPIC_API_KEY=...
+pip install "strot-ai[local]"
 ```
 
 ```python
 import strot
 
-# 1. Design the decision schema from a one-line intent (review/edit it).
-questions = strot.questions(tickets, "triage support tickets",
-                            llm="anthropic/claude-opus-4-8")
+# You design the typed questions (see `strot playbook`), and label a small sample
+# yourself — your own decisions, or human ground truth. STROT distills the rest.
+questions = {"is_bug": {"type": "predicate", "instructions": "mentions a crash or error?"}}
+labels    = [{"is_bug": True}, {"is_bug": False}, ...]   # one per record, same order
 
-# 2. Compile a decision model — the LLM teacher labels your sample, a calibrated
-#    head per question is distilled onto the frozen encoder.
-model = strot.decide(tickets, questions, llm="anthropic/claude-opus-4-8")
+# Compile a decision model — no LLM, no key. A calibrated head per question.
+model = strot.compile(tickets, questions, labels)
 
-# 3. Decide — locally, on CPU, $0 per call.
+# Decide — locally, on CPU, $0 per call.
 model(tickets[0])
 # {"predicates": {...}, "scores": {...}, "choices": {...}}  probabilities + calibrated confidence
 
-# 4. Ship one self-contained file; reload anywhere.
+# Ship one self-contained file; reload anywhere.
 model.dispatch("ticket-triage")
 strot.load_model("ticket-triage")
 ```
 
-The LLM runs only at compile time. After that, production is a self-contained
+No LLM runs inside STROT, at compile time or after. Production is a self-contained
 model file: the local model answers every record, **nothing is generated at
 runtime**, and every output is bounded typed JSON with a calibrated confidence.
 
@@ -63,87 +63,79 @@ questions = {
 }
 ```
 
-Pass that to `strot.decide(data, questions)`, or hand `decide` a **bare intent
-string** and it designs the schema for you first (`result.questions` shows what
-it chose). Each answer carries probabilities and a calibrated confidence.
+Pass that to `strot.compile(data, questions, labels)`. You design the config —
+the agent's job (see `strot playbook`). Each answer carries probabilities and a
+calibrated confidence.
 
-## Three tiers
+## Two tiers
 
-`strot.decide(data, questions, mode=...)` picks how hard it works:
+`strot.compile(data, questions, labels, mode=...)` picks how hard it works. Both
+distill from the labels you bring:
 
-| mode | what it is | needs | when |
-|---|---|---|---|
-| **`lite`** | zero-shot prototype heads (embed each option's description, cosine-match) | no labels, instant | try a decision immediately, $0, bring no data |
-| **`head`** *(default)* | a calibrated logistic head per question, distilled from teacher labels | the teacher labels your sample | the accuracy of training on your records |
-| **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | the `[finetune]` extra + more records | representation-bound tasks a frozen head can't crack |
-
-`warm=True` serves `lite` instantly while `head` trains in the background, then
-hot-swaps it in — "zero-shot that grows up."
+| mode | what it is | when |
+|---|---|---|
+| **`head`** *(default)* | a calibrated logistic head per question | the accuracy of training on your records |
+| **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | representation-bound tasks a frozen head can't crack |
 
 ## How it works
 
-Two phases: the expensive, non-deterministic one happens **once**; the cheap one
-runs on every record forever.
+Two phases: the labeling (the agent's judgment) happens **once**; the cheap
+deterministic part runs on every record forever.
 
-- **Compile once.** The LLM designs the question schema (optional) and writes the
-  record→text projection; the teacher labels a PII-masked sample; a calibrated
-  head per question is trained on the frozen encoder's embeddings and baked into
-  a standalone `.py` artifact. Content-addressed: a schema change triggers exactly
-  one recompile, nothing else does.
+- **Compile once.** You design the questions and label a small sample; STROT
+  projects each record to text, embeds it on the frozen encoder, fits a calibrated
+  head per question, and bakes a standalone artifact. No LLM, no network.
+  Content-addressed: different labels or a schema change is a fresh model.
 - **Decide forever.** The local model projects a record, embeds it once, and
   every question head answers — typed JSON, bounded, with calibrated confidence.
-  No LLM, no network, ~tens of ms on CPU.
+  No LLM, ~tens of ms on CPU.
 - **Refuses what it hasn't seen.** A drift gate (per-class centroids + a distance
   threshold, fit at compile time) returns a refusal for records unlike anything
   in training rather than guessing on them.
 - **Recompile, don't increment.** Every compile is a *fresh fit* from the frozen
-  base on the current data — never a warm-start from prior weights. A model's
-  weights are a pure function of its own `(data, questions, mode)`, so retraining
-  on accumulated data can only gain quality; it is immune to catastrophic
-  forgetting by construction.
+  base on the current labels — never a warm-start from prior weights. A model's
+  weights are a pure function of its own `(data, questions, labels, mode)`, so
+  retraining on accumulated data can only gain quality; it is immune to
+  catastrophic forgetting by construction.
 
 ## Data & privacy
 
-The teacher LLM is used as a **labeler of your real records**, never as a bulk
-synthetic generator. Before any record reaches the teacher it is **PII-masked at
-that boundary**: a regex pre-pass guards format-defined tokens (email, SSN, card,
-API keys, IBAN, IP/MAC/phone), and GLiNER (the `[pii]` extra) masks names,
-addresses, and orgs. Masking is compile-time only.
-
-We measured synthetic data and it hurt both accuracy and the confident slice — it
-comes out too clean and leaks the label. The policy is **real-first**: label real
-data; handle class imbalance by labeling more real minority-class records.
+The labels are **yours** — the agent's own decisions, or human ground truth; STROT
+never invents data. STROT holds no key and **sends records nowhere**: it embeds
+them locally. The only PII exposure is whatever *you* feed your own agent while
+labeling — so `strot.pii_scan(data)` is an advisory regex scan (email, SSN, card,
+IBAN, IP/MAC/phone) that flags what a record carries, and the real protection is
+**which agent you point at the data**: a local/open-weight agent keeps it in your
+infra.
 
 ## Install
 
 ```bash
-pip install strot-ai                # core (pure stdlib)
+pip install strot-ai                # core + the MCP server
 pip install "strot-ai[local]"       # + torch/transformers (compile + serve a model)
-pip install "strot-ai[finetune]"    # + torch/transformers, for mode="deep"
-pip install "strot-ai[pii]"         # + GLiNER masking at the teacher boundary
-pip install "strot-ai[openai]"      # + openai, teacher via llm="openai/<model>"
-pip install "strot-ai[anthropic]"   # + anthropic, teacher via llm="anthropic/<model>"
-pip install "strot-ai[mcp]"         # + the MCP server (drive it from an agent)
 ```
 
-Extras install optional packages; they do not sign you in. Set the matching API
-key and pass `llm="<provider>/<model>"`. Compile-time only — serving needs no key.
+`[local]` is all you need to compile and serve. The MCP server ships in the core
+install (`python -m strot.mcp`). No API keys, ever.
 
 ## Drive it from an agent (MCP)
 
-`strot-ai[mcp]` exposes the compiler as an [MCP](https://modelcontextprotocol.io)
-server, so an agent (Claude, etc.) can compile, run, evaluate, and keep decision
-models healthy with tools instead of code:
+STROT's MCP server lets an agent (Claude, Codex, ChatGPT, or a production
+automation agent) compile, run, evaluate, and keep decision models healthy with
+tools instead of code. The agent designs the questions and labels the sample; the
+tools do the deterministic rest.
 
 ```bash
-pip install "strot-ai[local,mcp,openai]"
+pip install "strot-ai[local]"
 python -m strot.mcp          # runs the MCP server over stdio
 ```
 
-Tools cover the whole lifecycle — `inspect_data`, `pii_scan`, `design_questions`,
-`compile_start`/`compile_status`, `decide`, `evaluate_model`, `read_traces`,
-`drift_check`, `cluster_rejections`, `recompile`, `set_status` (circuit breaker) —
-and a `strot_compiler` prompt (the playbook) teaches the agent how to use them.
+Tools cover the whole lifecycle — `inspect_data`, `pii_scan`,
+`compile_start`/`compile_status` (you pass the labels), `decide`, `evaluate_model`,
+`read_traces`, `drift_check`, `cluster_rejections`, `recompile`, `set_status`
+(circuit breaker) — and a `strot_compiler` prompt (the playbook) teaches the agent
+how to use them. Even simpler for code-running agents: `strot init` drops a skill
+(`SKILL.md` + a compile script) into your project.
 
 Point any MCP client at `python -m strot.mcp`. For Claude Desktop, add to
 `claude_desktop_config.json`:
@@ -151,14 +143,26 @@ Point any MCP client at `python -m strot.mcp`. For Claude Desktop, add to
 ```json
 {
   "mcpServers": {
-    "strot": {
-      "command": "python",
-      "args": ["-m", "strot.mcp"],
-      "env": { "OPENAI_API_KEY": "sk-..." }
-    }
+    "strot": { "command": "python", "args": ["-m", "strot.mcp"] }
   }
 }
 ```
+
+## Watcher — learn from an agent's traces
+
+An observed agent's `(input → decision)` pairs **are labels** — real, free, and
+in-distribution. The watcher turns them into a local understudy that takes the
+confident cases at $0 and defers the rest back to the agent:
+
+```python
+records, labels = strot.ingest_traces("agent_traces.jsonl")   # plain dicts or OTel spans
+questions = strot.infer_questions(labels)                      # recover the schema
+model = strot.compile(records, questions, labels)              # distill — no LLM
+```
+
+No labels to collect — the decisions the agent already made are the supervision.
+It clones the agent's *policy* (not truth), for typed decisions only. `strot init`
+installs the full watcher playbook as a skill; see `WATCHER.md`.
 
 Bake the encoder into your image for offline production:
 
@@ -171,9 +175,9 @@ ENV STROT_NLU_CHECKPOINT=/opt/encoder
 ## Docs
 
 [DEVELOPERS.md](DEVELOPERS.md) covers the architecture — the compile path, the
-`lite`/`head`/`deep` tiers, calibration & the drift gate, the lifecycle
-primitives (`evaluate`, traces, `drift_check`, `cluster_rejections`), and the MCP
-agent surface.
+`head`/`deep` tiers, calibration & the drift gate, the lifecycle primitives
+(`evaluate`, traces, `drift_check`, `cluster_rejections`), the **watcher** (learn
+from an agent's traces), and the MCP agent surface.
 
 ## Contributing & contact
 

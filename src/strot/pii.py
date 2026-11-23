@@ -1,31 +1,20 @@
-"""PII masking at the teacher boundary.
+"""Structured-PII detection for `pii_scan` (regex, no model, no network).
 
-The cloud LLM is confined to compile time and never sees production traffic,
-but at compile time one boundary does hand real sample records to a cloud
-teacher - the labeling call that turns records into supervision. This module
-masks at that boundary, so the records reaching the teacher are scrubbed of
-obvious PII first.
-
-:func:`mask_records` applies a list of pluggable masker callables (each a
-``Callable[[str], str]``) to every record. The default list (see
-:func:`default_maskers`) is a thin regex pre-pass for format-defined tokens
-(emails, SSN, Luhn card, secrets, IBAN, IP/MAC/phone) followed by GLiNER, the
-default masker for linguistic PII (names, addresses, orgs, locations). GLiNER
-needs the ``[pii]`` extra; without it the default degrades to regex-only with a
-warning. None of this is a compliance guarantee: deployments can pass their own
-maskers (a stronger NER/PII model, an allowlist projection in ``route_context``,
-etc.). Masking runs over the string projection of each field value; structure
-(dict keys, non-string values) is preserved so downstream serialization is
-unchanged.
+STROT itself never sends records anywhere - it embeds locally - so there is no
+"teacher boundary" to mask at. This module is a detection baseline: a zero-dep
+regex pass over format-defined tokens (email, SSN, Luhn card, secrets, IBAN,
+IP/MAC/phone) that :func:`pii_scan` uses to tell an agent what structured PII a
+record carries *before the agent feeds it to its own LLM*. It is an advisory
+signal, not a compliance guarantee, and not a privacy boundary (the real
+protection is which agent you point at the data - a local/open-weight agent
+keeps it in your infra). Masking runs over the string form of each field value;
+structure (dict keys, non-string values) is preserved.
 """
 
 from __future__ import annotations
 
 import re
-import warnings
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
-
-from .exceptions import RouterConfigurationError
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
 #: A masker maps a string to a redacted string.
 Masker = Callable[[str], str]
@@ -129,99 +118,27 @@ def mask_phone(text: str) -> str:
     return _PHONE_RE.sub("[PHONE]", text)
 
 
-#: A thin precision pre-pass for format-defined tokens only: the shapes regex
+#: Regex maskers for format-defined tokens, in apply order: the shapes regex
 #: catches cleanly with near-zero false positives (email, secrets, IBAN, IP,
-#: MAC, SSN, Luhn-validated card, phone). It runs before GLiNER so it pulls
-#: exact-format tokens out of the text as whole spans; the broad phone matcher
-#: is still last so the more specific digit patterns claim their spans first.
-#: Linguistic PII (names, addresses, orgs) is GLiNER's job, not regex's.
+#: MAC, SSN, Luhn-validated card, phone). The broad phone matcher runs last so
+#: the more specific digit patterns claim their spans first. Linguistic PII
+#: (names, addresses) has no fixed shape and is NOT covered - that is the agent's
+#: concern, handled by pointing a local agent at the data, not by STROT masking.
 DEFAULT_MASKERS: List[Masker] = [
     mask_email, mask_secret, mask_iban, mask_mac, mask_ip,
     mask_ssn, mask_credit_card, mask_phone,
 ]
 
 
-# GLiNER (zero-shot NER) is the default masker for linguistic PII: person
-# names, addresses, organizations, locations - the entities that have no fixed
-# shape and that regex cannot catch. The regex pass above is a precision
-# pre-pass for format-defined tokens only; GLiNER carries the headline
-# coverage. It needs the [pii] extra (torch + the gliner model). When the extra
-# is installed GLiNER is on by default; when it is not, default_maskers() warns
-# and degrades to regex-only. Compile-time only.
-
-#: Lightweight zero-shot NER checkpoint (medium variant, CPU-friendly).
-DEFAULT_GLINER_MODEL = "urchade/gliner_medium-v2.1"
-#: Unstructured entity types GLiNER covers that regex cannot.
-DEFAULT_PII_ENTITIES: List[str] = [
-    "person", "person name", "address", "location",
-    "organization", "nationality", "date of birth",
-]
-
-
-def gliner_masker(
-    entity_types: Optional[Sequence[str]] = None,
-    model_id: str = DEFAULT_GLINER_MODEL,
-    threshold: float = 0.5,
-) -> Masker:
-    """Build a NER masker that redacts GLiNER-detected entity spans.
-
-    Returns a ``Masker`` that replaces each detected entity with ``[<TYPE>]``.
-    The model is loaded once here and reused for every call. Needs the ``[pii]``
-    extra; raises :class:`RouterConfigurationError` otherwise so callers can
-    fall back to the regex baseline.
-    """
-    try:
-        from gliner import GLiNER
-    except ImportError as exc:  # pragma: no cover - env guard
-        raise RouterConfigurationError(
-            "NER masking needs the pii extra: pip install strot-ai[pii]"
-        ) from exc
-    labels = list(entity_types or DEFAULT_PII_ENTITIES)
-    model = GLiNER.from_pretrained(model_id)
-
-    def _mask(text: str) -> str:
-        entities = model.predict_entities(text, labels, threshold=threshold)
-        # Redact right-to-left so earlier spans keep their offsets.
-        for ent in sorted(entities, key=lambda e: e["start"], reverse=True):
-            tag = "[" + str(ent["label"]).upper().replace(" ", "_") + "]"
-            text = text[: ent["start"]] + tag + text[ent["end"]:]
-        return text
-
-    return _mask
-
-
-_NER_MASKER_CACHE: Optional[Masker] = None
-
-
 def default_maskers() -> List[Masker]:
-    """The default masker list for the teacher boundary.
+    """The regex detection baseline `pii_scan` uses (no model, no network).
 
-    GLiNER is the default masker. The returned list is ``[<regex pre-pass>,
-    <GLiNER masker>]``: the thin regex pre-pass runs first to claim
-    format-defined tokens (emails, cards, IPs, secrets) as clean whole spans,
-    then GLiNER runs over the remainder for the linguistic PII it owns - names,
-    addresses, orgs, locations. Order matters: running NER first can tag part of
-    an email domain as an organization and leave a mangled ``jane@[ORG]`` that
-    the email regex can no longer match, leaking the local part. Regex-first
-    avoids that.
-
-    GLiNER needs the ``[pii]`` extra. When it is importable it is included by
-    default, loaded once and cached. If the import fails, this warns and
-    degrades to the regex pre-pass alone, so base installs still work.
-    Compile-time only.
+    Returns the format-defined-token maskers. STROT embeds records locally and
+    sends them nowhere, so there is no boundary to mask at; this is an advisory
+    pass that lets an agent see what structured PII a record carries before it
+    feeds that record to its own LLM.
     """
-    global _NER_MASKER_CACHE
-    try:
-        if _NER_MASKER_CACHE is None:
-            _NER_MASKER_CACHE = gliner_masker()
-        return [*DEFAULT_MASKERS, _NER_MASKER_CACHE]
-    except RouterConfigurationError:
-        warnings.warn(
-            "GLiNER not installed; PII masking is falling back to regex-only, "
-            "which misses names/addresses. Install strot-ai[pii].",
-            stacklevel=2,
-        )
-        return list(DEFAULT_MASKERS)
+    return list(DEFAULT_MASKERS)
 
 
 def mask_text(text: str, maskers: Sequence[Masker] = DEFAULT_MASKERS) -> str:

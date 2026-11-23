@@ -112,6 +112,45 @@ def test_compile_status_unknown_job():
     assert tools.compile_status("nope")["status"] == "unknown"
 
 
+def test_compile_model_calls_the_llm_free_door(monkeypatch):
+    # compile_model must route to strot.compile (no llm arg).
+    import strot
+
+    seen = {}
+
+    class _Result:
+        questions = {"q": {}}
+        cache_hit = False
+        artifact_path = "/x/triage.strot"
+
+    def _fake_compile(records, questions, labels, **kw):
+        seen["labels"] = labels
+        seen["kw"] = kw
+        return _Result()
+
+    monkeypatch.setattr(strot, "compile", _fake_compile)
+    out = tools.compile_model(
+        [{"body": "a"}], {"q": {"type": "predicate"}}, [{"q": True}],
+    )
+    assert out["model_path"] == "/x/triage.strot"
+    assert seen["labels"] == [{"q": True}]
+    assert "llm" not in seen["kw"]  # the whole point: no LLM on this path
+
+
+def test_compile_start_with_labels_runs_in_background(monkeypatch):
+    monkeypatch.setattr(tools, "_compiles_started", 0)
+    monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
+    monkeypatch.setattr(
+        tools, "compile_model",
+        lambda *a, **k: {"model_path": "/x/triage.strot", "mode": "head"},
+    )
+    started = tools.compile_start([{"x": 1}], {"q": {"type": "predicate"}}, [{"q": True}])
+    assert started["status"] == "running" and "job_id" in started
+    done = _wait(started["job_id"])
+    assert done["status"] == "done"
+    assert done["result"]["model_path"] == "/x/triage.strot"
+
+
 def test_compile_error_is_surfaced_not_raised(monkeypatch):
     monkeypatch.setattr(tools, "_compiles_started", 0)
     monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
@@ -162,7 +201,7 @@ def test_recompile_reuses_question_config(tmp_path, monkeypatch):
     monkeypatch.delenv("STROT_MCP_COMPILE_BUDGET", raising=False)
     captured = {}
 
-    def _fake(data, questions, **k):
+    def _fake(data, questions, labels=None, **k):
         captured["questions"] = questions
         captured["name"] = k.get("name")
         return {"model_path": "x"}
@@ -184,8 +223,8 @@ def test_playbook_covers_the_loop_and_principles():
     from strot.mcp.playbook import PLAYBOOK
 
     for term in (
-        "inspect_data", "pii_scan", "design_questions", "compile_start",
+        "inspect_data", "pii_scan", "compile_start",
         "evaluate_model", "drift_check", "cluster_rejections", "recompile", "set_status",
-        "Distillation-only", "Recompile, don't increment", "Evaluate-safe, act-gated",
+        "Labels from any source", "Recompile, don't increment", "Evaluate-safe, act-gated",
     ):
         assert term in PLAYBOOK, term

@@ -33,16 +33,15 @@ def inspect_data(data: Any, sample_size: int = 25) -> Dict[str, Any]:
 
 
 def pii_scan(data: Any, sample_size: int = 25) -> Dict[str, Any]:
-    """Detect what PII the teacher-boundary masker would redact over a sample -
-    placeholder types + counts. Torch-free (regex; also GLiNER if ``[pii]`` is
-    installed). This is the 'detect' step of PII enablement: an agent can scan
-    before any data reaches the teacher.
+    """Detect structured PII in a sample - placeholder types + counts. Torch-free,
+    regex-only, no model, no network. Advisory: STROT sends records nowhere (it
+    embeds locally), so this is a signal for the agent to decide what it carries
+    before feeding a record to its own LLM.
     """
     from . import pii
 
     records = _records(data, sample_size)
-    maskers = pii.default_maskers()
-    masked = pii.mask_records(records, maskers=maskers)
+    masked = pii.mask_records(records, maskers=pii.default_maskers())
     counts: Dict[str, int] = {}
     for record in masked:
         for value in record.values():
@@ -51,5 +50,5 @@ def pii_scan(data: Any, sample_size: int = 25) -> Dict[str, Any]:
     return {
         "n_scanned": len(records),
         "detected": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
-        "masker": "regex+gliner" if len(maskers) > len(pii.DEFAULT_MASKERS) else "regex",
+        "masker": "regex",
     }
