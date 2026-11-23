@@ -5,7 +5,7 @@ description = "STROT: a decision compiler. Your agent labels a sample; STROT dis
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/strot-ai/STROT-Compiler"
+repository = "https://github.com/strot-ai/OpenDecisions"
 keywords = ["strot", "nlu", "decision-model", "classification", "distillation", "llm", "compiler"]
 classifiers = [
     "Development Status :: 4 - Beta",

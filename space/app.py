@@ -135,7 +135,7 @@ Output is bounded typed-JSON with confidence; low-confidence records abstain.
 Space — the first request after it's been idle wakes the container and loads the
 model (about 30–60s), then it's warm.*
 
-Repo: https://github.com/strot-ai/STROT-Compiler · `pip install strot-ai`
+Repo: https://github.com/strot-ai/OpenDecisions · `pip install strot-ai`
 """
 
 
