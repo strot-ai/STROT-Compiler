@@ -183,4 +183,4 @@ CI runs the suite on the core install across Python versions.
 
 Implements ideas from STROT (Structured Task Reasoning and Output Transformation,
 [arXiv:2505.01636](https://arxiv.org/abs/2505.01636)). MIT licensed; the base
-encoder is Apache-2.0. Source: <https://github.com/strot-ai/OpenDecisions>.
+encoder is Apache-2.0. Source: <https://github.com/strot-ai/STROT-Compiler>.

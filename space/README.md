@@ -25,4 +25,4 @@ Output is bounded typed-JSON with confidence; low-confidence records abstain.
   key-free, CPU-only, $0 per decision.
 - **Compile your own** uses your API key once to build a fresh artifact.
 
-Source: https://github.com/strot-ai/OpenDecisions · `pip install strot-ai`
+Source: https://github.com/strot-ai/STROT-Compiler · `pip install strot-ai`

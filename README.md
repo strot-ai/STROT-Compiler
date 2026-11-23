@@ -1,21 +1,17 @@
-# OpenDecisions
+# STROT
 
-### Open decision models, compiled from your data — $0 at inference.
+### The open decision system — $0 at inference.
 
 [![PyPI](https://img.shields.io/pypi/v/strot-ai?color=7c3aed&label=pip%20install%20strot-ai)](https://pypi.org/project/strot-ai/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
 
-OpenDecisions distills an agent's judgment into a **specialized decision model** —
-a calibrated head on a frozen encoder, trained on *your* real data — that then
+STROT distills an agent's judgment into a **specialized decision model** — a
+calibrated head on a frozen encoder, trained on *your* real data — that then
 makes every decision **locally, on CPU, at $0**: no API calls, no GPU, no
 per-record cost. **You (the agent) are the teacher: you design the questions and
-label a small sample. It runs no LLM and holds no API key** — it only embeds,
+label a small sample. STROT runs no LLM and holds no API key** — it only embeds,
 fits, and bakes.
-
-> The package is **`strot-ai`** (the STROT compiler engine): `pip install
-> strot-ai`, `import strot`, `python -m strot.mcp`. OpenDecisions is the product;
-> STROT is the method it implements.
 
 > The core (a head on a frozen `gte-modernbert` encoder) is benchmark-validated on
 > Banking77 (93% full-data, 87% at 10 examples/class). Drive it from your agent
@@ -29,7 +25,7 @@ pip install "strot-ai[local]"
 import strot
 
 # You design the typed questions (see `strot playbook`), and label a small sample
-# yourself — your own decisions, or human ground truth. OpenDecisions distills the rest.
+# yourself — your own decisions, or human ground truth. STROT distills the rest.
 questions = {"is_bug": {"type": "predicate", "instructions": "mentions a crash or error?"}}
 labels    = [{"is_bug": True}, {"is_bug": False}, ...]   # one per record, same order
 
@@ -45,7 +41,7 @@ model.dispatch("ticket-triage")
 strot.load_model("ticket-triage")
 ```
 
-No LLM runs inside OpenDecisions, at compile time or after. Production is a self-contained
+No LLM runs inside STROT, at compile time or after. Production is a self-contained
 model file: the local model answers every record, **nothing is generated at
 runtime**, and every output is bounded typed JSON with a calibrated confidence.
 
@@ -84,7 +80,7 @@ distill from the labels you bring:
 Two phases: the labeling (the agent's judgment) happens **once**; the cheap
 deterministic part runs on every record forever.
 
-- **Compile once.** You design the questions and label a small sample; OpenDecisions
+- **Compile once.** You design the questions and label a small sample; STROT
   projects each record to text, embeds it on the frozen encoder, fits a calibrated
   head per question, and bakes a standalone artifact. No LLM, no network.
   Content-addressed: different labels or a schema change is a fresh model.
@@ -102,7 +98,7 @@ deterministic part runs on every record forever.
 
 ## Data & privacy
 
-The labels are **yours** — the agent's own decisions, or human ground truth; OpenDecisions
+The labels are **yours** — the agent's own decisions, or human ground truth; STROT
 never invents data. It holds no key and **sends records nowhere**: it embeds
 them locally. The only PII exposure is whatever *you* feed your own agent while
 labeling — so `strot.pii_scan(data)` is an advisory regex scan (email, SSN, card,
@@ -122,7 +118,7 @@ install (`python -m strot.mcp`). No API keys, ever.
 
 ## Drive it from an agent (MCP)
 
-The OpenDecisions MCP server lets an agent (Claude, Codex, ChatGPT, or a production
+STROT's MCP server lets an agent (Claude, Codex, ChatGPT, or a production
 automation agent) compile, run, evaluate, and keep decision models healthy with
 tools instead of code. The agent designs the questions and labels the sample; the
 tools do the deterministic rest.

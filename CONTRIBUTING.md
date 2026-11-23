@@ -9,8 +9,8 @@ The core is pure standard library; the heavy pieces (the local model, hosted
 clients, the synthesizer) come in through extras.
 
 ```bash
-git clone https://github.com/strot-ai/OpenDecisions
-cd OpenDecisions
+git clone https://github.com/strot-ai/STROT-Compiler
+cd STROT-Compiler
 pip install -e ".[anthropic]"   # add [local] for the on-device model, [hosted] for OpenAI
 ```
 
