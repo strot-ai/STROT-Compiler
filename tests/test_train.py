@@ -169,6 +169,16 @@ class TestTrainCache:
                             state=tmp_path, execute=False)
         assert other.cache_key != first.cache_key
 
+    def test_max_length_is_baked_and_busts_cache(self, tmp_path, fake_runtime, decide_encoder):
+        # The token window is an input: it bakes into the artifact (so inference
+        # uses the same window) and a different window is a different model.
+        a = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(), state=tmp_path, execute=False)
+        assert "NLU_MAX_LENGTH = 256" in a.artifact_path.read_text()  # default
+        b = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(), max_length=512,
+                          state=tmp_path, execute=False)
+        assert "NLU_MAX_LENGTH = 512" in b.artifact_path.read_text()
+        assert b.cache_key != a.cache_key
+
     def test_projection_change_recompiles(self, tmp_path, fake_runtime, decide_encoder):
         # The projection is an input: a different route_context is a fresh model.
         base = strot.compile(DECIDE_SAMPLE, DECIDE_CONFIG, _labels(),

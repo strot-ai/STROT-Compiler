@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import templates
 from .exceptions import CompilationError, RouterConfigurationError
-from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
+from .constants import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL, NLU_MAX_LENGTH
 from .schema import DatasetSchema, introspect_schema
 
 #: Below this many labeled records for a class, its head under-learns; warn.
@@ -617,6 +617,7 @@ class StrotCompiler:
         golden: Optional[List[Mapping[str, Any]]],
         attempts: int,
         mode: str,
+        max_length: int = NLU_MAX_LENGTH,
     ) -> CompiledAsset:
         """The deterministic distill core: given the projected ``contexts`` and
         the ``answers`` that label them, embed, fit one calibrated head per
@@ -670,13 +671,13 @@ class StrotCompiler:
                 ]
                 q_classes[name] = len(classes)
             adapt = finetune_mod.finetune_decide(
-                contexts, q_labels, q_classes, train=train_ix,
+                contexts, q_labels, q_classes, train=train_ix, max_length=max_length,
             )
             vectors = adapt.vectors
             adapter, adapter_config = adapt.adapter, adapt.config
         else:
             vectors = distill_mod.make_encoder_embedder(
-                self._resolve_compile_checkpoint()
+                self._resolve_compile_checkpoint(), max_length=max_length,
             )(contexts)
 
         # 4. One calibrated logistic head per question.
@@ -730,7 +731,7 @@ class StrotCompiler:
             question_heads, code, schema, questions, golden, attempts,
             winner=("fine_tuned" if mode == "deep" else "distilled"),
             n_records=len(records), adapter=adapter, adapter_config=adapter_config,
-            ood=ood,
+            ood=ood, max_length=max_length,
         )
 
     def compile_model(
@@ -741,6 +742,7 @@ class StrotCompiler:
         projection: Optional[str] = None,
         golden: Optional[List[Mapping[str, Any]]] = None,
         mode: str = "head",
+        max_length: int = NLU_MAX_LENGTH,
     ) -> CompiledAsset:
         """Compile a decision model - the deterministic, LLM-free door.
 
@@ -750,7 +752,8 @@ class StrotCompiler:
         the calibrated heads + OOD gate, and bakes. ``mode="head"`` (default)
         distills a logistic head per question; ``mode="deep"`` adds a shared LoRA
         adapter. ``projection`` is optional ``route_context(record) -> str``
-        source; the default concatenates the record's text fields.
+        source; the default concatenates the record's text fields. ``max_length``
+        is the token window both tiers use (and bake for inference).
         """
         if mode not in ("head", "deep"):
             raise RouterConfigurationError(
@@ -808,7 +811,7 @@ class StrotCompiler:
 
         return self._distill_and_bake(
             records, contexts, answers, questions, code, schema, golden,
-            attempts=0, mode=mode,
+            attempts=0, mode=mode, max_length=max_length,
         )
 
     def _bake_decider(
@@ -824,6 +827,7 @@ class StrotCompiler:
         adapter: Optional[Dict[str, Any]] = None,
         adapter_config: Optional[Dict[str, Any]] = None,
         ood: Optional[Dict[str, Any]] = None,
+        max_length: int = NLU_MAX_LENGTH,
     ) -> CompiledAsset:
         """Bake baked heads + projection into a self-contained decider asset.
 
@@ -834,6 +838,7 @@ class StrotCompiler:
         """
         header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
+            max_length=int(max_length),
             schema_literal=repr(schema.to_dict()),
             config_literal=repr(dict(questions)),
         )

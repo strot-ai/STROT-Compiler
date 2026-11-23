@@ -120,6 +120,7 @@ def finetune_decide(
     question_classes: Dict[str, int],
     train: Sequence[int],
     config: Optional[FineTuneConfig] = None,
+    max_length: Optional[int] = None,
 ) -> DecideAdaptResult:
     """Train ONE shared cached-lower + top-N LoRA adapter for all questions.
 
@@ -141,6 +142,8 @@ def finetune_decide(
     import torch.nn as nn
 
     cfg = config or FineTuneConfig()
+    if max_length is not None:
+        cfg = replace(cfg, max_length=int(max_length))
     if len(texts) < MIN_FINETUNE_RECORDS:
         raise ValueError(
             f"need >= {MIN_FINETUNE_RECORDS} records to fine-tune; got {len(texts)}"
