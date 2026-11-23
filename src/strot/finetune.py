@@ -37,10 +37,16 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
+from .constants import DEFAULT_NLU_MODEL
 from .exceptions import RouterConfigurationError
 
-#: Default fine-tune base: a standard, peft-clean encoder.
-DEFAULT_FINETUNE_BASE = "answerdotai/ModernBERT-base"
+#: Default fine-tune base: the SAME encoder `head` uses, so `deep` is a true
+#: superset (head's frozen encoder + a LoRA adapter), not a different, weaker
+#: model. gte-modernbert-base loads as a plain ``ModernBertModel`` (identical
+#: structure to answerdotai/ModernBERT-base: ``.layers`` + ``.attention_type``),
+#: so the hand-rolled LoRA path below works on it unchanged - it just starts from
+#: the GTE-tuned weights instead of the raw ModernBERT ones.
+DEFAULT_FINETUNE_BASE = DEFAULT_NLU_MODEL
 
 #: Validated recipe defaults (see benchmarks/cyber_cached_top.py,
 #: cyber_soup_lora.py). ``top_layers`` is the measured knee.
@@ -144,14 +150,16 @@ def finetune_decide(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     path = snapshot_download(cfg.base_model)
-    tok = AutoTokenizer.from_pretrained(path)
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     enc = tok(
         list(texts), padding="max_length", truncation=True,
         max_length=cfg.max_length, return_tensors="pt",
     )
     ids, mask = enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
-    base = AutoModel.from_pretrained(path).to(device).eval()
+    # Force float32: gte-modernbert may carry a reduced-precision torch_dtype in
+    # its config, and the CPU LoRA path (float32 cache + heads) needs it uniform.
+    base = AutoModel.from_pretrained(path, trust_remote_code=True).to(device).float().eval()
     for p in base.parameters():
         p.requires_grad = False
     n_layers = len(base.layers)
@@ -196,7 +204,7 @@ def finetune_decide(
                 _wrap(child)
 
     torch.manual_seed(cfg.seed)
-    model = AutoModel.from_pretrained(path).to(device)
+    model = AutoModel.from_pretrained(path, trust_remote_code=True).to(device).float()
     for p in model.parameters():
         p.requires_grad = False
     for i in range(cut):

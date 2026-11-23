@@ -229,8 +229,9 @@ class CompiledDecider:
         config = ADAPTER_CONFIG
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         path = snapshot_download(config["base_model"])
-        self._tokenizer = AutoTokenizer.from_pretrained(path)
-        model = AutoModel.from_pretrained(path).to(self._device)
+        self._tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        # float32 to match the baked LoRA weights (the gte encoder may load Half).
+        model = AutoModel.from_pretrained(path, trust_remote_code=True).to(self._device).float()
         for p in model.parameters():
             p.requires_grad = False
         n_layers = int(config["n_layers"])
