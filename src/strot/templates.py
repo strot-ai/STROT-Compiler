@@ -167,6 +167,148 @@ if __name__ == "__main__":
             print(json.dumps(decider.process(json.loads(line)), default=str))
 '''
 
+DECIDE_IMAGE_HEADER_TEMPLATE = '''\
+"""Compiled STROT image decision model. DO NOT EDIT BY HAND.
+
+Synthesized by strot-ai in decide mode (image modality). Per record a frozen
+vision encoder embeds record[IMAGE_FIELD] and a compile-time-distilled logistic
+head per question answers it; output is exclusively type-safe JSON.
+
+    vision encoder : {nlu_model}
+
+Runtime dependency: pip install "strot-ai[local]" pillow (torch + transformers + PIL).
+"""
+
+import io
+import json
+import math
+import os
+from typing import Any, Dict, List, Mapping, Sequence
+
+try:
+    import torch
+    from PIL import Image
+    from transformers import AutoImageProcessor, AutoModel
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        'This image decision model embeds records with a vision encoder: '
+        'pip install "strot-ai[local]" pillow'
+    ) from _exc
+
+NLU_MODEL = {nlu_model!r}
+IMAGE_FIELD = {image_field!r}
+
+DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
+
+#: The original typed-question config this model was compiled from.
+QUESTIONS_CONFIG: Dict[str, Any] = {config_literal}
+'''
+
+DECIDE_IMAGE_RUNTIME_TEMPLATE = '''\
+# --- Runtime: frozen vision encoder + one distilled head per question ---
+# Each head is a logistic classifier trained at compile time on the image
+# embeddings; weights are baked in QUESTION_HEADS as literals.
+
+
+def _head_softmax(vector: Sequence[float], weights: Sequence[Sequence[float]],
+                  bias: Sequence[float], temperature: float = 1.0) -> List[float]:
+    logits = [(sum(w * x for w, x in zip(row, vector)) + b) / temperature
+              for row, b in zip(weights, bias)]
+    peak = max(logits)
+    exps = [math.exp(z - peak) for z in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def _nearest_centroid_distance(vector: Sequence[float],
+                               centroids: Sequence[Sequence[float]]) -> float:
+    return min(math.sqrt(sum((x - c) * (x - c) for x, c in zip(vector, cen)))
+               for cen in centroids)
+
+
+def _is_ood(vector: Sequence[float]) -> bool:
+    return bool(OOD) and _nearest_centroid_distance(vector, OOD["centroids"]) > OOD["threshold"]
+
+
+def _load_image(ref: Any) -> "Image.Image":
+    if isinstance(ref, Image.Image):
+        return ref.convert("RGB")
+    if isinstance(ref, (bytes, bytearray)):
+        return Image.open(io.BytesIO(ref)).convert("RGB")
+    if isinstance(ref, str):
+        if ref.startswith(("http://", "https://")):
+            import urllib.request
+            return Image.open(urllib.request.urlopen(ref)).convert("RGB")
+        return Image.open(ref).convert("RGB")
+    raise ValueError("image field must be a path, URL, bytes, or PIL image")
+
+
+#: Which output group each question type lands in.
+_DECISION_GROUP = {{"predicate": "predicates", "score": "scores", "choice": "choices"}}
+
+
+class CompiledDecider:
+    """Frozen vision-encoder embedding + one distilled head per question."""
+
+    def __init__(self) -> None:
+        checkpoint = os.environ.get("STROT_NLU_CHECKPOINT") or NLU_MODEL
+        from pathlib import Path
+        if not Path(checkpoint).is_dir():
+            from huggingface_hub import snapshot_download
+            checkpoint = snapshot_download(NLU_MODEL)
+        self._processor = AutoImageProcessor.from_pretrained(checkpoint)
+        model = AutoModel.from_pretrained(checkpoint)
+        self._vision = getattr(model, "vision_model", model).eval()
+
+    def _embed(self, record: Mapping[str, Any]) -> List[float]:
+        image = _load_image(record[IMAGE_FIELD])
+        pixel_values = self._processor(images=[image], return_tensors="pt")["pixel_values"]
+        with torch.no_grad():
+            out = self._vision(pixel_values=pixel_values)
+        pooled = getattr(out, "pooler_output", None)
+        if pooled is None:
+            pooled = out.last_hidden_state.mean(1)
+        return pooled[0].tolist()
+
+    def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        vector = self._embed(dict(record))
+        ood = _is_ood(vector)
+        output: Dict[str, Dict[str, Any]] = {{"predicates": {{}}, "scores": {{}}, "choices": {{}}}}
+        for name, head in QUESTION_HEADS.items():
+            classes = head["classes"]
+            if ood:
+                output[_DECISION_GROUP[head["type"]]][name] = {{"refusal": True, "reason": "ood"}}
+                continue
+            probs = _head_softmax(vector, head["weights"], head["bias"],
+                                  head.get("temperature", 1.0))
+            if head["type"] == "predicate":
+                output["predicates"][name] = {{
+                    "type": "predicate",
+                    "probability": round(float(probs[classes.index(True)]), 4),
+                }}
+            else:
+                idx = max(range(len(probs)), key=probs.__getitem__)
+                group = "scores" if head["type"] == "score" else "choices"
+                key = "score" if head["type"] == "score" else "choice"
+                output[group][name] = {{
+                    key: classes[idx],
+                    "probabilities": {{classes[i]: round(float(p), 4)
+                                       for i, p in enumerate(probs)}},
+                    "confidence": round(float(max(probs)), 4),
+                }}
+        return output
+
+
+if __name__ == "__main__":
+    import sys
+
+    decider = CompiledDecider()
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            print(json.dumps(decider.process(json.loads(line)), default=str))
+'''
+
 DECIDE_FINETUNED_RUNTIME_TEMPLATE = '''\
 # --- Runtime: shared top-N LoRA adapter + one head per question ---
 # ADAPTER / ADAPTER_CONFIG hold a cached-lower + top-N LoRA adapter trained

@@ -429,6 +429,9 @@ def train(
     name: Optional[str] = None,
     mode: str = "head",
     max_length: int = NLU_MAX_LENGTH,
+    modality: str = "text",
+    encoder: Optional[str] = None,
+    image_field: Optional[str] = None,
     execute: bool = True,
 ) -> RunResult:
     """Compile a decision model - the deterministic, LLM-free door (``strot.compile``).
@@ -444,8 +447,12 @@ def train(
     intent is not accepted here. ``projection`` is optional ``route_context``
     source; the default concatenates the record's text fields.
 
+    ``modality="image"`` (head tier only) embeds each record's ``image_field``
+    (a path / URL / bytes / PIL image) with a frozen vision ``encoder`` instead
+    of the text encoder; the heads, OOD gate, and decision JSON are identical.
+
     ``recompile, don't increment`` holds: the baked weights are a pure function of
-    ``(data, questions, labels, projection, mode)``.
+    ``(data, questions, labels, projection, mode, modality, encoder)``.
     """
     if isinstance(questions, str):
         try:
@@ -468,6 +475,10 @@ def train(
         raise RouterConfigurationError(
             f"mode must be 'head' or 'deep' (got {mode!r})."
         )
+    if modality not in ("text", "image"):
+        raise RouterConfigurationError(
+            f"modality must be 'text' or 'image' (got {modality!r})."
+        )
 
     records = as_records(data)
     if labels is None:
@@ -483,12 +494,19 @@ def train(
         )
     schema = introspect_schema(records)
     canonical_config = json.dumps(questions, sort_keys=True)
-    nlu = DEFAULT_NLU_MODEL
-    # Labels + projection + the token window are inputs, so they bust the cache:
-    # a fresh fit on any of them is a different model (recompile-don't-increment).
+    if modality == "image":
+        from .constants import DEFAULT_IMAGE_ENCODER
+
+        nlu = encoder or DEFAULT_IMAGE_ENCODER
+    else:
+        nlu = DEFAULT_NLU_MODEL
+    # Labels + projection + the token window + modality are inputs, so they bust
+    # the cache: a fresh fit on any of them is a different model
+    # (recompile-don't-increment).
     labels_fp = hashlib.sha256(
         (json.dumps(labels, sort_keys=True, default=str) + "\n"
-         + (projection or "") + "\n" + str(int(max_length)))
+         + (projection or "") + "\n" + str(int(max_length)) + "\n"
+         + modality + "\n" + (image_field or ""))
         .encode("utf-8")
     ).hexdigest()
     key_mode = "compile" if mode == "head" else f"compile-{mode}"
@@ -506,7 +524,8 @@ def train(
             asset = compiler.compile_model(
                 sample=records, questions=questions, labels=labels,
                 projection=projection, golden=golden, mode=mode,
-                max_length=max_length,
+                max_length=max_length, modality=modality, encoder=encoder,
+                image_field=image_field,
             )
         except Exception as exc:
             _log_episode(state, {

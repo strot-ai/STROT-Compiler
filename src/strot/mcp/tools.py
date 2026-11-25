@@ -69,6 +69,7 @@ def read_model_meta(path: Union[str, Path]) -> Dict[str, Any]:
         "questions": list(questions) if isinstance(questions, dict) else None,
         "encoder": _module_literal(source, "NLU_MODEL") or meta.get("nlu"),
         "mode": meta.get("mode"),
+        "modality": "image" if "IMAGE_FIELD" in source else "text",
         "has_adapter": "ADAPTER_CONFIG" in source,  # a deep (LoRA) model
         "has_drift_gate": "OOD" in source and "centroids" in source,
     }
@@ -112,6 +113,9 @@ def compile_model(
     projection: Optional[str] = None,
     state: str = ".strot",
     name: Optional[str] = None,
+    modality: str = "text",
+    encoder: Optional[str] = None,
+    image_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compile a decision model - the LLM-free door (needs the ``[local]`` extra).
 
@@ -119,18 +123,25 @@ def compile_model(
     label the sample, then hand them here. ``labels`` is one ``{question: answer}``
     dict per record in ``data`` order (an agent's decisions or human ground
     truth); ``projection`` is optional
-    ``route_context`` source (default concatenates text fields). Returns the path.
+    ``route_context`` source (default concatenates text fields).
+
+    For image records set ``modality="image"`` and ``image_field`` to the record
+    key holding the image (a path, URL, bytes, or PIL image); a frozen vision
+    ``encoder`` (default a SigLIP) embeds it. Image is head-tier only. Returns the
+    path.
     """
     import strot
 
     result = strot.compile(
         _as_records(data), questions, labels, projection=projection, mode=mode,
-        state=state, execute=False, name=name,
+        state=state, execute=False, name=name, modality=modality, encoder=encoder,
+        image_field=image_field,
     )
     path = result.dispatch(name) if name else result.artifact_path
     return {
         "model_path": str(path),
         "mode": mode,
+        "modality": modality,
         "questions": list(result.questions or {}),
         "cache_hit": result.cache_hit,
     }
@@ -174,10 +185,14 @@ def compile_start(
     projection: Optional[str] = None,
     state: str = ".strot",
     name: Optional[str] = None,
+    modality: str = "text",
+    encoder: Optional[str] = None,
+    image_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Start a compile in the background; returns a ``job_id`` to poll with
     :func:`compile_status`. YOU bring the labels (no LLM). Embedding a large sample runs minutes, so it is off-thread. Honors the
-    compile cap (a compute guard). Needs the ``[local]`` extra.
+    compile cap (a compute guard). Needs the ``[local]`` extra. For image records
+    pass ``modality="image"`` + ``image_field`` (head-tier only).
     """
     cap = _compile_cap()
     with _budget_lock:
@@ -194,7 +209,9 @@ def compile_start(
     def _run() -> None:
         try:
             result = compile_model(data, questions, labels, mode=mode,
-                                   projection=projection, state=state, name=name)
+                                   projection=projection, state=state, name=name,
+                                   modality=modality, encoder=encoder,
+                                   image_field=image_field)
             with _jobs_lock:
                 _jobs[job_id].update(status="done", result=result)
         except Exception as exc:  # surface the error to the poller, never crash the thread

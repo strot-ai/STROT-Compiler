@@ -66,6 +66,18 @@ model = strot.compile(data, questions, labels)   # -> a DecisionModel
 model.dispatch("triage")                          # -> triage.strot
 ```
 
+**Images** — if each record carries an image (a path, URL, bytes, or PIL image)
+under some field, compile against a frozen vision encoder instead. Everything
+else (typed questions, labels, confidence, routing) is identical; image is
+head-tier only:
+
+```python
+model = strot.compile(
+    data, questions, labels,
+    modality="image", image_field="photo",   # encoder= to pick a SigLIP/ViT/DINOv2
+)
+```
+
 **6. VERIFY** — hold out some labeled records and score the model:
 
 ```python

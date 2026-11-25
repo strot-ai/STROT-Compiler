@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from .constants import NLU_MAX_LENGTH
 from .exceptions import RouterConfigurationError
@@ -93,6 +93,62 @@ def make_encoder_embedder(
                 hidden = model(**inputs).last_hidden_state
             mask = inputs["attention_mask"].unsqueeze(-1).float()
             pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+            vectors.extend(pooled.tolist())
+        return vectors
+
+    return embed
+
+
+def load_image(ref: Any):
+    """Load an image reference (PIL image, bytes, a local path, or an http(s) URL)
+    into an RGB PIL image. The image field of a record is one of these."""
+    import io
+
+    from PIL import Image
+
+    if isinstance(ref, Image.Image):
+        return ref.convert("RGB")
+    if isinstance(ref, (bytes, bytearray)):
+        return Image.open(io.BytesIO(ref)).convert("RGB")
+    if isinstance(ref, str):
+        if ref.startswith(("http://", "https://")):
+            import urllib.request
+
+            return Image.open(urllib.request.urlopen(ref)).convert("RGB")  # noqa: S310
+        return Image.open(ref).convert("RGB")
+    raise RouterConfigurationError(
+        f"image field must be a path, URL, bytes, or PIL image (got {type(ref).__name__})"
+    )
+
+
+def make_image_embedder(
+    checkpoint: str, image_field: str, batch_size: int = 16
+) -> EmbedFn:
+    """Pooled image embedding from a vision encoder (head tier only).
+
+    Loads ``record[image_field]`` and embeds it with a frozen vision tower. Works
+    generically across SigLIP / ViT / DINOv2: it takes the model's
+    ``pooler_output`` and falls back to a mean over the patch tokens. The returned
+    embedder takes a list of **records** (not text) and returns one vector each -
+    everything downstream (calibrated head, OOD gate, bake) is identical to text.
+    """
+    import torch
+    from transformers import AutoImageProcessor, AutoModel
+
+    processor = AutoImageProcessor.from_pretrained(checkpoint)
+    model = AutoModel.from_pretrained(checkpoint).eval()
+    vision = getattr(model, "vision_model", model)  # SigLIP tower / plain ViT / DINOv2
+
+    def embed(records: Sequence[Mapping[str, Any]]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for start in range(0, len(records), batch_size):
+            batch = [load_image(r[image_field]) for r in records[start:start + batch_size]]
+            pixel_values = processor(images=batch, return_tensors="pt")["pixel_values"]
+            with torch.no_grad():
+                out = vision(pixel_values=pixel_values)
+            pooled = getattr(out, "pooler_output", None)
+            if pooled is None:
+                pooled = out.last_hidden_state.mean(1)
             vectors.extend(pooled.tolist())
         return vectors
 
