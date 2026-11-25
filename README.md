@@ -76,6 +76,24 @@ distill from the labels you bring:
 | **`head`** *(default)* | a calibrated logistic head per question | the accuracy of training on your records |
 | **`deep`** | a shared top-N LoRA adapter over all questions, then refit heads | representation-bound tasks a frozen head can't crack |
 
+## Images
+
+`head` is "embed → calibrated head," so the back half (typed questions, labels,
+calibration, drift gate, decision JSON) is modality-agnostic. Point it at a frozen
+vision encoder and each record's image field is embedded instead of text — same
+API, same output. Image is `head`-tier only (`deep` adapts a text ModernBERT).
+
+```python
+# records carry an image reference (path / URL / bytes / PIL) under a field
+model = strot.compile(
+    photos, questions, labels,
+    modality="image", image_field="photo",   # encoder= to pick a SigLIP / ViT / DINOv2
+)
+```
+
+Needs the `[image]` extra (adds pillow); the default encoder is
+`google/siglip-base-patch16-224`.
+
 ## How it works
 
 Two phases: the labeling (the agent's judgment) happens **once**; the cheap
@@ -112,10 +130,11 @@ infra.
 ```bash
 pip install strot-ai                # core + the MCP server
 pip install "strot-ai[local]"       # + torch/transformers (compile + serve a model)
+pip install "strot-ai[image]"       # + pillow (compile on images; see Images below)
 ```
 
-`[local]` is all you need to compile and serve. The MCP server ships in the core
-install (`python -m strot.mcp`). No API keys, ever.
+`[local]` is all you need to compile and serve text models. The MCP server ships
+in the core install (`python -m strot.mcp`). No API keys, ever.
 
 ## Drive it from an agent (MCP)
 
