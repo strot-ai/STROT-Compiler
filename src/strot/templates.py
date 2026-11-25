@@ -176,7 +176,7 @@ head per question answers it; output is exclusively type-safe JSON.
 
     vision encoder : {nlu_model}
 
-Runtime dependency: pip install "strot-ai[local]" pillow (torch + transformers + PIL).
+Runtime dependency: pip install "strot-ai[image]" (torch + transformers + PIL).
 """
 
 import io
@@ -192,7 +192,7 @@ try:
 except ImportError as _exc:  # pragma: no cover - environment guard
     raise RuntimeError(
         'This image decision model embeds records with a vision encoder: '
-        'pip install "strot-ai[local]" pillow'
+        'pip install "strot-ai[image]"'
     ) from _exc
 
 NLU_MODEL = {nlu_model!r}

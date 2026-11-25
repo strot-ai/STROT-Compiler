@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "2.0.3"
+version = "2.1.0"
 description = "STROT: a decision compiler. Your agent labels a sample; STROT distills a specialized decision model that runs locally on CPU at $0 - no LLM, no API keys."
 authors = ["strot-ai <lee@strot-ai.xyz>"]
 license = "MIT"
@@ -35,10 +35,14 @@ python = ">=3.10,<4.0"
 mcp = ">=2.0"
 transformers = { version = ">=5.0,<5.1", optional = true }
 torch = { version = ">=2.6", optional = true }
+# pillow is only needed to compile/serve image-modality models (it decodes
+# record[image_field]); text never imports it, so it rides the [image] extra.
+pillow = { version = ">=10.0", optional = true }
 
 [tool.poetry.extras]
 local = ["transformers", "torch"]
-all = ["transformers", "torch"]
+image = ["transformers", "torch", "pillow"]
+all = ["transformers", "torch", "pillow"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
