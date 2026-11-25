@@ -132,8 +132,15 @@ def make_image_embedder(
     embedder takes a list of **records** (not text) and returns one vector each -
     everything downstream (calibrated head, OOD gate, bake) is identical to text.
     """
-    import torch
-    from transformers import AutoImageProcessor, AutoModel
+    try:
+        import torch
+        from PIL import Image  # noqa: F401 - imported to fail fast if pillow is absent
+        from transformers import AutoImageProcessor, AutoModel
+    except ImportError as exc:
+        raise RouterConfigurationError(
+            "Image distillation needs the image runtime deps: "
+            'pip install "strot-ai[image]"'
+        ) from exc
 
     processor = AutoImageProcessor.from_pretrained(checkpoint)
     model = AutoModel.from_pretrained(checkpoint).eval()
