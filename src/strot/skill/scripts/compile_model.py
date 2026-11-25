@@ -10,8 +10,14 @@ at $0.
     python compile_model.py --data data.json --questions questions.json \
         --labels labels.json --name triage [--eval-labels held_out.json]
 
+For images, each record carries an image reference (a path or URL) under some
+field; embed it with a frozen vision encoder (head-tier only):
+
+    python compile_model.py --data data.json --questions questions.json \
+        --labels labels.json --name defect --modality image --image-field photo
+
 Shapes:
-  data.json      [ {record}, ... ]
+  data.json      [ {record}, ... ]   # image: record[<image-field>] is a path/URL
   questions.json { "<name>": {"type": "predicate|choice|score", ...}, ... }
   labels.json    [ {"<question>": <answer>}, ... ]   # one per record, same order
   held_out.json  [ {"record": {...}, "expect": {"<question>": <answer>}}, ... ]
@@ -42,6 +48,12 @@ def main(argv=None) -> int:
                     help="head (default) or deep (LoRA; needs [local])")
     ap.add_argument("--projection", default=None,
                     help="optional path to a route_context(record) python source file")
+    ap.add_argument("--modality", default="text", choices=["text", "image"],
+                    help="text (default) or image (embed record[image-field] with a vision encoder; head-tier only)")
+    ap.add_argument("--encoder", default=None,
+                    help="override the base encoder (image: a SigLIP/ViT/DINOv2 checkpoint)")
+    ap.add_argument("--image-field", default=None,
+                    help="with --modality image: the record key holding the image (path/URL)")
     ap.add_argument("--eval-labels", default=None,
                     help="optional JSON [{record, expect}] to score the model")
     args = ap.parse_args(argv)
@@ -64,7 +76,8 @@ def main(argv=None) -> int:
 
     result = strot.compile(
         data, questions, labels, projection=projection, mode=args.mode,
-        name=args.name, execute=False,
+        name=args.name, execute=False, modality=args.modality,
+        encoder=args.encoder, image_field=args.image_field,
     )
     model_path = result.model.dispatch(args.name)
     print(f"compiled: {model_path}")

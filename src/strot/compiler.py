@@ -618,11 +618,18 @@ class StrotCompiler:
         attempts: int,
         mode: str,
         max_length: int = NLU_MAX_LENGTH,
+        modality: str = "text",
+        encoder: Optional[str] = None,
+        image_field: Optional[str] = None,
     ) -> CompiledAsset:
         """The deterministic distill core: given the projected ``contexts`` and
         the ``answers`` that label them, embed, fit one calibrated head per
         question plus the OOD gate, and bake. No LLM, no network - only the frozen
-        encoder (and, for ``deep``, a shared LoRA adapter)."""
+        encoder (and, for ``deep``, a shared LoRA adapter).
+
+        For ``modality='image'`` the frozen vision ``encoder`` embeds each
+        record's ``image_field`` instead; ``contexts`` is empty and everything
+        downstream (heads, OOD, bake) is identical."""
         from . import distill as distill_mod
 
         # Coverage guard: a head can only learn an outcome it has seen. Warn on
@@ -659,7 +666,9 @@ class StrotCompiler:
         # the heads on the adapted embedding (one forward pass per record).
         adapter: Optional[Dict[str, Any]] = None
         adapter_config: Optional[Dict[str, Any]] = None
-        if mode == "deep":
+        if modality == "image":
+            vectors = distill_mod.make_image_embedder(encoder, image_field)(records)
+        elif mode == "deep":
             from . import finetune as finetune_mod
 
             q_labels: Dict[str, List[int]] = {}
@@ -731,7 +740,8 @@ class StrotCompiler:
             question_heads, code, schema, questions, golden, attempts,
             winner=("fine_tuned" if mode == "deep" else "distilled"),
             n_records=len(records), adapter=adapter, adapter_config=adapter_config,
-            ood=ood, max_length=max_length,
+            ood=ood, max_length=max_length, modality=modality, encoder=encoder,
+            image_field=image_field,
         )
 
     def compile_model(
@@ -743,6 +753,9 @@ class StrotCompiler:
         golden: Optional[List[Mapping[str, Any]]] = None,
         mode: str = "head",
         max_length: int = NLU_MAX_LENGTH,
+        modality: str = "text",
+        encoder: Optional[str] = None,
+        image_field: Optional[str] = None,
     ) -> CompiledAsset:
         """Compile a decision model - the deterministic, LLM-free door.
 
@@ -754,10 +767,39 @@ class StrotCompiler:
         adapter. ``projection`` is optional ``route_context(record) -> str``
         source; the default concatenates the record's text fields. ``max_length``
         is the token window both tiers use (and bake for inference).
+
+        ``modality="image"`` (head tier only) swaps the text encoder for a frozen
+        vision encoder: each record's ``image_field`` (a path / URL / bytes / PIL
+        image) is embedded and a calibrated head per question answers it. The
+        back half - heads, OOD gate, bake - is identical. ``encoder`` overrides
+        the base checkpoint (text: the NLU encoder; image: the vision encoder,
+        default ``DEFAULT_IMAGE_ENCODER``).
         """
         if mode not in ("head", "deep"):
             raise RouterConfigurationError(
                 f"mode must be 'head' or 'deep' (got {mode!r})."
+            )
+        if modality not in ("text", "image"):
+            raise RouterConfigurationError(
+                f"modality must be 'text' or 'image' (got {modality!r})."
+            )
+        if modality == "image":
+            if mode != "head":
+                raise RouterConfigurationError(
+                    "modality='image' is head-tier only (deep adapts a text "
+                    "ModernBERT); use mode='head'."
+                )
+            if not image_field:
+                raise RouterConfigurationError(
+                    "modality='image' needs image_field: the record key holding "
+                    "the image (a path, URL, bytes, or PIL image)."
+                )
+        elif encoder is not None:
+            # Text encoder swap is not wired yet (the base encoder is a STROT
+            # decision); don't silently ignore a caller-supplied one.
+            raise RouterConfigurationError(
+                "encoder= is only supported for modality='image'; the text base "
+                "encoder is fixed."
             )
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
@@ -771,7 +813,15 @@ class StrotCompiler:
         records = list(sample)
 
         # Projection: a caller-supplied route_context, or the default concat.
-        if projection is None:
+        # Image modality embeds record[image_field] directly - no text projection.
+        if modality == "image":
+            if projection is not None:
+                raise RouterConfigurationError(
+                    "modality='image' embeds record[image_field] directly; a text "
+                    "projection does not apply."
+                )
+            code = ""
+        elif projection is None:
             code = DEFAULT_DECIDE_PROJECTION
         else:
             perr = self._validate_candidate(projection, ["route_context"])
@@ -805,6 +855,15 @@ class StrotCompiler:
         if error:
             raise RouterConfigurationError(f"labels are invalid: {error}")
 
+        if modality == "image":
+            from .constants import DEFAULT_IMAGE_ENCODER
+
+            return self._distill_and_bake(
+                records, [], answers, questions, code, schema, golden,
+                attempts=0, mode=mode, max_length=max_length, modality="image",
+                encoder=encoder or DEFAULT_IMAGE_ENCODER, image_field=image_field,
+            )
+
         ns: Dict[str, Any] = {}
         exec(compile(code, "<compile-projection>", "exec"), ns)
         contexts = [ns["route_context"](dict(record)) for record in records]
@@ -828,29 +887,46 @@ class StrotCompiler:
         adapter_config: Optional[Dict[str, Any]] = None,
         ood: Optional[Dict[str, Any]] = None,
         max_length: int = NLU_MAX_LENGTH,
+        modality: str = "text",
+        encoder: Optional[str] = None,
+        image_field: Optional[str] = None,
     ) -> CompiledAsset:
         """Bake baked heads + projection into a self-contained decider asset.
 
         Shared by all tiers - they differ only in how ``question_heads`` was
         fitted. ``head`` embeds with the frozen encoder; ``deep`` passes
-        an ``adapter`` and bakes the LoRA-adapted runtime instead. ``ood`` (when
-        fitted) bakes the drift gate; an empty literal is a runtime no-op.
+        an ``adapter`` and bakes the LoRA-adapted runtime instead; ``image``
+        bakes a vision-encoder runtime that embeds ``record[image_field]``.
+        ``ood`` (when fitted) bakes the drift gate; an empty literal is a
+        runtime no-op.
         """
-        header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
-            nlu_model=self.nlu_model,
-            max_length=int(max_length),
-            schema_literal=repr(schema.to_dict()),
-            config_literal=repr(dict(questions)),
-        )
         heads_literal = "QUESTION_HEADS: Dict[str, Any] = " + repr(question_heads)
         ood_literal = "OOD: Dict[str, Any] = " + repr(ood or {})
-        parts = [header, code, heads_literal, ood_literal]
-        if adapter is not None:
-            parts.append("ADAPTER: Dict[str, Any] = " + repr(adapter))
-            parts.append("ADAPTER_CONFIG: Dict[str, Any] = " + repr(adapter_config))
-            parts.append(templates.DECIDE_FINETUNED_RUNTIME_TEMPLATE.format())
+        if modality == "image":
+            baked_model = encoder
+            header = templates.DECIDE_IMAGE_HEADER_TEMPLATE.format(
+                nlu_model=encoder,
+                image_field=image_field,
+                schema_literal=repr(schema.to_dict()),
+                config_literal=repr(dict(questions)),
+            )
+            parts = [header, heads_literal, ood_literal,
+                     templates.DECIDE_IMAGE_RUNTIME_TEMPLATE.format()]
         else:
-            parts.append(templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format())
+            baked_model = self.nlu_model
+            header = templates.DECIDE_DISTILLED_HEADER_TEMPLATE.format(
+                nlu_model=self.nlu_model,
+                max_length=int(max_length),
+                schema_literal=repr(schema.to_dict()),
+                config_literal=repr(dict(questions)),
+            )
+            parts = [header, code, heads_literal, ood_literal]
+            if adapter is not None:
+                parts.append("ADAPTER: Dict[str, Any] = " + repr(adapter))
+                parts.append("ADAPTER_CONFIG: Dict[str, Any] = " + repr(adapter_config))
+                parts.append(templates.DECIDE_FINETUNED_RUNTIME_TEMPLATE.format())
+            else:
+                parts.append(templates.DECIDE_DISTILLED_RUNTIME_TEMPLATE.format())
         source = "\n\n".join(parts) + "\n"
         if golden:
             error = self._test_golden_decider(source, golden, questions)
@@ -862,7 +938,7 @@ class StrotCompiler:
                 )
         return CompiledAsset(
             source=source,
-            nlu_model=self.nlu_model,
+            nlu_model=baked_model,
             runtime_kind="decide",
             goal=json.dumps(questions, sort_keys=True),
             schema=schema,

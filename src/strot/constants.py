@@ -9,6 +9,10 @@ caller choice - there is no public model-selection surface.
 #: Banking77: a head on this reaches full-fine-tune SOTA). Not caller-selectable.
 DEFAULT_NLU_MODEL = "Alibaba-NLP/gte-modernbert-base"
 
+#: Default vision encoder for image-modality compiles (head tier only). Swappable
+#: via compile(..., encoder=...); any SigLIP / ViT / DINOv2 checkpoint works.
+DEFAULT_IMAGE_ENCODER = "google/siglip-base-patch16-224"
+
 #: Token window every tier uses, so `head` and `deep` always see the SAME text
 #: (ModernBERT supports far longer; this is the STROT default). Shared here so the
 #: tiers can never diverge - `deep` seeing less text than `head` is not a fair

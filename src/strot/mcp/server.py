@@ -54,12 +54,21 @@ def compile_start(
     mode: str = "head",
     projection: Optional[str] = None,
     name: Optional[str] = None,
+    modality: str = "text",
+    encoder: Optional[str] = None,
+    image_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compile a decision model from labels YOU bring (no LLM) -> returns a job_id
     to poll. The agent-labels door: design the questions and decide each record
     yourself, pass {question: answer} per record.
+
+    For image records pass modality="image" + image_field (the record key holding
+    a path/URL/bytes/PIL image); a frozen vision encoder embeds it (head-tier only).
     Runs minutes; needs [local]."""
-    return tools.compile_start(data, questions, labels, mode=mode, projection=projection, name=name)
+    return tools.compile_start(
+        data, questions, labels, mode=mode, projection=projection, name=name,
+        modality=modality, encoder=encoder, image_field=image_field,
+    )
 
 
 @server.tool()
